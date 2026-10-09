@@ -10,7 +10,6 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-# Guvenlik: gercek islem kapali.
 REAL_TRADING_ENABLED = False
 TRADING_MODE = "paper"
 
@@ -28,6 +27,7 @@ _cache: dict[str, Any] = {
     "time": 0.0,
     "candidates": [],
     "error": None,
+    "diagnostics": {},
 }
 
 _next_request_time = 0.0
@@ -40,7 +40,7 @@ def _number(value, default=0.0):
         if value is None:
             return default
         result = float(value)
-        if result != result or result in (float("inf"), float("-inf")):
+        if not (float("-inf") < result < float("inf")):
             return default
         return result
     except (TypeError, ValueError, OverflowError):
@@ -51,30 +51,49 @@ def _normalize_pairs(payload):
     pairs = payload.get("pairs") or []
     candidates = []
 
+    stats = {
+        "pairs_received": len(pairs),
+        "solana_pairs": 0,
+        "wrong_chain": 0,
+        "missing_address": 0,
+        "wrong_quote": 0,
+        "low_liquidity": 0,
+        "low_volume": 0,
+        "no_transactions": 0,
+        "invalid_price": 0,
+        "passed_filters": 0,
+    }
+
     for pair in pairs:
         if not isinstance(pair, dict):
             continue
 
         if str(pair.get("chainId", "")).lower() != "solana":
+            stats["wrong_chain"] += 1
             continue
+
+        stats["solana_pairs"] += 1
 
         base = pair.get("baseToken") or {}
         quote = pair.get("quoteToken") or {}
 
         if not isinstance(base, dict) or not isinstance(quote, dict):
+            stats["missing_address"] += 1
             continue
 
-        base_symbol = str(base.get("symbol") or "").strip()
+        symbol = str(base.get("symbol") or "").strip()
         quote_symbol = str(quote.get("symbol") or "").strip()
-        base_address = str(base.get("address") or "").strip()
+        address = str(base.get("address") or "").strip()
 
-        if not base_address:
+        if not address:
+            stats["missing_address"] += 1
             continue
 
-        if base_symbol.upper() in {"SOL", "WSOL"}:
+        if symbol.upper() in {"SOL", "WSOL"}:
             continue
 
         if quote_symbol.upper() not in {"SOL", "WSOL", "USDC", "USDT"}:
+            stats["wrong_quote"] += 1
             continue
 
         liquidity = _number((pair.get("liquidity") or {}).get("usd"))
@@ -86,25 +105,30 @@ def _normalize_pairs(payload):
         price = _number(pair.get("priceUsd"))
 
         if liquidity < MIN_LIQUIDITY_USD:
+            stats["low_liquidity"] += 1
             continue
 
         if volume_24h < MIN_VOLUME_24H_USD:
+            stats["low_volume"] += 1
             continue
 
-        if buys + sells <= 0 or price <= 0:
+        if buys + sells <= 0:
+            stats["no_transactions"] += 1
+            continue
+
+        if price <= 0:
+            stats["invalid_price"] += 1
             continue
 
         ratio = buys / max(sells, 1.0)
-
-        # Siralama puanidir; karlilik tahmini degildir.
         score = (
             min(volume_24h / max(liquidity, 1.0), 10.0) * 5
             + min(ratio, 3.0) * 5
         )
 
         candidates.append({
-            "token_address": base_address,
-            "symbol": base_symbol or "UNKNOWN",
+            "token_address": address,
+            "symbol": symbol or "UNKNOWN",
             "name": str(base.get("name") or ""),
             "quote_symbol": quote_symbol,
             "pool_address": str(pair.get("pairAddress") or ""),
@@ -119,7 +143,9 @@ def _normalize_pairs(payload):
             "url": str(pair.get("url") or ""),
         })
 
-    # Ayni token birden fazla havuzda bulunabilir.
+        stats["passed_filters"] += 1
+
+    # Bir tokenin birden fazla havuzu varsa en likit havuzu tut.
     unique = {}
 
     for item in candidates:
@@ -129,18 +155,22 @@ def _normalize_pairs(payload):
         if previous is None or item["liquidity_usd"] > previous["liquidity_usd"]:
             unique[address] = item
 
-    return sorted(
-        unique.values(),
-        key=lambda item: item["score"],
-        reverse=True,
+    stats["unique_tokens"] = len(unique)
+
+    return (
+        sorted(
+            unique.values(),
+            key=lambda item: item["score"],
+            reverse=True,
+        ),
+        stats,
     )
 
 
 async def _fetch_candidates():
     global _next_request_time, _consecutive_errors
 
-    now = time.time()
-    if now < _next_request_time:
+    if time.time() < _next_request_time:
         raise RuntimeError("provider_cooldown")
 
     headers = {
@@ -163,6 +193,7 @@ async def _fetch_candidates():
             ERROR_COOLDOWN_SECONDS * (2 ** min(_consecutive_errors - 1, 4)),
             MAX_ERROR_COOLDOWN_SECONDS,
         )
+
         retry_after = response.headers.get("Retry-After")
         if retry_after:
             try:
@@ -174,59 +205,57 @@ async def _fetch_candidates():
         raise RuntimeError("dexscreener_rate_limited")
 
     response.raise_for_status()
-
     payload = response.json()
+
     if not isinstance(payload, dict):
         raise RuntimeError("invalid_market_data")
 
-    candidates = _normalize_pairs(payload)
+    candidates, diagnostics = _normalize_pairs(payload)
 
     _consecutive_errors = 0
     _next_request_time = time.time() + CACHE_SECONDS
 
-    return candidates
+    return candidates, diagnostics
 
 
 async def get_signal_candidates(limit=20, **kwargs):
-    global _next_request_time
-
     async with _lock:
         now = time.time()
 
-        # Yalnizca basarili sonuclari taze onbellekten sun.
-        cache_is_fresh = (
+        fresh = (
             _cache["error"] is None
             and now - _cache["time"] < CACHE_SECONDS
         )
 
-        if cache_is_fresh:
+        if fresh:
             candidates = _cache["candidates"]
+            diagnostics = _cache["diagnostics"]
             error = None
 
         elif now < _next_request_time:
             candidates = _cache["candidates"]
+            diagnostics = _cache["diagnostics"]
             error = _cache["error"] or "provider_cooldown"
 
         else:
             try:
-                candidates = await _fetch_candidates()
+                candidates, diagnostics = await _fetch_candidates()
 
                 _cache.update({
                     "time": time.time(),
                     "candidates": candidates,
+                    "diagnostics": diagnostics,
                     "error": None,
                 })
                 error = None
 
             except Exception as exc:
                 error = f"{type(exc).__name__}: {exc}"
-
                 logger.warning("DEX Screener tarama hatasi: %s", error)
 
-                # Eski veriyi yeni veri gibi gosterme.
-                # Basarisiz sorgu basarili onbellek olarak kaydedilmez.
                 _cache["error"] = error
                 candidates = []
+                diagnostics = _cache["diagnostics"]
 
     try:
         safe_limit = max(1, min(int(limit), 20))
@@ -238,24 +267,22 @@ async def get_signal_candidates(limit=20, **kwargs):
     if signals:
         note = (
             "Adaylar piyasa verilerine gore siralandi. "
-            "Bu sonuc yatirim tavsiyesi veya kar garantisi degildir."
+            "Yatirim tavsiyesi veya kar garantisi degildir."
         )
     elif error:
-        note = (
-            "Piyasa verisi alinamadi veya saglayici bekleme suresi aktif. "
-            "last_error alanini kontrol edin."
-        )
+        note = "Piyasa verisi alinamadi. last_error alanini kontrol edin."
     else:
         note = (
-            "Arama sonuclarinda filtrelerden gecen aday bulunamadi. "
-            "Bu, piyasada hic firsat olmadigi anlamina gelmez."
+            "Veri alindi ancak filtrelerden gecen aday bulunamadi. "
+            "diagnostics alanini inceleyin."
         )
 
     return {
         "provider": "DEX Screener",
-        "checked": len(candidates),
+        "checked": diagnostics.get("solana_pairs", 0),
         "candidate_count": len(candidates),
         "signals": signals,
+        "diagnostics": diagnostics,
         "mode": TRADING_MODE,
         "real_trading_enabled": REAL_TRADING_ENABLED,
         "note": note,
