@@ -288,10 +288,25 @@ async def get_signal_candidates(limit=20, min_liquidity_usd=None, min_volume_24h
                 candidates, diagnostics = _cache["candidates"], _cache["diagnostics"]
 
         filtered = [x for x in candidates if x["liquidity_usd"] >= liquidity_floor and x["volume_24h_usd"] >= volume_floor and x["buy_sell_ratio"] >= ratio_floor]
+        # Read-only preview helps explain why candidates fail filters; it never changes trade decisions.
+        candidate_preview = [
+            {
+                "symbol": str(x.get("symbol") or "UNKNOWN"),
+                "name": str(x.get("name") or ""),
+                "liquidity_usd": round(_number(x.get("liquidity_usd")), 2),
+                "volume_24h_usd": round(_number(x.get("volume_24h_usd")), 2),
+                "buy_sell_ratio": round(_number(x.get("buy_sell_ratio")), 3),
+                "score": round(_number(x.get("score")), 3),
+                "source": str(x.get("source") or ""),
+                "url": str(x.get("url") or ""),
+            }
+            for x in candidates[:20]
+        ]
         diag = {**diagnostics, "active_min_liquidity_usd": liquidity_floor, "active_min_volume_24h_usd": volume_floor,
             "active_min_buy_sell_ratio": ratio_floor, "below_liquidity_filter": sum(x["liquidity_usd"] < liquidity_floor for x in candidates),
             "below_volume_filter": sum(x["volume_24h_usd"] < volume_floor for x in candidates),
-            "below_ratio_filter": sum(x["buy_sell_ratio"] < ratio_floor for x in candidates)}
+            "below_ratio_filter": sum(x["buy_sell_ratio"] < ratio_floor for x in candidates),
+            "candidate_preview": candidate_preview}
 
     try:
         safe_limit = max(1, min(int(limit), 50))
