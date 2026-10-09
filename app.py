@@ -7,7 +7,7 @@ from fastapi import FastAPI
 app = FastAPI(title="Memecoin Spy Pro")
 
 DEX_URL = "https://api.dexscreener.com/token-profiles/latest/v1"
-
+import asyncio
 
 @app.get("/")
 def home():
