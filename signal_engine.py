@@ -4,15 +4,13 @@ from datetime import datetime, timezone
 
 import httpx
 
-# Primary source: GeckoTerminal. Fallback: DexScreener.
-GECKO_URL = (
-    "https://api.geckoterminal.com/api/v2/"
-    "networks/solana/trending_pools"
-)
+# Public market-data sources. No API keys required.
+GECKO_URL = "https://api.geckoterminal.com/api/v2/networks/solana/trending_pools"
 DEX_BOOSTS_URL = "https://api.dexscreener.com/token-boosts/top/v1"
+DEX_PROFILES_URL = "https://api.dexscreener.com/token-profiles/latest/v1"
 DEX_TOKENS_URL = "https://api.dexscreener.com/latest/dex/tokens/"
 
-REQUEST_TIMEOUT_SECONDS = 15
+REQUEST_TIMEOUT_SECONDS = 20
 CACHE_SECONDS = 240
 GECKO_COOLDOWN_SECONDS = 1800
 MAX_POOLS = 20
@@ -36,9 +34,7 @@ def _token_address_from_pool(pool):
     relationships = pool.get("relationships") or {}
     base = (relationships.get("base_token") or {}).get("data") or {}
     token_id = base.get("id") or ""
-    if token_id.startswith("solana_"):
-        return token_id[len("solana_"):]
-    return token_id
+    return token_id[len("solana_"):] if token_id.startswith("solana_") else token_id
 
 
 def _normalise_gecko(payload):
@@ -46,17 +42,14 @@ def _normalise_gecko(payload):
     for item in (payload.get("data") or [])[:MAX_POOLS]:
         if not isinstance(item, dict):
             continue
-
         attrs = item.get("attributes") or {}
         transactions = attrs.get("transactions") or {}
         h24 = transactions.get("h24") or {}
         volume = attrs.get("volume_usd") or {}
         price_change = attrs.get("price_change_percentage") or {}
-        buys = int(_num(h24.get("buys")))
-        sells = int(_num(h24.get("sells")))
+        buys, sells = int(_num(h24.get("buys"))), int(_num(h24.get("sells")))
         pool_name = attrs.get("name") or "Unknown pool"
         token_name = pool_name.split(" / ", 1)[0].strip()
-
         results.append({
             "chain": "solana",
             "token_name": token_name,
@@ -82,61 +75,66 @@ def _normalise_gecko(payload):
 async def _get_json(client, url):
     response = await client.get(url)
     response.raise_for_status()
-    return response.json()
+    try:
+        return response.json()
+    except ValueError as exc:
+        raise RuntimeError(f"Non-JSON response from {url}: {response.text[:120]}") from exc
 
 
 async def _fetch_gecko(client):
-    payload = await _get_json(client, GECKO_URL)
-    return _normalise_gecko(payload)
+    return _normalise_gecko(await _get_json(client, GECKO_URL))
 
 
 async def _fetch_dexscreener(client):
-    # Use the top-boosted Solana token list as a fallback discovery source.
-    payload = await _get_json(client, DEX_BOOSTS_URL)
-    if not isinstance(payload, list):
-        return []
-
+    # Try two independent DexScreener discovery lists; one may work if the
+    # other is empty or temporarily unavailable.
+    discovery_errors = []
     addresses = []
     seen = set()
-    for item in payload:
-        if not isinstance(item, dict):
-            continue
-        if (item.get("chainId") or "").lower() != "solana":
-            continue
-        address = item.get("tokenAddress") or ""
-        if address and address not in seen:
-            seen.add(address)
-            addresses.append(address)
-        if len(addresses) >= MAX_FALLBACK_TOKENS:
-            break
+
+    for source_name, url in (
+        ("token boosts", DEX_BOOSTS_URL),
+        ("token profiles", DEX_PROFILES_URL),
+    ):
+        try:
+            payload = await _get_json(client, url)
+            if not isinstance(payload, list):
+                continue
+            for item in payload:
+                if not isinstance(item, dict) or (item.get("chainId") or "").lower() != "solana":
+                    continue
+                address = item.get("tokenAddress") or ""
+                if address and address not in seen:
+                    seen.add(address)
+                    addresses.append(address)
+                if len(addresses) >= MAX_FALLBACK_TOKENS:
+                    break
+            if addresses:
+                break
+        except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+            discovery_errors.append(f"{source_name}: {type(exc).__name__} {str(exc)[:100]}")
 
     if not addresses:
-        return []
+        detail = "; ".join(discovery_errors) or "no Solana token addresses returned"
+        raise RuntimeError(f"DexScreener discovery failed: {detail}")
 
-    # DexScreener accepts comma-separated token addresses on this endpoint.
     url = DEX_TOKENS_URL + ",".join(addresses)
     pairs_payload = await _get_json(client, url)
     pairs = pairs_payload.get("pairs") or []
     best_by_token = {}
 
     for pair in pairs:
-        if not isinstance(pair, dict):
+        if not isinstance(pair, dict) or (pair.get("chainId") or "").lower() != "solana":
             continue
-        if (pair.get("chainId") or "").lower() != "solana":
-            continue
-
         base_token = pair.get("baseToken") or {}
         address = base_token.get("address") or ""
         if not address:
             continue
-
         liquidity = _num((pair.get("liquidity") or {}).get("usd"))
         volume_24h = _num((pair.get("volume") or {}).get("h24"))
         txns = (pair.get("txns") or {}).get("h24") or {}
-        buys = int(_num(txns.get("buys")))
-        sells = int(_num(txns.get("sells")))
+        buys, sells = int(_num(txns.get("buys"))), int(_num(txns.get("sells")))
         price_change = pair.get("priceChange") or {}
-
         candidate = {
             "chain": "solana",
             "token_name": base_token.get("name") or "Unknown",
@@ -156,11 +154,12 @@ async def _fetch_dexscreener(client):
             "profile": {},
             "source": "DexScreener fallback",
         }
-
-        # Keep the most liquid pool for each token to avoid duplicate signals.
         previous = best_by_token.get(address)
         if previous is None or liquidity > previous["liquidity_usd"]:
             best_by_token[address] = candidate
+
+    if not best_by_token:
+        raise RuntimeError("DexScreener returned no Solana trading pairs for discovered tokens")
 
     return sorted(
         best_by_token.values(),
@@ -171,19 +170,12 @@ async def _fetch_dexscreener(client):
 
 async def _fetch_candidates():
     global _gecko_blocked_until, _gecko_last_error, _last_provider
-
     headers = {
         "Accept": "application/json",
-        "User-Agent": "MemecoinSpyBot/1.1",
+        "User-Agent": "Mozilla/5.0 MemecoinSpyBot/1.2",
     }
-
-    async with httpx.AsyncClient(
-        timeout=REQUEST_TIMEOUT_SECONDS,
-        headers=headers,
-    ) as client:
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS, headers=headers, follow_redirects=True) as client:
         now = time.monotonic()
-
-        # Do not hammer GeckoTerminal while its cooldown is active.
         if now >= _gecko_blocked_until:
             try:
                 data = await _fetch_gecko(client)
@@ -192,32 +184,26 @@ async def _fetch_candidates():
                     _gecko_last_error = None
                     _last_provider = "GeckoTerminal public API"
                     return data, _last_provider
+                _gecko_last_error = "GeckoTerminal returned no pools"
             except httpx.HTTPStatusError as exc:
-                if exc.response.status_code == 429:
-                    _gecko_blocked_until = (
-                        time.monotonic() + GECKO_COOLDOWN_SECONDS
-                    )
-                    _gecko_last_error = "GeckoTerminal HTTP 429"
-                else:
-                    _gecko_last_error = f"GeckoTerminal HTTP {exc.response.status_code}"
-            except (httpx.HTTPError, ValueError) as exc:
-                _gecko_last_error = (
-                    f"GeckoTerminal {type(exc).__name__}: {str(exc)[:120]}"
-                )
+                code = exc.response.status_code
+                _gecko_last_error = f"GeckoTerminal HTTP {code}"
+                if code == 429:
+                    _gecko_blocked_until = time.monotonic() + GECKO_COOLDOWN_SECONDS
+            except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+                _gecko_last_error = f"GeckoTerminal {type(exc).__name__}: {str(exc)[:160]}"
 
-        # Fallback runs when GeckoTerminal is rate-limited or unavailable.
         try:
             data = await _fetch_dexscreener(client)
-            if data:
-                _last_provider = "DexScreener fallback"
-                return data, _last_provider
-            raise RuntimeError("DexScreener fallback returned no Solana pairs")
-        except (httpx.HTTPError, ValueError, RuntimeError) as exc:
-            raise httpx.HTTPError(
-                f"GeckoTerminal unavailable ({_gecko_last_error}); "
-                f"DexScreener fallback failed: {type(exc).__name__}: "
-                f"{str(exc)[:140]}"
-            ) from exc
+            _last_provider = "DexScreener fallback"
+            return data, _last_provider
+        except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+            detail = (
+                f"GeckoTerminal failed ({_gecko_last_error or 'unavailable'}); "
+                f"DexScreener failed ({type(exc).__name__}: {str(exc)[:220]})"
+            )
+            # Preserve the provider's HTTP status/detail for the API response/logs.
+            raise RuntimeError(detail) from exc
 
 
 async def get_signal_candidates(
@@ -227,23 +213,19 @@ async def get_signal_candidates(
     limit=20,
 ):
     global _last_provider
-
     async with _lock:
         now = time.monotonic()
         cache_exists = _cache["value"] is not None
         cache_fresh = cache_exists and now - _cache["at"] < CACHE_SECONDS
-
         if cache_fresh:
             base = _cache["value"]
             provider = _cache["provider"] or "Cached data"
         else:
             try:
                 base, provider = await _fetch_candidates()
-                _cache["value"] = base
-                _cache["at"] = time.monotonic()
-                _cache["provider"] = provider
+                _cache.update({"value": base, "at": time.monotonic(), "provider": provider})
                 _last_provider = provider
-            except httpx.HTTPError:
+            except (httpx.HTTPError, RuntimeError):
                 if not cache_exists:
                     raise
                 base = _cache["value"]
@@ -255,11 +237,7 @@ async def get_signal_candidates(
             and item["volume_24h_usd"] >= min_volume_24h_usd
             and item["buys_to_sells_ratio"] >= min_buys_sells_ratio
         ]
-        filtered.sort(
-            key=lambda item: (item["liquidity_usd"], item["volume_24h_usd"]),
-            reverse=True,
-        )
-
+        filtered.sort(key=lambda item: (item["liquidity_usd"], item["volume_24h_usd"]), reverse=True)
         return {
             "mode": "paper",
             "provider": provider,
@@ -271,9 +249,8 @@ async def get_signal_candidates(
                 "min_buys_sells_ratio": min_buys_sells_ratio,
             },
             "warning": (
-                "Paper simulation only. Signals are not buy recommendations "
-                "and do not prove profitability. Fallback or cached data may "
-                "be incomplete or stale."
+                "Paper simulation only. Signals are not buy recommendations and do not "
+                "prove profitability. Fallback or cached data may be incomplete or stale."
             ),
             "signals": filtered[:limit],
             "timestamp": datetime.now(timezone.utc).isoformat(),
