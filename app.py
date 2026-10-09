@@ -27,10 +27,16 @@ def health():
 @app.get("/signals")
 async def signals():
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            response = await client.get(DEX_URL)
-            response.raise_for_status()
-            data = response.json()
+        async with httpx.AsyncClient(timeout=20) as client:
+    await asyncio.sleep(2)
+    response = await client.get(DEX_URL)
+
+    if response.status_code == 429:
+        await asyncio.sleep(10)
+        response = await client.get(DEX_URL)
+
+    response.raise_for_status()
+    data = response.json()
 
         tokens = [
             token for token in data
