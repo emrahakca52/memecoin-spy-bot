@@ -7,10 +7,9 @@ from fastapi import FastAPI, HTTPException, Query
 from signal_engine import get_signal_candidates
 from wallet_tracker import get_wallet_stats
 from paper_engine import (
-    paper_status,
-    list_paper_trades,
+    get_paper_status as paper_status,
+    get_paper_trades as list_paper_trades,
     record_paper_trade,
-    portfolio_status,
 )
 from auto_paper_bot import bot_status, start_bot, stop_bot
 
@@ -24,7 +23,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Memecoin Spy Pro",
-    version="1.1.1",
+    version="1.1.2",
     lifespan=lifespan,
 )
 
@@ -63,33 +62,21 @@ async def signals(
             min_buys_sells_ratio=min_buys_sells_ratio,
             limit=limit,
         )
-
     except httpx.HTTPStatusError as exc:
         if exc.response.status_code == 429:
             raise HTTPException(
                 status_code=503,
-                detail=(
-                    "Market data provider rate limit. "
-                    "Please wait before retrying."
-                ),
-            )
-
+                detail="Market data provider rate limit. Please wait before retrying.",
+            ) from exc
         raise HTTPException(
             status_code=502,
-            detail=(
-                "Market data provider returned HTTP "
-                f"{exc.response.status_code}."
-            ),
-        )
-
+            detail=f"Market data provider returned HTTP {exc.response.status_code}.",
+        ) from exc
     except httpx.HTTPError as exc:
         raise HTTPException(
             status_code=502,
-            detail=(
-                "Could not reach market data provider: "
-                f"{type(exc).__name__}"
-            ),
-        )
+            detail=f"Could not reach market data provider: {type(exc).__name__}",
+        ) from exc
 
 
 @app.get("/wallet/{wallet_address}")
@@ -98,35 +85,26 @@ async def wallet(
     limit: int = Query(20, ge=1, le=100),
 ):
     try:
-        return await get_wallet_stats(
-            wallet_address,
-            limit=limit,
-        )
-
+        return await get_wallet_stats(wallet_address, limit=limit)
     except ValueError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=str(exc),
-        )
-
-    except httpx.HTTPError:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except httpx.HTTPError as exc:
         raise HTTPException(
             status_code=502,
             detail="Could not reach the Solana RPC provider.",
-        )
+        ) from exc
 
 
 @app.get("/paper/status")
-def get_paper_status():
+def get_paper_status_route():
     return {
         **paper_status(),
-        **portfolio_status(),
         "bot": bot_status(),
     }
 
 
 @app.get("/paper/trades")
-def get_paper_trades():
+def get_paper_trades_route():
     return {
         "mode": "paper",
         "trades": list_paper_trades(),
@@ -156,7 +134,6 @@ def add_paper_trade(payload: dict):
         "amount_usd",
         "price_usd",
     }
-
     if not required.issubset(payload):
         raise HTTPException(
             status_code=400,
@@ -170,11 +147,6 @@ def add_paper_trade(payload: dict):
             amount_usd=float(payload["amount_usd"]),
             price_usd=float(payload["price_usd"]),
             token_symbol=str(payload.get("token_symbol", "")),
-            source="manual",
         )
-
     except ValueError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=str(exc),
-        )
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
