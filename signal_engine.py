@@ -204,15 +204,55 @@ def _dedupe(candidates):
 
 
 async def _fetch_coingecko():
+    """Discover a broader sample of new Solana pools without relaxing trade filters.
+
+    CoinGecko's on-chain new-pools endpoint is paginated. Read only a few pages per
+    scan to stay conservative with the Demo API rate limit; any partial data is kept
+    if a later page fails.
+    """
     api_key = os.getenv("COINGECKO_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("coingecko_api_key_missing")
+
+    all_pools = []
+    all_included = []
+    page_errors = []
+    pages_scanned = 0
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS, headers={
-        "Accept": "application/json", "User-Agent": "MemecoinSpyBot/1.4", "x-cg-demo-api-key": api_key,
+        "Accept": "application/json", "User-Agent": "MemecoinSpyBot/1.5", "x-cg-demo-api-key": api_key,
     }) as client:
-        payload = await _get_json(client, GECKO_NEW_POOLS_URL, params={"include": "base_token,quote_token", "page": 1}, provider="coingecko")
-    candidates, diagnostics = _normalize_coingecko_pools(payload)
-    diagnostics["fallback_used"] = True
+        for page in (1, 2, 3):
+            try:
+                payload = await _get_json(
+                    client,
+                    GECKO_NEW_POOLS_URL,
+                    params={"include": "base_token,quote_token", "page": page},
+                    provider="coingecko",
+                )
+                data = payload.get("data", []) if isinstance(payload, dict) else []
+                if not data:
+                    break
+                all_pools.extend(data)
+                included = payload.get("included", []) if isinstance(payload, dict) else []
+                if isinstance(included, list):
+                    all_included.extend(included)
+                pages_scanned += 1
+            except Exception as exc:
+                page_errors.append(f"page_{page}:{type(exc).__name__}:{str(exc)[:100]}")
+                if not all_pools:
+                    raise
+                break
+            # Small pause between paginated requests to avoid unnecessary bursts.
+            if page < 3:
+                await asyncio.sleep(0.35)
+
+    combined_payload = {"data": all_pools, "included": all_included}
+    candidates, diagnostics = _normalize_coingecko_pools(combined_payload)
+    diagnostics.update({
+        "coingecko_pages_scanned": pages_scanned,
+        "coingecko_page_errors": page_errors,
+        "fallback_used": True,
+    })
     return candidates, diagnostics
 
 
