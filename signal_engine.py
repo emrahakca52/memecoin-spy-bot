@@ -1,4 +1,3 @@
-
 import asyncio
 import logging
 import os
@@ -10,744 +9,553 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-# Güvenlik: gerçek işlemler kapalıdır.
+# Safety: this module only discovers and scores candidates.
+# It never sends orders or enables real trading.
 REAL_TRADING_ENABLED = False
 TRADING_MODE = "paper"
 
-DEX_BASE_URL = "https://api.dexscreener.com"
-PROFILE_URL = f"{DEX_BASE_URL}/token-profiles/latest/v1"
-BOOST_URL = f"{DEX_BASE_URL}/token-boosts/latest/v1"
-TOKENS_URL = f"{DEX_BASE_URL}/tokens/v1/solana"
+DEX_BASE = "https://api.dexscreener.com"
+DEX_PROFILES_URL = f"{DEX_BASE}/token-profiles/latest/v1"
+DEX_BOOSTS_URL = f"{DEX_BASE}/token-boosts/latest/v1"
+DEX_TOKENS_URL = f"{DEX_BASE}/tokens/v1/solana"
 
-GECKO_DEMO_BASE = "https://api.coingecko.com/api/v3"
-GECKO_NEW_POOLS_URL = (
-    f"{GECKO_DEMO_BASE}/onchain/networks/solana/new_pools"
+COINGECKO_BASE = "https://api.coingecko.com/api/v3"
+COINGECKO_NEW_POOLS_URL = (
+    "https://api.coingecko.com/api/v3/onchain/networks/solana/new_pools"
 )
-GECKO_TRENDING_URL = (
-    "https://api.geckoterminal.com/api/v2/networks/solana/trending_pools"
+GECKOTERMINAL_BASE = "https://api.geckoterminal.com/api/v2"
+GECKOTERMINAL_TRENDING_URL = (
+    f"{GECKOTERMINAL_BASE}/networks/solana/trending_pools"
 )
+
+COINGECKO_DEMO_API_KEY = os.getenv("COINGECKO_DEMO_API_KEY", "").strip()
 
 MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "10000"))
 MIN_VOLUME_24H_USD = float(os.getenv("MIN_VOLUME_24H_USD", "20000"))
-MIN_BUY_SELL_RATIO = float(os.getenv("MIN_BUY_SELL_RATIO", "1.0"))
+MIN_BUYS_SELLS_RATIO = float(os.getenv("MIN_BUYS_SELLS_RATIO", "1.0"))
 
-CACHE_SECONDS = 120
-ERROR_COOLDOWN_SECONDS = 60
-MAX_ERROR_COOLDOWN_SECONDS = 600
-REQUEST_TIMEOUT_SECONDS = 20
-MAX_DISCOVERED_ADDRESSES = 60
-MAX_CANDIDATE_PREVIEW = 20
+CACHE_SECONDS = int(os.getenv("SIGNAL_CACHE_SECONDS", "180"))
+ERROR_COOLDOWN_SECONDS = int(os.getenv("ERROR_COOLDOWN_SECONDS", "60"))
+MAX_ERROR_COOLDOWN_SECONDS = int(os.getenv("MAX_ERROR_COOLDOWN_SECONDS", "600"))
+REQUEST_TIMEOUT_SECONDS = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "15"))
+MAX_DISCOVERED_ADDRESSES = int(os.getenv("MAX_DISCOVERED_ADDRESSES", "60"))
+PREVIEW_LIMIT = int(os.getenv("SIGNAL_PREVIEW_LIMIT", "20"))
 
-WSOL_MINT = "So11111111111111111111111111111111111111112"
-ALLOWED_QUOTES = {"SOL", "WSOL", "USDC", "USDT"}
-
+# Per-source cooldowns reduce repeated requests when a provider rate-limits us.
+_provider_cooldowns: dict[str, float] = {}
+_provider_errors: dict[str, int] = {}
+_lock = asyncio.Lock()
 _cache: dict[str, Any] = {
-    "time": 0.0,
+    "timestamp": 0.0,
     "candidates": [],
-    "error": None,
     "diagnostics": {},
 }
 
-# Her sağlayıcı için bağımsız bekleme süresi.
-_provider_cooldowns: dict[str, float] = {}
-_provider_errors: dict[str, int] = {}
 
-_lock = asyncio.Lock()
-
-
-def _number(value, default=0.0):
+def _as_float(value: Any, default: float = 0.0) -> float:
     try:
-        result = float(value)
-        if result != result or abs(result) == float("inf"):
+        if value is None or value == "":
             return default
-        return result
-    except (TypeError, ValueError, OverflowError):
+        return float(value)
+    except (TypeError, ValueError):
         return default
 
 
+def _first(mapping: dict, *keys: str, default: Any = None) -> Any:
+    for key in keys:
+        value = mapping.get(key)
+        if value is not None:
+            return value
+    return default
+
+
+def _cooldown_remaining(provider: str) -> float:
+    return max(0.0, _provider_cooldowns.get(provider, 0.0) - time.monotonic())
+
+
 async def _get_json(
-    client,
-    url,
+    client: httpx.AsyncClient,
+    url: str,
     *,
-    headers=None,
-    params=None,
-    provider="provider",
-):
-    now = time.time()
-    cooldown_until = _provider_cooldowns.get(provider, 0.0)
-
-    if now < cooldown_until:
-        raise RuntimeError(f"{provider}_cooldown")
-
-    response = await client.get(url, headers=headers, params=params)
-
-    if response.status_code == 429:
-        count = _provider_errors.get(provider, 0) + 1
-        _provider_errors[provider] = count
-
-        delay = min(
-            ERROR_COOLDOWN_SECONDS * (2 ** min(count - 1, 4)),
-            MAX_ERROR_COOLDOWN_SECONDS,
+    provider: str,
+    params: dict | None = None,
+    headers: dict | None = None,
+) -> Any:
+    remaining = _cooldown_remaining(provider)
+    if remaining > 0:
+        raise RuntimeError(
+            f"{provider} cooldown active ({int(remaining)}s remaining)"
         )
 
-        retry_after = response.headers.get("Retry-After")
-        if retry_after:
-            try:
-                delay = max(delay, min(float(retry_after), 3600))
-            except (TypeError, ValueError):
-                pass
+    try:
+        response = await client.get(url, params=params, headers=headers)
+        if response.status_code == 429:
+            _provider_errors[provider] = _provider_errors.get(provider, 0) + 1
+            exponent = min(_provider_errors[provider] - 1, 5)
+            delay = min(
+                MAX_ERROR_COOLDOWN_SECONDS,
+                ERROR_COOLDOWN_SECONDS * (2 ** exponent),
+            )
+            retry_after = response.headers.get("Retry-After")
+            if retry_after:
+                try:
+                    delay = max(delay, min(float(retry_after), 3600.0))
+                except ValueError:
+                    pass
+            delay += random.uniform(0, min(10.0, delay * 0.1))
+            _provider_cooldowns[provider] = time.monotonic() + delay
+            raise RuntimeError(f"{provider} returned HTTP 429; cooldown {int(delay)}s")
 
-        _provider_cooldowns[provider] = (
-            time.time() + delay + random.uniform(1, 5)
-        )
-        raise RuntimeError(f"{provider}_rate_limited")
-
-    response.raise_for_status()
-    _provider_errors[provider] = 0
-    _provider_cooldowns.pop(provider, None)
-    return response.json()
-
-
-def _dedupe(candidates):
-    unique = {}
-
-    for item in candidates:
-        address = str(item.get("token_address") or "").strip()
-        if not address:
-            continue
-
-        old = unique.get(address)
-
-        if old is None or item["liquidity_usd"] > old["liquidity_usd"]:
-            unique[address] = item
-
-    return sorted(
-        unique.values(),
-        key=lambda item: item.get("score", 0),
-        reverse=True,
-    )
+        response.raise_for_status()
+        _provider_errors[provider] = 0
+        _provider_cooldowns.pop(provider, None)
+        return response.json()
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code
+        if status in (403, 408, 425, 500, 502, 503, 504):
+            _provider_errors[provider] = _provider_errors.get(provider, 0) + 1
+            exponent = min(_provider_errors[provider] - 1, 4)
+            delay = min(
+                MAX_ERROR_COOLDOWN_SECONDS,
+                ERROR_COOLDOWN_SECONDS * (2 ** exponent),
+            )
+            _provider_cooldowns[provider] = time.monotonic() + delay
+        raise
 
 
-def _extract_token_addresses(payload):
-    if not isinstance(payload, list):
-        return []
-
-    result = []
-
-    for item in payload:
-        if not isinstance(item, dict):
-            continue
-
-        if str(item.get("chainId", "")).lower() != "solana":
-            continue
-
-        address = str(item.get("tokenAddress") or "").strip()
-
-        if address and address != WSOL_MINT:
-            result.append(address)
-
-    return list(dict.fromkeys(result))
+def _dex_token_address(item: dict) -> str | None:
+    chain = str(item.get("chainId") or "").lower()
+    address = item.get("tokenAddress")
+    if chain == "solana" and address:
+        return str(address)
+    return None
 
 
-def _candidate(
-    address,
-    symbol,
-    name,
-    quote_symbol,
-    pool_address,
-    price,
-    liquidity,
-    volume,
-    buys,
-    sells,
-    source,
-    url,
-):
-    address = str(address or "").strip()
-    price = _number(price)
-    liquidity = _number(liquidity)
-    volume = _number(volume)
-    buys = _number(buys)
-    sells = _number(sells)
+async def _discover_dex_pairs(client: httpx.AsyncClient) -> tuple[list[dict], list[str]]:
+    """Fetch profiles and boosts independently; keep partial results if one fails."""
+    addresses: list[str] = []
+    errors: list[str] = []
 
-    if (
-        not address
-        or address == WSOL_MINT
-        or price <= 0
-        or liquidity < 0
-        or volume < 0
-        or buys + sells <= 0
+    for label, url in (
+        ("dex_profiles", DEX_PROFILES_URL),
+        ("dex_boosts", DEX_BOOSTS_URL),
     ):
-        return None
+        try:
+            payload = await _get_json(client, url, provider="dexscreener")
+            if isinstance(payload, dict):
+                items = payload.get("data", [])
+            else:
+                items = payload if isinstance(payload, list) else []
+            for item in items:
+                if isinstance(item, dict):
+                    address = _dex_token_address(item)
+                    if address and address not in addresses:
+                        addresses.append(address)
+        except Exception as exc:
+            errors.append(f"{label}: {type(exc).__name__}: {str(exc)[:160]}")
+            # A shared provider cooldown means another DEX request will fail too.
+            if _cooldown_remaining("dexscreener") > 0:
+                break
 
-    ratio = buys / max(sells, 1.0)
-    score = (
-        min(volume / max(liquidity, 1.0), 10.0) * 5
-        + min(ratio, 3.0) * 5
-    )
-
-    return {
-        "token_address": address,
-        "symbol": symbol or "UNKNOWN",
-        "name": name or "",
-        "quote_symbol": quote_symbol or "UNKNOWN",
-        "pool_address": pool_address or "",
-        "price_usd": price,
-        "liquidity_usd": liquidity,
-        "volume_24h_usd": volume,
-        "buys_24h": int(buys),
-        "sells_24h": int(sells),
-        "buy_sell_ratio": round(ratio, 3),
-        "score": round(score, 3),
-        "source": source,
-        "url": url or "",
-    }
-
-
-async def _discover_dex_pairs(client):
-    profiles = await _get_json(
-        client, PROFILE_URL, provider="dexscreener"
-    )
-
-    # İlk çağrı başarılıysa boost akışını da dene.
-    boosts = await _get_json(
-        client, BOOST_URL, provider="dexscreener"
-    )
-
-    addresses = list(
-        dict.fromkeys(
-            _extract_token_addresses(profiles)
-            + _extract_token_addresses(boosts)
-        )
-    )[:MAX_DISCOVERED_ADDRESSES]
-
-    pairs = []
-    errors = []
-
+    addresses = addresses[:MAX_DISCOVERED_ADDRESSES]
+    pairs: list[dict] = []
+    # Dexscreener token endpoint accepts up to 30 token addresses per request.
     for start in range(0, len(addresses), 30):
-        batch = addresses[start:start + 30]
-
+        batch = addresses[start : start + 30]
         try:
             payload = await _get_json(
                 client,
-                f"{TOKENS_URL}/" + ",".join(batch),
+                f"{DEX_TOKENS_URL}/{'/'.join(batch)}",
                 provider="dexscreener",
             )
-
             if isinstance(payload, list):
-                pairs.extend(payload)
+                pairs.extend(item for item in payload if isinstance(item, dict))
+            elif isinstance(payload, dict):
+                items = payload.get("pairs", payload.get("data", []))
+                if isinstance(items, list):
+                    pairs.extend(item for item in items if isinstance(item, dict))
+        except Exception as exc:
+            errors.append(f"dex_token_lookup: {type(exc).__name__}: {str(exc)[:160]}")
+            break
 
-        except RuntimeError:
-            raise
-        except (httpx.HTTPError, ValueError) as exc:
-            errors.append(
-                f"{type(exc).__name__}: {str(exc)[:100]}"
-            )
-
-    if not pairs and errors:
-        raise RuntimeError("dexscreener_token_pair_requests_failed")
-
-    return pairs, len(addresses), errors
+    return pairs, errors
 
 
-def _normalize_dex_pairs(pairs):
-    candidates = []
-    stats = {
-        "pairs_received": len(pairs),
-        "solana_pairs": 0,
-        "passed_raw_checks": 0,
-    }
+def _normalize_dex_pair(pair: dict) -> dict | None:
+    if str(pair.get("chainId") or "").lower() != "solana":
+        return None
+    base = pair.get("baseToken") or {}
+    address = base.get("address")
+    if not address:
+        return None
 
-    for pair in pairs:
-        if not isinstance(pair, dict):
-            continue
-
-        if str(pair.get("chainId", "")).lower() != "solana":
-            continue
-
-        stats["solana_pairs"] += 1
-
-        base = pair.get("baseToken") or {}
-        quote = pair.get("quoteToken") or {}
-
-        if not isinstance(base, dict) or not isinstance(quote, dict):
-            continue
-
-        quote_symbol = str(quote.get("symbol") or "").strip().upper()
-
-        if quote_symbol not in ALLOWED_QUOTES:
-            continue
-
-        txns = pair.get("txns") or {}
-        h24 = txns.get("h24") or {}
-
-        item = _candidate(
-            str(base.get("address") or "").strip(),
-            str(base.get("symbol") or "UNKNOWN"),
-            str(base.get("name") or ""),
-            quote_symbol,
-            str(pair.get("pairAddress") or ""),
-            _number(pair.get("priceUsd")),
-            _number((pair.get("liquidity") or {}).get("usd")),
-            _number((pair.get("volume") or {}).get("h24")),
-            _number(h24.get("buys")),
-            _number(h24.get("sells")),
-            "DEX Screener",
-            str(pair.get("url") or ""),
-        )
-
-        if item:
-            candidates.append(item)
-            stats["passed_raw_checks"] += 1
-
-    return _dedupe(candidates), stats
-
-
-def _included_index(payload):
-    included = payload.get("included", []) if isinstance(payload, dict) else []
+    txns = pair.get("txns") or {}
+    h24 = txns.get("h24") or {}
+    buys = _as_float(h24.get("buys"))
+    sells = _as_float(h24.get("sells"))
+    ratio = buys / max(sells, 1.0)
+    volume = pair.get("volume") or {}
+    liquidity = pair.get("liquidity") or {}
 
     return {
-        str(item.get("id")): item
-        for item in included
-        if isinstance(item, dict) and item.get("id")
+        "token_address": str(address),
+        "symbol": str(base.get("symbol") or "UNKNOWN"),
+        "token_symbol": str(base.get("symbol") or "UNKNOWN"),
+        "name": str(base.get("name") or ""),
+        "price_usd": _as_float(pair.get("priceUsd")),
+        "liquidity_usd": _as_float(liquidity.get("usd")),
+        "volume_24h_usd": _as_float(volume.get("h24")),
+        "buys_24h": int(buys),
+        "sells_24h": int(sells),
+        "buy_sell_ratio": ratio,
+        "buys_to_sells_ratio": ratio,
+        "pool_address": pair.get("pairAddress"),
+        "pair_address": pair.get("pairAddress"),
+        "provider": "DexScreener",
+        "url": pair.get("url"),
+        "created_at": pair.get("pairCreatedAt"),
     }
 
 
-def _normalize_coingecko_pools(payload):
-    data = payload.get("data", []) if isinstance(payload, dict) else []
-    included = _included_index(payload)
-    candidates = []
+async def _fetch_coingecko(client: httpx.AsyncClient) -> tuple[list[dict], list[str]]:
+    pools: list[dict] = []
+    errors: list[str] = []
+    headers = {"accept": "application/json"}
+    if COINGECKO_DEMO_API_KEY:
+        headers["x-cg-demo-api-key"] = COINGECKO_DEMO_API_KEY
 
-    for pool in data:
-        if not isinstance(pool, dict):
-            continue
+    for page in (1, 2, 3):
+        try:
+            payload = await _get_json(
+                client,
+                COINGECKO_NEW_POOLS_URL,
+                provider="coingecko",
+                params={"page": page},
+                headers=headers,
+            )
+            data = payload.get("data", []) if isinstance(payload, dict) else []
+            included = payload.get("included", []) if isinstance(payload, dict) else []
+            included_by_id = {
+                obj.get("id"): obj
+                for obj in included
+                if isinstance(obj, dict) and obj.get("id")
+            }
 
-        attrs = pool.get("attributes") or {}
-        rels = pool.get("relationships") or {}
+            for pool in data:
+                if not isinstance(pool, dict):
+                    continue
+                attrs = pool.get("attributes") or {}
+                rels = pool.get("relationships") or {}
+                base_rel = (rels.get("base_token") or {}).get("data") or {}
+                base_obj = included_by_id.get(base_rel.get("id"), {})
+                base_attrs = base_obj.get("attributes") or {}
+                address = base_attrs.get("address")
+                if not address:
+                    # Geckoterminal-style pool IDs can include "solana_".
+                    address = attrs.get("base_token_address")
+                if not address:
+                    continue
 
-        base_id = str(
-            (((rels.get("base_token") or {}).get("data") or {}).get("id"))
-            or ""
-        )
-        quote_id = str(
-            (((rels.get("quote_token") or {}).get("data") or {}).get("id"))
-            or ""
-        )
-
-        base_attrs = (included.get(base_id) or {}).get("attributes") or {}
-        quote_attrs = (included.get(quote_id) or {}).get("attributes") or {}
-
-        address = str(
-            base_attrs.get("address")
-            or (base_id.split("_", 1)[1] if "_" in base_id else "")
-        )
-        quote_symbol = str(
-            quote_attrs.get("symbol") or "UNKNOWN"
-        ).upper()
-
-        txns = attrs.get("transactions") or {}
-        h24 = txns.get("h24") or {}
-
-        pool_address = str(attrs.get("address") or "")
-        item = _candidate(
-            address,
-            str(base_attrs.get("symbol") or "UNKNOWN"),
-            str(base_attrs.get("name") or attrs.get("name") or ""),
-            quote_symbol,
-            pool_address or str(pool.get("id") or ""),
-            _number(attrs.get("base_token_price_usd")),
-            _number(attrs.get("reserve_in_usd")),
-            _number((attrs.get("volume_usd") or {}).get("h24")),
-            _number(h24.get("buys")),
-            _number(h24.get("sells")),
-            "CoinGecko",
-            f"https://www.geckoterminal.com/solana/pools/{pool_address}",
-        )
-
-        if item:
-            candidates.append(item)
-
-    return _dedupe(candidates), {
-        "provider": "CoinGecko",
-        "coingecko_pools_received": len(data),
-        "coingecko_candidates": len(candidates),
-    }
-
-
-def _normalize_gecko_pools(payload):
-    data = payload.get("data", []) if isinstance(payload, dict) else []
-    candidates = []
-
-    for pool in data:
-        if not isinstance(pool, dict):
-            continue
-
-        attrs = pool.get("attributes") or {}
-        rels = pool.get("relationships") or {}
-
-        base_id = str(
-            (((rels.get("base_token") or {}).get("data") or {}).get("id"))
-            or ""
-        )
-
-        address = (
-            base_id.split("_", 1)[1]
-            if base_id.startswith("solana_")
-            else str(attrs.get("base_token_address") or "")
-        )
-
-        txns = attrs.get("transactions") or {}
-        h24 = txns.get("h24") or {}
-        name = str(attrs.get("name") or "")
-        pool_address = str(attrs.get("address") or "")
-
-        item = _candidate(
-            address,
-            name.split(" / ")[0].strip() if name else "UNKNOWN",
-            name,
-            "UNKNOWN",
-            pool_address,
-            _number(attrs.get("base_token_price_usd")),
-            _number(attrs.get("reserve_in_usd")),
-            _number((attrs.get("volume_usd") or {}).get("h24")),
-            _number(h24.get("buys")),
-            _number(h24.get("sells")),
-            "GeckoTerminal",
-            f"https://www.geckoterminal.com/solana/pools/{pool_address}",
-        )
-
-        if item:
-            candidates.append(item)
-
-    return _dedupe(candidates), {
-        "provider": "GeckoTerminal",
-        "gecko_pools_received": len(data),
-        "gecko_candidates": len(candidates),
-    }
-
-
-async def _fetch_coingecko():
-    api_key = os.getenv("COINGECKO_API_KEY", "").strip()
-
-    if not api_key:
-        raise RuntimeError("coingecko_api_key_missing")
-
-    all_pools = []
-    all_included = []
-    page_errors = []
-    pages_scanned = 0
-
-    headers = {
-        "Accept": "application/json",
-        "User-Agent": "MemecoinSpyBot/1.6",
-        "x-cg-demo-api-key": api_key,
-    }
-
-    async with httpx.AsyncClient(
-        timeout=REQUEST_TIMEOUT_SECONDS,
-        headers=headers,
-    ) as client:
-        for page in (1, 2, 3):
-            try:
-                payload = await _get_json(
-                    client,
-                    GECKO_NEW_POOLS_URL,
-                    params={
-                        "include": "base_token,quote_token",
-                        "page": page,
-                    },
-                    provider="coingecko",
+                volume = attrs.get("volume_usd") or {}
+                txns = attrs.get("transactions") or {}
+                h24 = txns.get("h24") or {}
+                buys = _as_float(h24.get("buys"))
+                sells = _as_float(h24.get("sells"))
+                ratio = buys / max(sells, 1.0)
+                liquidity = _as_float(attrs.get("reserve_in_usd"))
+                price = _as_float(attrs.get("base_token_price_usd"))
+                pool_id = pool.get("id", "")
+                pool_address = attrs.get("address") or (
+                    pool_id.split("_", 1)[1] if "_" in pool_id else pool_id
                 )
 
-                data = payload.get("data", []) if isinstance(payload, dict) else []
-
-                if not data:
-                    break
-
-                all_pools.extend(data)
-
-                included = payload.get("included", [])
-                if isinstance(included, list):
-                    all_included.extend(included)
-
-                pages_scanned += 1
-
-            except Exception as exc:
-                page_errors.append(
-                    f"page_{page}:{type(exc).__name__}:{str(exc)[:100]}"
-                )
-                if not all_pools:
-                    raise
+                pools.append({
+                    "token_address": str(address),
+                    "symbol": str(base_attrs.get("symbol") or "UNKNOWN"),
+                    "token_symbol": str(base_attrs.get("symbol") or "UNKNOWN"),
+                    "name": str(base_attrs.get("name") or ""),
+                    "price_usd": price,
+                    "liquidity_usd": liquidity,
+                    "volume_24h_usd": _as_float(volume.get("h24")),
+                    "buys_24h": int(buys),
+                    "sells_24h": int(sells),
+                    "buy_sell_ratio": ratio,
+                    "buys_to_sells_ratio": ratio,
+                    "pool_address": pool_address,
+                    "pair_address": pool_address,
+                    "provider": "CoinGecko",
+                    "url": None,
+                    "created_at": attrs.get("pool_created_at"),
+                })
+        except Exception as exc:
+            errors.append(f"coingecko_page_{page}: {type(exc).__name__}: {str(exc)[:160]}")
+            # Stop paging when this provider is in cooldown; preserve prior pages.
+            if _cooldown_remaining("coingecko") > 0:
                 break
+        if page != 3:
+            await asyncio.sleep(0.35)
 
-            if page < 3:
-                await asyncio.sleep(0.35)
-
-    combined_payload = {
-        "data": all_pools,
-        "included": all_included,
-    }
-
-    candidates, diagnostics = _normalize_coingecko_pools(combined_payload)
-
-    diagnostics.update({
-        "coingecko_pages_scanned": pages_scanned,
-        "coingecko_page_errors": page_errors,
-    })
-
-    return candidates, diagnostics
+    return pools, errors
 
 
-async def _fetch_gecko_fallback():
-    headers = {
-        "Accept": "application/json",
-        "User-Agent": "MemecoinSpyBot/1.6",
-    }
-
-    async with httpx.AsyncClient(
-        timeout=REQUEST_TIMEOUT_SECONDS,
-        headers=headers,
-    ) as client:
+async def _fetch_gecko_fallback(client: httpx.AsyncClient) -> tuple[list[dict], list[str]]:
+    pools: list[dict] = []
+    errors: list[str] = []
+    try:
         payload = await _get_json(
             client,
-            GECKO_TRENDING_URL,
+            GECKOTERMINAL_TRENDING_URL,
             provider="geckoterminal",
+            headers={"accept": "application/json;version=20230302"},
         )
+        data = payload.get("data", []) if isinstance(payload, dict) else []
+        included = payload.get("included", []) if isinstance(payload, dict) else []
+        included_by_id = {
+            obj.get("id"): obj
+            for obj in included
+            if isinstance(obj, dict) and obj.get("id")
+        }
 
-    return _normalize_gecko_pools(payload)
+        for pool in data:
+            if not isinstance(pool, dict):
+                continue
+            attrs = pool.get("attributes") or {}
+            rels = pool.get("relationships") or {}
+            base_rel = (rels.get("base_token") or {}).get("data") or {}
+            base_obj = included_by_id.get(base_rel.get("id"), {})
+            base_attrs = base_obj.get("attributes") or {}
+            address = base_attrs.get("address")
+            if not address:
+                continue
+
+            volume = attrs.get("volume_usd") or {}
+            txns = attrs.get("transactions") or {}
+            h24 = txns.get("h24") or {}
+            buys = _as_float(h24.get("buys"))
+            sells = _as_float(h24.get("sells"))
+            ratio = buys / max(sells, 1.0)
+            pool_id = pool.get("id", "")
+            pool_address = attrs.get("address") or (
+                pool_id.split("_", 1)[1] if "_" in pool_id else pool_id
+            )
+
+            pools.append({
+                "token_address": str(address),
+                "symbol": str(base_attrs.get("symbol") or "UNKNOWN"),
+                "token_symbol": str(base_attrs.get("symbol") or "UNKNOWN"),
+                "name": str(base_attrs.get("name") or ""),
+                "price_usd": _as_float(attrs.get("base_token_price_usd")),
+                "liquidity_usd": _as_float(attrs.get("reserve_in_usd")),
+                "volume_24h_usd": _as_float(volume.get("h24")),
+                "buys_24h": int(buys),
+                "sells_24h": int(sells),
+                "buy_sell_ratio": ratio,
+                "buys_to_sells_ratio": ratio,
+                "pool_address": pool_address,
+                "pair_address": pool_address,
+                "provider": "GeckoTerminal",
+                "url": None,
+                "created_at": attrs.get("pool_created_at"),
+            })
+    except Exception as exc:
+        errors.append(f"geckoterminal: {type(exc).__name__}: {str(exc)[:160]}")
+
+    return pools, errors
 
 
-async def _fetch_dexscreener():
-    headers = {
-        "Accept": "application/json",
-        "User-Agent": "MemecoinSpyBot/1.6",
+async def _fetch_candidates() -> tuple[list[dict], dict]:
+    timeout = httpx.Timeout(REQUEST_TIMEOUT_SECONDS, connect=8.0)
+    limits = httpx.Limits(max_connections=5, max_keepalive_connections=3)
+    all_candidates: list[dict] = []
+    source_errors: list[str] = []
+    source_counts: dict[str, int] = {}
+
+    async with httpx.AsyncClient(timeout=timeout, limits=limits) as client:
+        dex_pairs, dex_errors = await _discover_dex_pairs(client)
+        source_errors.extend(dex_errors)
+        normalized_dex = [
+            item for pair in dex_pairs
+            if (item := _normalize_dex_pair(pair)) is not None
+        ]
+        source_counts["DexScreener"] = len(normalized_dex)
+        all_candidates.extend(normalized_dex)
+
+        cg_pools, cg_errors = await _fetch_coingecko(client)
+        source_errors.extend(cg_errors)
+        source_counts["CoinGecko"] = len(cg_pools)
+        all_candidates.extend(cg_pools)
+
+        gt_pools, gt_errors = await _fetch_gecko_fallback(client)
+        source_errors.extend(gt_errors)
+        source_counts["GeckoTerminal"] = len(gt_pools)
+        all_candidates.extend(gt_pools)
+
+    # Deduplicate by token address. Prefer the row with more useful market data.
+    by_address: dict[str, dict] = {}
+    for candidate in all_candidates:
+        address = candidate.get("token_address")
+        if not address:
+            continue
+        old = by_address.get(address)
+        if old is None:
+            by_address[address] = candidate
+            continue
+        old_quality = (
+            int(_as_float(old.get("liquidity_usd")) > 0)
+            + int(_as_float(old.get("volume_24h_usd")) > 0)
+            + int(_as_float(old.get("price_usd")) > 0)
+        )
+        new_quality = (
+            int(_as_float(candidate.get("liquidity_usd")) > 0)
+            + int(_as_float(candidate.get("volume_24h_usd")) > 0)
+            + int(_as_float(candidate.get("price_usd")) > 0)
+        )
+        if new_quality > old_quality:
+            by_address[address] = candidate
+
+    candidates = list(by_address.values())
+    diagnostics = {
+        "provider": "Combined",
+        "checked": len(candidates),
+        "source_counts": source_counts,
+        "source_errors": source_errors[-20:],
+        "candidate_count": len(candidates),
+        "note": (
+            "Provider rate limits can temporarily reduce coverage. "
+            "Candidates are deduplicated across sources; paper mode only."
+        ),
+        "last_error": source_errors[-1] if source_errors else None,
     }
-
-    async with httpx.AsyncClient(
-        timeout=REQUEST_TIMEOUT_SECONDS,
-        headers=headers,
-    ) as client:
-        pairs, discovered, batch_errors = await _discover_dex_pairs(client)
-
-    candidates, diagnostics = _normalize_dex_pairs(pairs)
-
-    diagnostics.update({
-        "provider": "DEX Screener",
-        "discovered_solana_tokens": discovered,
-        "batch_errors": batch_errors,
-    })
-
     return candidates, diagnostics
 
 
-async def _fetch_candidates():
-    """
-    Kaynakları birleştirir.
-    Tek bir kaynağın hatası diğer kaynakları durdurmaz.
-    """
-    combined = []
-    source_diagnostics = []
-    errors = []
-
-    providers = (
-        ("CoinGecko", _fetch_coingecko),
-        ("DEX Screener", _fetch_dexscreener),
-        ("GeckoTerminal", _fetch_gecko_fallback),
+def _score(candidate: dict) -> float:
+    liquidity = _as_float(candidate.get("liquidity_usd"))
+    volume = _as_float(candidate.get("volume_24h_usd"))
+    ratio = _as_float(
+        _first(candidate, "buy_sell_ratio", "buys_to_sells_ratio", default=0)
     )
-
-    for provider_name, fetcher in providers:
-        try:
-            candidates, diagnostics = await fetcher()
-            combined.extend(candidates)
-
-            source_diagnostics.append({
-                "source": provider_name,
-                "status": "ok",
-                **diagnostics,
-            })
-
-        except Exception as exc:
-            message = (
-                f"{provider_name}:{type(exc).__name__}:"
-                f"{str(exc)[:120]}"
-            )
-            errors.append(message)
-
-            source_diagnostics.append({
-                "source": provider_name,
-                "status": "error",
-                "error": message,
-            })
-
-            logger.warning("Market source failed: %s", message)
-
-    combined = _dedupe(combined)
-
-    if not combined:
-        raise RuntimeError(
-            "; ".join(errors) if errors else "no_market_data"
-        )
-
-    return combined, {
-        "provider": "Combined",
-        "sources": source_diagnostics,
-        "source_errors": errors,
-        "unique_candidates": len(combined),
-    }
+    # A transparent ranking aid only; not a prediction or profitability claim.
+    return round(
+        min(liquidity / 10000.0, 5.0)
+        + min(volume / 20000.0, 5.0)
+        + min(ratio, 5.0),
+        3,
+    )
 
 
 async def get_signal_candidates(
-    limit=20,
-    min_liquidity_usd=None,
-    min_volume_24h_usd=None,
-    min_buys_sells_ratio=None,
-    **kwargs,
-):
-    liquidity_floor = max(
-        0.0,
-        _number(
-            MIN_LIQUIDITY_USD
-            if min_liquidity_usd is None
-            else min_liquidity_usd,
-            MIN_LIQUIDITY_USD,
-        ),
+    min_liquidity_usd: float | None = None,
+    min_volume_24h_usd: float | None = None,
+    min_buys_sells_ratio: float | None = None,
+    limit: int = 20,
+) -> dict:
+    """Return filtered Solana token candidates and source diagnostics."""
+    min_liquidity = (
+        MIN_LIQUIDITY_USD if min_liquidity_usd is None else float(min_liquidity_usd)
+    )
+    min_volume = (
+        MIN_VOLUME_24H_USD if min_volume_24h_usd is None else float(min_volume_24h_usd)
+    )
+    min_ratio = (
+        MIN_BUYS_SELLS_RATIO
+        if min_buys_sells_ratio is None
+        else float(min_buys_sells_ratio)
     )
 
-    volume_floor = max(
-        0.0,
-        _number(
-            MIN_VOLUME_24H_USD
-            if min_volume_24h_usd is None
-            else min_volume_24h_usd,
-            MIN_VOLUME_24H_USD,
-        ),
-    )
-
-    ratio_floor = max(
-        0.0,
-        _number(
-            MIN_BUY_SELL_RATIO
-            if min_buys_sells_ratio is None
-            else min_buys_sells_ratio,
-            MIN_BUY_SELL_RATIO,
-        ),
-    )
-
+    now = time.monotonic()
     async with _lock:
-        now = time.time()
-        fresh = (
-            _cache["time"] > 0
-            and now - _cache["time"] < CACHE_SECONDS
+        cache_is_fresh = (
+            now - float(_cache.get("timestamp", 0.0)) < CACHE_SECONDS
+            and isinstance(_cache.get("candidates"), list)
+            and bool(_cache.get("diagnostics"))
         )
-
-        if fresh:
-            candidates = _cache["candidates"]
-            diagnostics = _cache["diagnostics"]
-            error = _cache["error"]
-
+        if cache_is_fresh:
+            candidates = list(_cache["candidates"])
+            diagnostics = dict(_cache["diagnostics"])
         else:
-            try:
-                candidates, diagnostics = await _fetch_candidates()
+            candidates, diagnostics = await _fetch_candidates()
+            _cache.update({
+                "timestamp": time.monotonic(),
+                "candidates": candidates,
+                "diagnostics": diagnostics,
+            })
 
-                _cache.update({
-                    "time": time.time(),
-                    "candidates": candidates,
-                    "diagnostics": diagnostics,
-                    "error": None,
-                })
-
-                error = None
-
-            except Exception as exc:
-                error = f"{type(exc).__name__}: {str(exc)[:300]}"
-                logger.warning("Market scan failed: %s", error)
-
-                _cache["error"] = error
-                candidates = _cache["candidates"]
-                diagnostics = _cache["diagnostics"]
-
-        filtered = [
-            item for item in candidates
-            if item["liquidity_usd"] >= liquidity_floor
-            and item["volume_24h_usd"] >= volume_floor
-            and item["buy_sell_ratio"] >= ratio_floor
-        ]
-
-        preview = [
-            {
-                "symbol": str(item.get("symbol") or "UNKNOWN"),
-                "name": str(item.get("name") or ""),
-                "liquidity_usd": round(
-                    _number(item.get("liquidity_usd")), 2
-                ),
-                "volume_24h_usd": round(
-                    _number(item.get("volume_24h_usd")), 2
-                ),
-                "buy_sell_ratio": round(
-                    _number(item.get("buy_sell_ratio")), 3
-                ),
-                "score": round(_number(item.get("score")), 3),
-                "source": str(item.get("source") or ""),
-                "url": str(item.get("url") or ""),
-            }
-            for item in candidates[:MAX_CANDIDATE_PREVIEW]
-        ]
-
-        diag = {
-            **diagnostics,
-            "active_min_liquidity_usd": liquidity_floor,
-            "active_min_volume_24h_usd": volume_floor,
-            "active_min_buy_sell_ratio": ratio_floor,
-            "unique_candidate_count": len(candidates),
-            "below_liquidity_filter": sum(
-                item["liquidity_usd"] < liquidity_floor
-                for item in candidates
-            ),
-            "below_volume_filter": sum(
-                item["volume_24h_usd"] < volume_floor
-                for item in candidates
-            ),
-            "below_ratio_filter": sum(
-                item["buy_sell_ratio"] < ratio_floor
-                for item in candidates
-            ),
-            "candidate_preview": preview,
-        }
-
-    try:
-        safe_limit = max(1, min(int(limit), 50))
-    except (TypeError, ValueError):
-        safe_limit = 20
-
-    signals = filtered[:safe_limit]
-
-    if signals:
-        note = (
-            "Filtered market candidates only; "
-            "not investment advice or a profit guarantee."
+    filtered: list[dict] = []
+    for candidate in candidates:
+        liquidity = _as_float(candidate.get("liquidity_usd"))
+        volume = _as_float(candidate.get("volume_24h_usd"))
+        ratio = _as_float(
+            _first(candidate, "buy_sell_ratio", "buys_to_sells_ratio", default=0)
         )
-    elif error:
-        note = (
-            "Market scan failed or cached data is being used; "
-            "inspect last_error and diagnostics."
-        )
-    else:
-        note = (
-            "Market data received, but no candidates passed "
-            "the active filters."
-        )
+        price = _as_float(candidate.get("price_usd"))
+        if (
+            liquidity < min_liquidity
+            or volume < min_volume
+            or ratio < min_ratio
+            or price <= 0
+        ):
+            continue
 
-    return {
-        "provider": diag.get("provider", "Combined"),
-        "checked": diag.get(
-            "unique_candidate_count",
-            len(candidates),
-        ),
+        item = dict(candidate)
+        item["score"] = _score(item)
+        filtered.append(item)
+
+    filtered.sort(key=lambda item: item.get("score", 0), reverse=True)
+    result_signals = filtered[: max(0, int(limit))]
+    result_diagnostics = dict(diagnostics)
+    result_diagnostics.update({
+        "checked": len(candidates),
         "candidate_count": len(filtered),
-        "signals": signals,
-        "diagnostics": diag,
+        "filters": {
+            "min_liquidity_usd": min_liquidity,
+            "min_volume_24h_usd": min_volume,
+            "min_buys_sells_ratio": min_ratio,
+        },
+        "candidate_preview": [
+            {
+                "symbol": item.get("symbol"),
+                "token_address": item.get("token_address"),
+                "liquidity_usd": item.get("liquidity_usd"),
+                "volume_24h_usd": item.get("volume_24h_usd"),
+                "buy_sell_ratio": item.get("buy_sell_ratio"),
+                "score": item.get("score"),
+                "provider": item.get("provider"),
+            }
+            for item in result_signals[:PREVIEW_LIMIT]
+        ],
+        "cached_for_seconds": CACHE_SECONDS,
         "mode": TRADING_MODE,
         "real_trading_enabled": REAL_TRADING_ENABLED,
-        "note": note,
-        "last_error": error,
+    })
+
+    return {
+        "provider": diagnostics.get("provider", "Combined"),
+        "checked": len(candidates),
+        "candidate_count": len(filtered),
+        "signals": result_signals,
+        "note": diagnostics.get("note"),
+        "last_error": diagnostics.get("last_error"),
+        "source_errors": diagnostics.get("source_errors", []),
+        "diagnostics": result_diagnostics,
+    }
+
+
+def get_signal_engine_status() -> dict:
+    now = time.monotonic()
+    return {
+        "mode": TRADING_MODE,
+        "real_trading_enabled": REAL_TRADING_ENABLED,
+        "cache_age_seconds": (
+            round(now - float(_cache.get("timestamp", 0.0)), 1)
+            if _cache.get("timestamp")
+            else None
+        ),
+        "cache_ttl_seconds": CACHE_SECONDS,
+        "provider_cooldowns_seconds": {
+            provider: round(max(0.0, expiry - now), 1)
+            for provider, expiry in _provider_cooldowns.items()
+            if expiry > now
+        },
+        "provider_error_counts": dict(_provider_errors),
     }
