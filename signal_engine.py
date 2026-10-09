@@ -3,155 +3,86 @@ import time
 
 import httpx
 
+# Conservative signal scanner: one market-data request per scan.
+# If the provider rate-limits us, serve cached data (if any) and wait.
 DEX_SEARCH_URL = "https://api.dexscreener.com/latest/dex/search"
-DEX_BOOSTS_URL = "https://api.dexscreener.com/token-boosts/latest/v1"
+REQUEST_TIMEOUT_SECONDS = 12
+CACHE_SECONDS = 60
+REQUEST_COOLDOWN_SECONDS = 180
 
-REQUEST_TIMEOUT = 15
-CACHE_SECONDS = 30
-COOLDOWN_SECONDS = 60
-
-_cache = {"time": 0.0, "data": None}
-_last_request = 0.0
+_cache = {"at": 0.0, "pairs": None}
+_last_request_at = 0.0
 _lock = asyncio.Lock()
+_last_error = None
 
 
-def _number(value):
+def _num(value, default=0.0):
     try:
         return float(value or 0)
     except (TypeError, ValueError):
-        return 0.0
+        return default
 
 
-async def _fetch_json(client, url, params=None):
-    response = await client.get(url, params=params)
-
+async def _fetch_pairs(client):
+    # This is deliberately the only request made during a scan.
+    response = await client.get(DEX_SEARCH_URL, params={"q": "SOL"})
     if response.status_code == 429:
-        raise httpx.HTTPStatusError(
-            "Market data provider rate limited",
-            request=response.request,
-            response=response,
-        )
-
+        raise RuntimeError("rate_limited")
     response.raise_for_status()
-    return response.json()
+    payload = response.json()
 
+    pairs = []
+    seen = set()
+    for pair in payload.get("pairs") or []:
+        if not isinstance(pair, dict):
+            continue
+        if (pair.get("chainId") or "").lower() != "solana":
+            continue
 
-async def _collect_pairs(client):
-    pairs_by_address = {}
-
-    # Önce Solana token listesine ulaşmayı dene.
-    try:
-        boosts = await _fetch_json(client, DEX_BOOSTS_URL)
-
-        addresses = list(dict.fromkeys(
-            item.get("tokenAddress")
-            for item in boosts
-            if isinstance(item, dict)
-            and item.get("chainId") == "solana"
-            and item.get("tokenAddress")
-        ))[:30]
-
-        for offset in range(0, len(addresses), 10):
-            batch = addresses[offset:offset + 10]
-
-            if not batch:
-                continue
-
-            payload = await _fetch_json(
-                client,
-                "https://api.dexscreener.com/latest/dex/tokens/"
-                + ",".join(batch),
-            )
-
-            for pair in payload.get("pairs") or []:
-                if not isinstance(pair, dict):
-                    continue
-
-                if (pair.get("chainId") or "").lower() != "solana":
-                    continue
-
-                address = (pair.get("baseToken") or {}).get("address")
-
-                if address and address in batch:
-                    pairs_by_address[address] = pair
-
-    except httpx.HTTPStatusError:
-        raise
-    except (httpx.HTTPError, ValueError, TypeError):
-        pass
-
-    # İlk kaynak sonuç vermezse arama kaynağını dene.
-    if not pairs_by_address:
-        payload = await _fetch_json(
-            client,
-            DEX_SEARCH_URL,
-            params={"q": "SOL"},
-        )
-
-        for pair in payload.get("pairs") or []:
-            if not isinstance(pair, dict):
-                continue
-
-            if (pair.get("chainId") or "").lower() != "solana":
-                continue
-
-            address = (pair.get("baseToken") or {}).get("address")
-
-            if address:
-                previous = pairs_by_address.get(address)
-
-                if (
-                    previous is None
-                    or _number(
-                        (pair.get("liquidity") or {}).get("usd")
-                    ) > _number(
-                        (previous.get("liquidity") or {}).get("usd")
-                    )
-                ):
-                    pairs_by_address[address] = pair
-
-    return list(pairs_by_address.values())
-
-
-def _build_signals(pairs, min_liquidity_usd,
-                   min_volume_24h_usd, min_buys_sells_ratio, limit):
-    signals = []
-
-    for pair in pairs:
         base = pair.get("baseToken") or {}
         address = base.get("address")
-
-        if not address:
+        price = _num(pair.get("priceUsd"))
+        if not address or price <= 0:
             continue
 
-        liquidity = _number(
-            (pair.get("liquidity") or {}).get("usd")
-        )
+        # Deduplicate by pair address when available, otherwise token address.
+        key = pair.get("pairAddress") or address
+        if key in seen:
+            continue
+        seen.add(key)
+        pairs.append(pair)
 
-        volume = _number(
-            (pair.get("volume") or {}).get("h24")
-        )
+    return pairs
 
+
+def _build_signals(
+    pairs,
+    min_liquidity_usd=10000,
+    min_volume_24h_usd=20000,
+    min_buys_sells_ratio=1.0,
+    limit=20,
+):
+    signals = []
+
+    for pair in pairs or []:
+        base = pair.get("baseToken") or {}
+        address = base.get("address")
+        price = _num(pair.get("priceUsd"))
+        if not address or price <= 0:
+            continue
+
+        liquidity = _num((pair.get("liquidity") or {}).get("usd"))
+        volume = _num((pair.get("volume") or {}).get("h24"))
         txns = (pair.get("txns") or {}).get("h24") or {}
-        buys = _number((txns.get("buys") or 0))
-        sells = _number((txns.get("sells") or 0))
+        buys = _num(txns.get("buys"))
+        sells = _num(txns.get("sells"))
+        ratio = buys / max(sells, 1.0)
 
-        ratio = buys / max(sells, 1)
-
-        # Yetersiz piyasa verilerini ele.
         if liquidity < min_liquidity_usd:
             continue
-
         if volume < min_volume_24h_usd:
             continue
-
         if ratio < min_buys_sells_ratio:
-            continue
-
-        # DexScreener fiyatı yalnızca BASE token içindir.
-        price = _number(pair.get("priceUsd"))
-
-        if price <= 0:
             continue
 
         signals.append({
@@ -163,7 +94,7 @@ def _build_signals(pairs, min_liquidity_usd,
             "buys": int(buys),
             "sells": int(sells),
             "buys_to_sells_ratio": round(ratio, 4),
-            "price_change_24h_pct": _number(
+            "price_change_24h_pct": _num(
                 (pair.get("priceChange") or {}).get("h24")
             ),
             "pair_address": pair.get("pairAddress"),
@@ -173,14 +104,33 @@ def _build_signals(pairs, min_liquidity_usd,
         })
 
     signals.sort(
-        key=lambda item: (
-            item["liquidity_usd"],
-            item["volume_24h_usd"],
-        ),
+        key=lambda item: (item["liquidity_usd"], item["volume_24h_usd"]),
         reverse=True,
     )
+    return signals[:max(0, int(limit))]
 
-    return signals[:limit]
+
+def _response(pairs, min_liquidity_usd, min_volume_24h_usd,
+              min_buys_sells_ratio, limit, provider, note=None):
+    signals = _build_signals(
+        pairs,
+        min_liquidity_usd=min_liquidity_usd,
+        min_volume_24h_usd=min_volume_24h_usd,
+        min_buys_sells_ratio=min_buys_sells_ratio,
+        limit=limit,
+    )
+    result = {
+        "provider": provider,
+        "checked": len(pairs or []),
+        "candidate_count": len(signals),
+        "signals": signals,
+        "mode": "paper",
+        "real_trading_enabled": False,
+        "note": note or (
+            "Experimental market filters only. Signals do not guarantee profits."
+        ),
+    }
+    return result
 
 
 async def get_signal_candidates(
@@ -189,96 +139,86 @@ async def get_signal_candidates(
     min_buys_sells_ratio=1.0,
     limit=20,
 ):
-    global _last_request
+    """Return filtered candidates without propagating provider rate-limit errors."""
+    global _last_request_at, _last_error
 
     now = time.monotonic()
+    cached_pairs = _cache["pairs"]
 
-    if (
-        _cache["data"] is not None
-        and now - _cache["time"] < CACHE_SECONDS
-    ):
-        return _build_response(
-            _cache["data"],
-            min_liquidity_usd,
-            min_volume_24h_usd,
-            min_buys_sells_ratio,
-            limit,
-            "cache",
+    # Serve cache without calling the provider.
+    if cached_pairs is not None and now - _cache["at"] < CACHE_SECONDS:
+        return _response(
+            cached_pairs, min_liquidity_usd, min_volume_24h_usd,
+            min_buys_sells_ratio, limit, "DexScreener cache",
+            "Using cached market data; quotes may be stale.",
         )
 
     async with _lock:
         now = time.monotonic()
+        cached_pairs = _cache["pairs"]
 
-        if (
-            _cache["data"] is not None
-            and now - _cache["time"] < CACHE_SECONDS
-        ):
-            return _build_response(
-                _cache["data"],
-                min_liquidity_usd,
-                min_volume_24h_usd,
-                min_buys_sells_ratio,
-                limit,
-                "cache",
+        if cached_pairs is not None and now - _cache["at"] < CACHE_SECONDS:
+            return _response(
+                cached_pairs, min_liquidity_usd, min_volume_24h_usd,
+                min_buys_sells_ratio, limit, "DexScreener cache",
+                "Using cached market data; quotes may be stale.",
             )
 
-        if now - _last_request < COOLDOWN_SECONDS:
+        if now - _last_request_at < REQUEST_COOLDOWN_SECONDS:
+            if cached_pairs is not None:
+                return _response(
+                    cached_pairs, min_liquidity_usd, min_volume_24h_usd,
+                    min_buys_sells_ratio, limit, "DexScreener stale cache",
+                    "Provider cooldown active; returning cached data only. "
+                    "Do not treat stale quotes as confirmed current prices.",
+                )
             return {
                 "provider": "DexScreener",
                 "checked": 0,
+                "candidate_count": 0,
                 "signals": [],
-                "note": "Provider cooldown active; retry later.",
+                "mode": "paper",
+                "real_trading_enabled": False,
+                "note": "Provider cooldown active; no fresh data available. Retry later.",
             }
 
-        _last_request = now
+        _last_request_at = now
 
-        async with httpx.AsyncClient(
-            timeout=REQUEST_TIMEOUT,
-            headers={
-                "Accept": "application/json",
-                "User-Agent": "MemecoinSpyBot/1.5",
-            },
-        ) as client:
-            pairs = await _collect_pairs(client)
+        try:
+            async with httpx.AsyncClient(
+                timeout=REQUEST_TIMEOUT_SECONDS,
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": "MemecoinSpyBot/1.6",
+                },
+            ) as client:
+                pairs = await _fetch_pairs(client)
 
-        _cache["data"] = pairs
-        _cache["time"] = time.monotonic()
+            _cache["pairs"] = pairs
+            _cache["at"] = time.monotonic()
+            _last_error = None
 
-        return _build_response(
-            pairs,
-            min_liquidity_usd,
-            min_volume_24h_usd,
-            min_buys_sells_ratio,
-            limit,
-            "DexScreener",
-        )
+            return _response(
+                pairs, min_liquidity_usd, min_volume_24h_usd,
+                min_buys_sells_ratio, limit, "DexScreener",
+            )
 
-
-def _build_response(
-    pairs,
-    min_liquidity_usd,
-    min_volume_24h_usd,
-    min_buys_sells_ratio,
-    limit,
-    provider,
-):
-    signals = _build_signals(
-        pairs,
-        min_liquidity_usd,
-        min_volume_24h_usd,
-        min_buys_sells_ratio,
-        limit,
-    )
-
-    return {
-        "provider": provider,
-        "checked": len(pairs),
-        "candidate_count": len(signals),
-        "signals": signals,
-        "mode": "paper",
-        "real_trading_enabled": False,
-        "note": (
-            "Market filters only; signals are experimental and "
-            "do not guarantee profitable trades."
-        ),
-    }
+        except Exception as exc:
+            _last_error = str(exc)[:250]
+            if cached_pairs is not None:
+                return _response(
+                    cached_pairs, min_liquidity_usd, min_volume_24h_usd,
+                    min_buys_sells_ratio, limit, "DexScreener stale cache",
+                    "Provider request failed; cached data may be stale. "
+                    "Do not treat it as a confirmed current quote.",
+                )
+            return {
+                "provider": "DexScreener",
+                "checked": 0,
+                "candidate_count": 0,
+                "signals": [],
+                "mode": "paper",
+                "real_trading_enabled": False,
+                "note": "Market data unavailable; no fresh signals returned. "
+                        "Provider cooldown is active.",
+            }
