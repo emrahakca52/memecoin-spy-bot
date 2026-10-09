@@ -1,3 +1,5 @@
+import asyncio
+import time
 from datetime import datetime, timezone
 from threading import RLock
 
@@ -7,6 +9,13 @@ _lock = RLock()
 _trades = []
 _positions = {}
 _next_id = 1
+
+PRICE_CACHE_SECONDS = 300
+RATE_LIMIT_COOLDOWN_SECONDS = 600
+
+_price_cache = {}
+_blocked_until = 0.0
+_last_price_error = None
 
 
 def _now():
@@ -157,21 +166,79 @@ def open_paper_position(
 
 
 async def update_paper_prices():
+    global _blocked_until, _last_price_error
+
+    now = time.monotonic()
+
     with _lock:
         addresses = list(_positions.keys())
 
-    if not addresses:
-        return {"updated": 0}
+        if not addresses:
+            return {"updated": 0, "note": "No open positions"}
+
+        # Önce önbellekteki fiyatları kullan.
+        cached_addresses = {
+            address
+            for address in addresses
+            if address in _price_cache
+            and now - _price_cache[address]["at"] < PRICE_CACHE_SECONDS
+        }
+
+        addresses_to_fetch = [
+            address for address in addresses
+            if address not in cached_addresses
+        ]
+
+        # API sınırına takıldıysak yeni istek gönderme.
+        if now < _blocked_until:
+            return {
+                "updated": 0,
+                "rate_limited": True,
+                "note": "DexScreener cooldown active; cached prices retained.",
+                "last_error": _last_price_error,
+            }
+
+    if not addresses_to_fetch:
+        return {"updated": 0, "cached": True}
 
     url = (
         "https://api.dexscreener.com/latest/dex/tokens/"
-        + ",".join(addresses[:30])
+        + ",".join(addresses_to_fetch[:30])
     )
 
-    async with httpx.AsyncClient(timeout=15) as client:
-        response = await client.get(url)
-        response.raise_for_status()
-        data = response.json()
+    try:
+        async with httpx.AsyncClient(
+            timeout=15,
+            headers={"User-Agent": "MemecoinSpyPro/1.0"},
+        ) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+            data = response.json()
+
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 429:
+            _blocked_until = time.monotonic() + RATE_LIMIT_COOLDOWN_SECONDS
+            _last_price_error = "DexScreener rate limit (429)"
+            return {
+                "updated": 0,
+                "rate_limited": True,
+                "note": "Prices were not refreshed; previous values retained.",
+            }
+
+        _last_price_error = (
+            f"HTTP {exc.response.status_code} from DexScreener"
+        )
+        return {
+            "updated": 0,
+            "error": _last_price_error,
+        }
+
+    except httpx.HTTPError as exc:
+        _last_price_error = f"Market data request failed: {type(exc).__name__}"
+        return {
+            "updated": 0,
+            "error": _last_price_error,
+        }
 
     pairs = data.get("pairs") or []
     prices = {}
@@ -189,21 +256,37 @@ async def update_paper_prices():
             prices.setdefault(address, price)
 
     updated = 0
+    current_time = time.monotonic()
 
     with _lock:
+        for address, price in prices.items():
+            _price_cache[address] = {
+                "price": price,
+                "at": current_time,
+            }
+
         for address, pos in _positions.items():
-            price = prices.get(address)
+            cached = _price_cache.get(address)
 
-            if price:
-                pos["current_price_usd"] = price
-                pos["current_value_usd"] = round(
-                    pos["quantity"] * price, 4
-                )
-                pos["unrealized_pnl_usd"] = round(
-                    pos["current_value_usd"] - pos["amount_usd"],
-                    4,
-                )
-                pos["last_updated"] = _now()
-                updated += 1
+            if not cached:
+                continue
 
-    return {"updated": updated}
+            price = cached["price"]
+            pos["current_price_usd"] = price
+            pos["current_value_usd"] = round(
+                pos["quantity"] * price, 4
+            )
+            pos["unrealized_pnl_usd"] = round(
+                pos["current_value_usd"] - pos["amount_usd"], 4
+            )
+            pos["last_updated"] = _now()
+            updated += 1
+
+        _last_price_error = None
+        _blocked_until = 0.0
+
+    return {
+        "updated": updated,
+        "cached": False,
+        "rate_limited": False,
+    }
