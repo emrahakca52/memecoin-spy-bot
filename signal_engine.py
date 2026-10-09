@@ -15,6 +15,7 @@ TRADING_MODE = "paper"
 BASE_URL = "https://api.dexscreener.com"
 PROFILE_URL = f"{BASE_URL}/token-profiles/latest/v1"
 BOOST_URL = f"{BASE_URL}/token-boosts/latest/v1"
+GECKO_TRENDING_URL = "https://api.geckoterminal.com/api/v2/networks/solana/trending_pools"
 TOKENS_URL = f"{BASE_URL}/tokens/v1/solana"
 
 MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "10000"))
@@ -65,7 +66,7 @@ async def _get_json(client, url):
             except ValueError:
                 pass
         _next_request_time = time.time() + delay + random.uniform(1, 5)
-        raise RuntimeError("dexscreener_rate_limited")
+        raise RuntimeError(f"dexscreener_rate_limited:{url}")
     response.raise_for_status()
     return response.json()
 
@@ -203,23 +204,108 @@ def _normalize_pairs(pairs):
     return sorted(unique.values(), key=lambda x: x["score"], reverse=True), stats
 
 
+def _normalize_gecko_pools(payload):
+    """Convert GeckoTerminal trending-pool data to the bot's common candidate shape."""
+    data = payload.get("data", []) if isinstance(payload, dict) else []
+    candidates = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        attrs = item.get("attributes") or {}
+        rels = item.get("relationships") or {}
+        base_rel = ((rels.get("base_token") or {}).get("data") or {})
+        base_id = str(base_rel.get("id") or "")
+        address = base_id.split("_", 1)[1] if base_id.startswith("solana_") else ""
+        if not address:
+            address = str(attrs.get("base_token_address") or "")
+        if not address or address == WSOL_MINT:
+            continue
+        txns = attrs.get("transactions") or {}
+        h24 = txns.get("h24") or {}
+        buys = _number(h24.get("buys"))
+        sells = _number(h24.get("sells"))
+        price = _number(attrs.get("base_token_price_usd"))
+        liquidity = _number(attrs.get("reserve_in_usd"))
+        volume = _number((attrs.get("volume_usd") or {}).get("h24"))
+        if price <= 0 or buys + sells <= 0:
+            continue
+        ratio = buys / max(sells, 1.0)
+        name = str(attrs.get("name") or "")
+        symbol = name.split(" / ")[0].strip() if name else "UNKNOWN"
+        candidates.append({
+            "token_address": address,
+            "symbol": symbol,
+            "name": name,
+            "quote_symbol": "UNKNOWN",
+            "pool_address": str(attrs.get("address") or ""),
+            "price_usd": price,
+            "liquidity_usd": liquidity,
+            "volume_24h_usd": volume,
+            "buys_24h": int(buys),
+            "sells_24h": int(sells),
+            "buy_sell_ratio": round(ratio, 3),
+            "score": round(min(volume / max(liquidity, 1.0), 10.0) * 5 + min(ratio, 3.0) * 5, 3),
+            "source": "GeckoTerminal",
+            "url": f"https://www.geckoterminal.com/solana/pools/{attrs.get('address', '')}",
+        })
+    unique = {}
+    for item in candidates:
+        old = unique.get(item["token_address"])
+        if old is None or item["liquidity_usd"] > old["liquidity_usd"]:
+            unique[item["token_address"]] = item
+    return sorted(unique.values(), key=lambda x: x["score"], reverse=True), {
+        "provider": "GeckoTerminal", "gecko_pools_received": len(data),
+        "gecko_candidates": len(unique),
+    }
+
+
+async def _fetch_gecko_fallback():
+    async with httpx.AsyncClient(
+        timeout=REQUEST_TIMEOUT_SECONDS,
+        headers={"Accept": "application/json", "User-Agent": "MemecoinSpyBot/1.3"},
+    ) as client:
+        response = await client.get(GECKO_TRENDING_URL)
+        response.raise_for_status()
+        payload = response.json()
+    candidates, diagnostics = _normalize_gecko_pools(payload)
+    diagnostics["fallback_used"] = True
+    return candidates, diagnostics
+
+
 async def _fetch_candidates():
     global _next_request_time, _consecutive_errors
     if time.time() < _next_request_time:
         raise RuntimeError("provider_cooldown")
 
-    async with httpx.AsyncClient(
-        timeout=REQUEST_TIMEOUT_SECONDS,
-        headers={"Accept": "application/json", "User-Agent": "MemecoinSpyBot/1.2"},
-    ) as client:
-        pairs, discovered_count, batch_errors = await _discover_pairs(client)
-
-    candidates, diagnostics = _normalize_pairs(pairs)
-    diagnostics["discovered_solana_tokens"] = discovered_count
-    diagnostics["batch_errors"] = batch_errors
-    _consecutive_errors = 0
-    _next_request_time = time.time() + CACHE_SECONDS
-    return candidates, diagnostics
+    try:
+        async with httpx.AsyncClient(
+            timeout=REQUEST_TIMEOUT_SECONDS,
+            headers={"Accept": "application/json", "User-Agent": "MemecoinSpyBot/1.3"},
+        ) as client:
+            pairs, discovered_count, batch_errors = await _discover_pairs(client)
+        candidates, diagnostics = _normalize_pairs(pairs)
+        diagnostics["provider"] = "DEX Screener"
+        diagnostics["discovered_solana_tokens"] = discovered_count
+        diagnostics["batch_errors"] = batch_errors
+        _consecutive_errors = 0
+        _next_request_time = time.time() + CACHE_SECONDS
+        return candidates, diagnostics
+    except RuntimeError as exc:
+        # If DexScreener is rate-limited, try one separate provider rather than failing immediately.
+        if "dexscreener_rate_limited" not in str(exc):
+            raise
+        dex_error = str(exc)
+        logger.warning("DEX Screener limited (%s); trying GeckoTerminal fallback", dex_error)
+        try:
+            candidates, diagnostics = await _fetch_gecko_fallback()
+            diagnostics["dexscreener_error"] = dex_error
+            _consecutive_errors = 0
+            _next_request_time = time.time() + CACHE_SECONDS
+            return candidates, diagnostics
+        except Exception as fallback_exc:
+            raise RuntimeError(
+                f"dexscreener_rate_limited; geckoterminal_fallback_failed:{type(fallback_exc).__name__}:{str(fallback_exc)[:100]}"
+            ) from fallback_exc
 
 
 async def get_signal_candidates(
@@ -295,7 +381,7 @@ async def get_signal_candidates(
 
     return {
         "provider": "DEX Screener",
-        "checked": diag.get("solana_pairs", 0),
+        "checked": diag.get("solana_pairs", diag.get("gecko_pools_received", 0)),
         "candidate_count": len(filtered),
         "signals": signals,
         "diagnostics": diag,
