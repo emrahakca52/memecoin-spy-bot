@@ -200,10 +200,25 @@ def open_paper_position(
     amount_usd=10.0,
     price_usd=None,
     source="auto",
+    max_open_positions=None,
+    metadata=None,
 ):
-    if price_usd is None:
-        raise ValueError("price_usd is required to open a paper position")
-    return record_paper_trade(
+    """Open a simulated position; accepts auto_paper_bot compatibility args."""
+    if not token_address:
+        raise ValueError("token_address is required")
+    if price_usd is None or _num(price_usd) <= 0:
+        raise ValueError("price_usd is required and must be positive")
+
+    # Do not repeatedly buy the same token on every polling cycle.
+    if token_address in _open_positions:
+        return {"ok": True, "mode": "paper", "skipped": True,
+                "reason": "position_already_open", "token_address": token_address}
+
+    if max_open_positions is not None and len(_open_positions) >= int(max_open_positions):
+        return {"ok": True, "mode": "paper", "skipped": True,
+                "reason": "max_open_positions_reached"}
+
+    result = record_paper_trade(
         token_address=token_address,
         token_symbol=token_symbol,
         side="BUY",
@@ -211,6 +226,10 @@ def open_paper_position(
         price_usd=price_usd,
         source=source,
     )
+    position = _open_positions.get(token_address)
+    if position is not None and metadata:
+        position["metadata"] = dict(metadata)
+    return result
 
 
 async def update_paper_prices():
