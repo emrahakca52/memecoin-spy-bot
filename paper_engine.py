@@ -5,14 +5,18 @@ from threading import RLock
 
 import httpx
 
+# Paper simulation only. No wallet or real orders are used.
 _lock = RLock()
 _trades = []
 _positions = {}
 _next_id = 1
+_realized_pnl_usd = 0.0
 
-PRICE_CACHE_SECONDS = 300
-RATE_LIMIT_COOLDOWN_SECONDS = 600
-
+PRICE_CACHE_SECONDS = 120
+RATE_LIMIT_COOLDOWN_SECONDS = 60
+TAKE_PROFIT_PCT = 0.10   # Close simulated position at +10%
+STOP_LOSS_PCT = -0.05    # Close simulated position at -5%
+GECKO_BASE_URL = "https://api.geckoterminal.com/api/v2"
 _price_cache = {}
 _blocked_until = 0.0
 _last_price_error = None
@@ -29,10 +33,10 @@ def paper_status():
             "real_trading_enabled": False,
             "simulated_trade_count": len(_trades),
             "open_positions": len(_positions),
-            "note": (
-                "Paper simulation only. No wallet is connected "
-                "and no real orders are sent."
-            ),
+            "realized_pnl_usd": round(_realized_pnl_usd, 4),
+            "take_profit_pct": TAKE_PROFIT_PCT * 100,
+            "stop_loss_pct": STOP_LOSS_PCT * 100,
+            "note": "Paper simulation only. No wallet is connected and no real orders are sent.",
         }
 
 
@@ -45,50 +49,31 @@ def portfolio_status():
     with _lock:
         positions = [dict(pos) for pos in _positions.values()]
         invested = sum(p["amount_usd"] for p in positions)
-        current_value = sum(
-            p.get("current_value_usd", p["amount_usd"])
-            for p in positions
-        )
-
+        current_value = sum(p.get("current_value_usd", p["amount_usd"]) for p in positions)
+        unrealized = current_value - invested
         return {
             "open_positions": positions,
             "paper_invested_usd": round(invested, 2),
             "paper_current_value_usd": round(current_value, 2),
-            "paper_unrealized_pnl_usd": round(
-                current_value - invested, 2
-            ),
+            "paper_unrealized_pnl_usd": round(unrealized, 4),
+            "paper_realized_pnl_usd": round(_realized_pnl_usd, 4),
+            "paper_total_pnl_usd": round(unrealized + _realized_pnl_usd, 4),
         }
 
 
 def bot_snapshot():
-    return {
-        **paper_status(),
-        **portfolio_status(),
-    }
+    return {**paper_status(), **portfolio_status()}
 
 
-def record_paper_trade(
-    token_address,
-    side,
-    amount_usd,
-    price_usd,
-    token_symbol="",
-    source="manual",
-):
+def record_paper_trade(token_address, side, amount_usd, price_usd, token_symbol="", source="manual"):
     global _next_id
-
     side = side.strip().lower()
-
     if side not in {"buy", "sell"}:
         raise ValueError("side must be 'buy' or 'sell'.")
-
     if not token_address or not token_address.strip():
         raise ValueError("token_address cannot be empty.")
-
     if amount_usd <= 0 or price_usd <= 0:
-        raise ValueError(
-            "amount_usd and price_usd must be greater than zero."
-        )
+        raise ValueError("amount_usd and price_usd must be greater than zero.")
 
     with _lock:
         trade = {
@@ -96,197 +81,174 @@ def record_paper_trade(
             "token_address": token_address.strip(),
             "token_symbol": token_symbol,
             "side": side,
-            "amount_usd": round(amount_usd, 2),
-            "price_usd": price_usd,
-            "simulated_token_quantity": round(
-                amount_usd / price_usd, 10
-            ),
+            "amount_usd": round(float(amount_usd), 4),
+            "price_usd": float(price_usd),
+            "simulated_token_quantity": round(float(amount_usd) / float(price_usd), 10),
             "timestamp": _now(),
             "mode": "paper",
             "source": source,
         }
-
         _next_id += 1
         _trades.append(trade)
-
         return dict(trade)
 
 
-def open_paper_position(
-    token_address,
-    token_symbol,
-    amount_usd,
-    price_usd,
-    max_open_positions=5,
-    metadata=None,
-):
+def open_paper_position(token_address, token_symbol, amount_usd, price_usd, max_open_positions=5, metadata=None):
     if not token_address or amount_usd <= 0 or price_usd <= 0:
         return {"opened": False, "reason": "invalid input"}
-
     with _lock:
         if token_address in _positions:
             return {"opened": False, "reason": "already open"}
-
         if len(_positions) >= max_open_positions:
-            return {
-                "opened": False,
-                "reason": "position limit reached",
-            }
+            return {"opened": False, "reason": "position limit reached"}
 
-        quantity = amount_usd / price_usd
-
+        quantity = float(amount_usd) / float(price_usd)
         pos = {
             "token_address": token_address,
             "token_symbol": token_symbol,
-            "amount_usd": round(amount_usd, 2),
-            "entry_price_usd": price_usd,
-            "current_price_usd": price_usd,
+            "amount_usd": round(float(amount_usd), 2),
+            "entry_price_usd": float(price_usd),
+            "current_price_usd": float(price_usd),
             "quantity": quantity,
-            "current_value_usd": round(amount_usd, 2),
+            "current_value_usd": round(float(amount_usd), 4),
             "unrealized_pnl_usd": 0.0,
+            "unrealized_pnl_pct": 0.0,
             "opened_at": _now(),
             "metadata": metadata or {},
         }
-
         _positions[token_address] = pos
+        record_paper_trade(token_address, "buy", amount_usd, price_usd, token_symbol, "auto_paper")
+        return {"opened": True, "position": dict(pos)}
 
-        record_paper_trade(
-            token_address=token_address,
-            side="buy",
-            amount_usd=amount_usd,
-            price_usd=price_usd,
-            token_symbol=token_symbol,
-            source="auto_paper",
-        )
 
-        return {
-            "opened": True,
-            "position": dict(pos),
-        }
+async def _fetch_token_price(client, token_address):
+    # GeckoTerminal token pools endpoint; select the deepest available pool.
+    url = f"{GECKO_BASE_URL}/networks/solana/tokens/{token_address}/pools"
+    response = await client.get(url, params={"page": 1})
+    response.raise_for_status()
+    payload = response.json()
+    pools = payload.get("data") or []
+    best = None
+    best_liquidity = -1.0
+
+    for pool in pools:
+        attrs = pool.get("attributes") or {}
+        price = attrs.get("base_token_price_usd")
+        try:
+            price = float(price or 0)
+            liquidity = float(attrs.get("reserve_in_usd") or 0)
+        except (TypeError, ValueError):
+            continue
+        if price > 0 and liquidity > best_liquidity:
+            best = (price, liquidity)
+            best_liquidity = liquidity
+
+    return best[0] if best else None
 
 
 async def update_paper_prices():
     global _blocked_until, _last_price_error
 
     now = time.monotonic()
-
     with _lock:
         addresses = list(_positions.keys())
-
         if not addresses:
-            return {"updated": 0, "note": "No open positions"}
+            return {"updated": 0, "closed": 0, "note": "No open positions"}
 
-        # Önce önbellekteki fiyatları kullan.
-        cached_addresses = {
-            address
+        cached = {
+            address: _price_cache[address]["price"]
             for address in addresses
-            if address in _price_cache
-            and now - _price_cache[address]["at"] < PRICE_CACHE_SECONDS
+            if address in _price_cache and now - _price_cache[address]["at"] < PRICE_CACHE_SECONDS
         }
+        to_fetch = [address for address in addresses if address not in cached]
 
-        addresses_to_fetch = [
-            address for address in addresses
-            if address not in cached_addresses
-        ]
-
-        # API sınırına takıldıysak yeni istek gönderme.
         if now < _blocked_until:
             return {
                 "updated": 0,
+                "closed": 0,
                 "rate_limited": True,
-                "note": "DexScreener cooldown active; cached prices retained.",
+                "note": "GeckoTerminal cooldown active; previous prices retained.",
                 "last_error": _last_price_error,
             }
 
-    if not addresses_to_fetch:
-        return {"updated": 0, "cached": True}
-
-    url = (
-        "https://api.dexscreener.com/latest/dex/tokens/"
-        + ",".join(addresses_to_fetch[:30])
-    )
-
-    try:
-        async with httpx.AsyncClient(
-            timeout=15,
-            headers={"User-Agent": "MemecoinSpyPro/1.0"},
-        ) as client:
-            response = await client.get(url)
-            response.raise_for_status()
-            data = response.json()
-
-    except httpx.HTTPStatusError as exc:
-        if exc.response.status_code == 429:
-            _blocked_until = time.monotonic() + RATE_LIMIT_COOLDOWN_SECONDS
-            _last_price_error = "DexScreener rate limit (429)"
-            return {
-                "updated": 0,
-                "rate_limited": True,
-                "note": "Prices were not refreshed; previous values retained.",
-            }
-
-        _last_price_error = (
-            f"HTTP {exc.response.status_code} from DexScreener"
-        )
-        return {
-            "updated": 0,
-            "error": _last_price_error,
+    prices = dict(cached)
+    if to_fetch:
+        headers = {
+            "Accept": "application/json;version=20230302",
+            "User-Agent": "MemecoinSpyPro/1.1",
         }
-
-    except httpx.HTTPError as exc:
-        _last_price_error = f"Market data request failed: {type(exc).__name__}"
-        return {
-            "updated": 0,
-            "error": _last_price_error,
-        }
-
-    pairs = data.get("pairs") or []
-    prices = {}
-
-    for pair in pairs:
-        token = pair.get("baseToken") or {}
-        address = token.get("address")
-
         try:
-            price = float(pair.get("priceUsd") or 0)
-        except (TypeError, ValueError):
-            continue
-
-        if address and price > 0:
-            prices.setdefault(address, price)
+            async with httpx.AsyncClient(timeout=15, headers=headers) as client:
+                # At most five positions are normally open; sequential requests reduce rate-limit risk.
+                for address in to_fetch:
+                    price = await _fetch_token_price(client, address)
+                    if price and price > 0:
+                        prices[address] = price
+                        _price_cache[address] = {"price": price, "at": time.monotonic()}
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 429:
+                _blocked_until = time.monotonic() + RATE_LIMIT_COOLDOWN_SECONDS
+                _last_price_error = "GeckoTerminal rate limit (429)"
+            else:
+                _last_price_error = f"GeckoTerminal HTTP {exc.response.status_code}"
+            return {"updated": 0, "closed": 0, "error": _last_price_error, "rate_limited": exc.response.status_code == 429}
+        except (httpx.HTTPError, ValueError) as exc:
+            _last_price_error = f"{type(exc).__name__}: {str(exc)[:160]}"
+            return {"updated": 0, "closed": 0, "error": _last_price_error}
 
     updated = 0
-    current_time = time.monotonic()
-
+    closed = []
     with _lock:
-        for address, price in prices.items():
-            _price_cache[address] = {
-                "price": price,
-                "at": current_time,
-            }
-
-        for address, pos in _positions.items():
-            cached = _price_cache.get(address)
-
-            if not cached:
+        for address, pos in list(_positions.items()):
+            price = prices.get(address)
+            if not price or price <= 0:
                 continue
 
-            price = cached["price"]
-            pos["current_price_usd"] = price
-            pos["current_value_usd"] = round(
-                pos["quantity"] * price, 4
-            )
-            pos["unrealized_pnl_usd"] = round(
-                pos["current_value_usd"] - pos["amount_usd"], 4
-            )
+            pos["current_price_usd"] = float(price)
+            pos["current_value_usd"] = round(pos["quantity"] * float(price), 4)
+            pnl = pos["current_value_usd"] - pos["amount_usd"]
+            pnl_pct = (float(price) / pos["entry_price_usd"] - 1.0) * 100.0
+            pos["unrealized_pnl_usd"] = round(pnl, 4)
+            pos["unrealized_pnl_pct"] = round(pnl_pct, 3)
             pos["last_updated"] = _now()
             updated += 1
 
-        _last_price_error = None
-        _blocked_until = 0.0
+            reason = None
+            if pnl_pct >= TAKE_PROFIT_PCT * 100:
+                reason = "take_profit"
+            elif pnl_pct <= STOP_LOSS_PCT * 100:
+                reason = "stop_loss"
+
+            if reason:
+                sale_value = max(pos["current_value_usd"], 0.0001)
+                record_paper_trade(
+                    token_address=address,
+                    side="sell",
+                    amount_usd=sale_value,
+                    price_usd=float(price),
+                    token_symbol=pos["token_symbol"],
+                    source=f"auto_paper_{reason}",
+                )
+                closed_pnl = sale_value - pos["amount_usd"]
+                _realized_pnl_usd += closed_pnl
+                closed.append({
+                    "token_symbol": pos["token_symbol"],
+                    "token_address": address,
+                    "exit_price_usd": float(price),
+                    "pnl_usd": round(closed_pnl, 4),
+                    "pnl_pct": round(pnl_pct, 3),
+                    "reason": reason,
+                })
+                del _positions[address]
+
+        _last_price_error = None if prices else _last_price_error
+        _blocked_until = 0.0 if prices else _blocked_until
 
     return {
         "updated": updated,
-        "cached": False,
+        "closed": len(closed),
+        "closed_positions": closed,
+        "cached": not bool(to_fetch),
         "rate_limited": False,
+        "last_error": _last_price_error,
     }
