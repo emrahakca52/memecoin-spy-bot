@@ -2,11 +2,7 @@ import asyncio
 from datetime import datetime, timezone
 
 from signal_engine import get_signal_candidates
-from paper_engine import (
-    get_token_price_usd,
-    open_paper_position,
-    update_paper_prices,
-)
+from paper_engine import get_token_price_usd, open_paper_position, update_paper_prices
 
 POLL_SECONDS = 180
 PAPER_BUY_USD = 10.0
@@ -25,9 +21,9 @@ _last_scan = None
 _last_skipped = []
 
 
-async def _loop():
+async def _loop(stop_event):
     global _last_run, _last_error, _last_price_update, _last_scan, _last_skipped
-    while not _stop_event.is_set():
+    while not stop_event.is_set():
         try:
             _last_error = None
             _last_skipped = []
@@ -43,47 +39,44 @@ async def _loop():
                 "checked": data.get("checked", 0),
                 "candidate_count": data.get("candidate_count", len(data.get("signals", []))),
                 "note": data.get("note"),
+                "last_error": data.get("last_error"),
             }
 
             for token in data.get("signals", []):
-                if _stop_event.is_set():
+                if stop_event.is_set():
                     break
                 address = token.get("token_address")
-                try:
-                    signal_price = float(token.get("price_usd") or 0)
-                except (TypeError, ValueError):
-                    continue
+                symbol = token.get("symbol", token.get("token_symbol", ""))
+                signal_price = float(token.get("price_usd") or 0)
                 if not address or signal_price <= 0:
-                    _last_skipped.append({"symbol": token.get("token_symbol"), "reason": "invalid_signal_price"})
+                    _last_skipped.append({"symbol": symbol, "reason": "invalid_signal_price"})
                     continue
 
-                # Never open a position from the scanner quote alone.
                 live_price = await get_token_price_usd(address)
                 if live_price is None or live_price <= 0:
-                    _last_skipped.append({"symbol": token.get("token_symbol"), "reason": "live_price_unavailable"})
+                    _last_skipped.append({"symbol": symbol, "reason": "live_price_unavailable"})
                     continue
 
                 deviation = abs(live_price / signal_price - 1) * 100
                 if deviation > MAX_ENTRY_PRICE_DEVIATION_PCT:
                     _last_skipped.append({
-                        "symbol": token.get("token_symbol"),
+                        "symbol": symbol,
                         "reason": "signal_live_price_deviation",
                         "deviation_pct": round(deviation, 2),
                     })
                     continue
 
-                open_paper_position(
+                result = open_paper_position(
                     token_address=address,
-                    token_symbol=token.get("token_symbol", ""),
+                    token_symbol=symbol,
                     amount_usd=PAPER_BUY_USD,
                     price_usd=live_price,
                     max_open_positions=MAX_OPEN_POSITIONS,
                     metadata={
-                        "pair_address": token.get("pair_address"),
-                        "dex_id": token.get("dex_id"),
+                        "pair_address": token.get("pool_address", token.get("pair_address")),
                         "liquidity_usd": token.get("liquidity_usd"),
                         "volume_24h_usd": token.get("volume_24h_usd"),
-                        "buys_to_sells_ratio": token.get("buys_to_sells_ratio"),
+                        "buy_sell_ratio": token.get("buy_sell_ratio", token.get("buys_to_sells_ratio")),
                         "strategy": "experimental_candidate_filter_not_validated",
                         "signal_price_usd": signal_price,
                         "entry_price_deviation_pct": round(deviation, 4),
@@ -91,11 +84,15 @@ async def _loop():
                         "stop_loss_pct": -5,
                     },
                 )
+                if result.get("skipped"):
+                    _last_skipped.append({"symbol": symbol, "reason": result.get("reason")})
+
             _last_run = datetime.now(timezone.utc).isoformat()
         except Exception as exc:
             _last_error = f"{type(exc).__name__}: {str(exc)[:200]}"
+
         try:
-            await asyncio.wait_for(_stop_event.wait(), timeout=POLL_SECONDS)
+            await asyncio.wait_for(stop_event.wait(), timeout=POLL_SECONDS)
         except asyncio.TimeoutError:
             pass
 
@@ -105,19 +102,25 @@ async def start_bot():
     if _task is not None and not _task.done():
         return bot_status()
     _stop_event = asyncio.Event()
-    _task = asyncio.create_task(_loop())
+    _task = asyncio.create_task(_loop(_stop_event))
     return bot_status()
 
 
 async def stop_bot():
     global _task, _stop_event
-    if _stop_event is not None:
-        _stop_event.set()
-    if _task is not None:
+    task = _task
+    event = _stop_event
+    if event is not None:
+        event.set()
+    if task is not None:
         try:
-            await asyncio.wait_for(_task, timeout=5)
-        except Exception:
-            _task.cancel()
+            await asyncio.wait_for(task, timeout=5)
+        except asyncio.TimeoutError:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
     _task = None
     _stop_event = None
     return bot_status()

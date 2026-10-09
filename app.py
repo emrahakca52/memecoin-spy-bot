@@ -16,16 +16,12 @@ from auto_paper_bot import bot_status, start_bot, stop_bot
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Paper bot is OFF by default.
+    # Paper bot is off by default.
     yield
     await stop_bot()
 
 
-app = FastAPI(
-    title="Memecoin Spy Pro",
-    version="1.1.2",
-    lifespan=lifespan,
-)
+app = FastAPI(title="Memecoin Spy Pro", version="1.2.0", lifespan=lifespan)
 
 
 @app.get("/")
@@ -41,11 +37,7 @@ def home():
 
 @app.get("/health")
 def health():
-    return {
-        "status": "ok",
-        "mode": "paper",
-        "real_trading_enabled": False,
-    }
+    return {"status": "ok", "mode": "paper", "real_trading_enabled": False}
 
 
 @app.get("/signals")
@@ -56,21 +48,20 @@ async def signals(
     limit: int = Query(20, ge=1, le=50),
 ):
     try:
-        return await get_signal_candidates(
+        result = await get_signal_candidates(
             min_liquidity_usd=min_liquidity_usd,
             min_volume_24h_usd=min_volume_24h_usd,
             min_buys_sells_ratio=min_buys_sells_ratio,
             limit=limit,
         )
+        # The scanner reports provider failures as structured JSON so callers
+        # can inspect last_error without crashing the endpoint.
+        return result
     except httpx.HTTPStatusError as exc:
-        if exc.response.status_code == 429:
-            raise HTTPException(
-                status_code=503,
-                detail="Market data provider rate limit. Please wait before retrying.",
-            ) from exc
+        status = 503 if exc.response.status_code == 429 else 502
         raise HTTPException(
-            status_code=502,
-            detail=f"Market data provider returned HTTP {exc.response.status_code}.",
+            status_code=status,
+            detail="Market data provider is temporarily unavailable.",
         ) from exc
     except httpx.HTTPError as exc:
         raise HTTPException(
@@ -80,10 +71,7 @@ async def signals(
 
 
 @app.get("/wallet/{wallet_address}")
-async def wallet(
-    wallet_address: str,
-    limit: int = Query(20, ge=1, le=100),
-):
+async def wallet(wallet_address: str, limit: int = Query(20, ge=1, le=100)):
     try:
         return await get_wallet_stats(wallet_address, limit=limit)
     except ValueError as exc:
@@ -97,18 +85,12 @@ async def wallet(
 
 @app.get("/paper/status")
 def get_paper_status_route():
-    return {
-        **paper_status(),
-        "bot": bot_status(),
-    }
+    return {**paper_status(), "bot": bot_status()}
 
 
 @app.get("/paper/trades")
 def get_paper_trades_route():
-    return {
-        "mode": "paper",
-        "trades": list_paper_trades(),
-    }
+    return {"mode": "paper", "trades": list_paper_trades()}
 
 
 @app.get("/paper-bot/status")
@@ -128,18 +110,12 @@ async def stop_paper_bot():
 
 @app.post("/paper/trades")
 def add_paper_trade(payload: dict):
-    required = {
-        "token_address",
-        "side",
-        "amount_usd",
-        "price_usd",
-    }
+    required = {"token_address", "side", "amount_usd", "price_usd"}
     if not required.issubset(payload):
         raise HTTPException(
             status_code=400,
             detail=f"Required fields: {sorted(required)}",
         )
-
     try:
         return record_paper_trade(
             token_address=str(payload["token_address"]),

@@ -1,4 +1,3 @@
-import asyncio
 import time
 from email.utils import parsedate_to_datetime
 from datetime import datetime, timezone
@@ -16,7 +15,6 @@ MAX_ACCEPTED_PRICE_JUMP_PCT = 35.0
 
 _price_cache = {}
 _price_last_request = {}
-_price_lock = asyncio.Lock()
 _provider_cooldown_until = 0.0
 _provider_cooldown_reason = None
 _open_positions = {}
@@ -28,7 +26,7 @@ def _num(value, default=0.0):
     try:
         result = float(value or 0)
         return result if result == result and abs(result) != float("inf") else default
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
 
 
@@ -44,15 +42,21 @@ def _set_provider_cooldown(response):
                 retry_date = parsedate_to_datetime(retry_after)
                 if retry_date.tzinfo is None:
                     retry_date = retry_date.replace(tzinfo=timezone.utc)
-                wait_seconds = max(1, int((retry_date - datetime.now(timezone.utc)).total_seconds()))
+                wait_seconds = max(
+                    1, int((retry_date - datetime.now(timezone.utc)).total_seconds())
+                )
             except (TypeError, ValueError, OverflowError):
                 wait_seconds = PRICE_COOLDOWN_SECONDS
     wait_seconds = min(wait_seconds, MAX_PROVIDER_COOLDOWN_SECONDS)
-    _provider_cooldown_until = max(_provider_cooldown_until, time.monotonic() + wait_seconds)
+    _provider_cooldown_until = max(
+        _provider_cooldown_until, time.monotonic() + wait_seconds
+    )
     _provider_cooldown_reason = f"HTTP 429; pausing provider requests for {wait_seconds}s"
 
 
 async def _get_json(client, url):
+    if time.monotonic() < _provider_cooldown_until:
+        raise RuntimeError("price_provider_cooldown")
     response = await client.get(url)
     if response.status_code == 429:
         _set_provider_cooldown(response)
@@ -70,7 +74,7 @@ async def _fetch_prices_batch(client, token_addresses):
         try:
             payload = await _get_json(client, DEX_TOKEN_URL + ",".join(chunk))
             for pair in payload.get("pairs") or []:
-                if not isinstance(pair, dict) or (pair.get("chainId") or "").lower() != "solana":
+                if not isinstance(pair, dict) or str(pair.get("chainId", "")).lower() != "solana":
                     continue
                 base = (pair.get("baseToken") or {}).get("address")
                 price = _num(pair.get("priceUsd"))
@@ -82,7 +86,7 @@ async def _fetch_prices_batch(client, token_addresses):
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code == 429:
                 return {address: None for address in addresses}
-        except (httpx.HTTPError, ValueError):
+        except (httpx.HTTPError, ValueError, RuntimeError):
             pass
 
     missing = [a for a in addresses if a not in results]
@@ -104,7 +108,7 @@ async def _fetch_prices_batch(client, token_addresses):
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code == 429:
                 _set_provider_cooldown(exc.response)
-        except (httpx.HTTPError, ValueError):
+        except (httpx.HTTPError, ValueError, RuntimeError):
             pass
 
     for address in addresses:
@@ -132,6 +136,7 @@ async def get_token_prices_usd(token_addresses):
     if not missing or now < _provider_cooldown_until:
         return prices
 
+    # No concurrent duplicate requests for the same cache refresh.
     async with _price_lock:
         now = time.monotonic()
         still_missing = []
@@ -148,10 +153,10 @@ async def get_token_prices_usd(token_addresses):
         try:
             async with httpx.AsyncClient(
                 timeout=PRICE_TIMEOUT_SECONDS,
-                headers={"Accept": "application/json", "User-Agent": "MemecoinSpyBot/1.7"},
+                headers={"Accept": "application/json", "User-Agent": "MemecoinSpyBot/1.8"},
             ) as client:
                 fetched = await _fetch_prices_batch(client, still_missing)
-        except (httpx.HTTPError, ValueError):
+        except (httpx.HTTPError, ValueError, RuntimeError):
             fetched = {}
 
         for address in still_missing:
@@ -163,13 +168,16 @@ async def get_token_prices_usd(token_addresses):
                 old_price = _num(previous.get("price"))
                 if old_price > 0:
                     jump = abs(price / old_price - 1) * 100
-                    # Conservative: reject a large jump rather than acting on a
-                    # potentially mismatched or erroneous quote. Recheck next cycle.
                     if jump > MAX_ACCEPTED_PRICE_JUMP_PCT:
                         continue
             _price_cache[address] = {"at": time.monotonic(), "price": price}
             prices[address] = price
     return prices
+
+
+# Declared lock after helper definitions to avoid any hidden event-loop state.
+import asyncio
+_price_lock = asyncio.Lock()
 
 
 async def get_token_price_usd(token_address):
@@ -189,11 +197,14 @@ def record_paper_trade(token_address, side, amount_usd, price_usd,
         raise ValueError("token_address, amount_usd and price_usd must be valid")
 
     trade = {
-        "token_address": token_address, "token_symbol": token_symbol or token_address[:8],
-        "side": side, "amount_usd": round(amount_usd, 8), "price_usd": price_usd,
-        "source": source, "reason": reason, "timestamp": time.time(), "mode": "paper",
+        "token_address": token_address,
+        "token_symbol": token_symbol or token_address[:8],
+        "side": side, "amount_usd": round(amount_usd, 8),
+        "price_usd": price_usd, "source": source, "reason": reason,
+        "timestamp": time.time(), "mode": "paper",
     }
     _paper_trades.append(trade)
+
     if side == "BUY":
         quantity = amount_usd / price_usd
         position = _open_positions.get(token_address)
@@ -229,7 +240,9 @@ def record_paper_trade(token_address, side, amount_usd, price_usd,
                 _open_positions.pop(token_address, None)
             else:
                 position["quantity"] = remaining_qty
-                position["invested_usd"] = max(0.0, _num(position.get("invested_usd")) - cost)
+                position["invested_usd"] = max(
+                    0.0, _num(position.get("invested_usd")) - cost
+                )
     return {"ok": True, "mode": "paper", "trade": trade}
 
 
@@ -239,6 +252,8 @@ def open_paper_position(token_address, token_symbol="", amount_usd=10.0, price_u
         raise ValueError("token_address is required")
     if price_usd is None or _num(price_usd) <= 0:
         raise ValueError("price_usd is required and must be positive")
+    if _num(amount_usd) <= 0:
+        raise ValueError("amount_usd must be positive")
     if token_address in _open_positions:
         return {"ok": True, "mode": "paper", "skipped": True, "reason": "position_already_open"}
     if max_open_positions is not None and len(_open_positions) >= int(max_open_positions):
@@ -256,13 +271,14 @@ def _close_position(address, position, price, reason):
     invested = _num(position.get("invested_usd"))
     value = quantity * price
     pnl = value - invested
+    entry = _num(position.get("entry_price_usd"))
     trade = {
         "token_address": address,
         "token_symbol": position.get("token_symbol", address[:8]),
         "side": "SELL", "amount_usd": round(value, 8), "price_usd": price,
         "source": "auto", "reason": reason, "realized_pnl_usd": round(pnl, 8),
-        "entry_price_usd": _num(position.get("entry_price_usd")),
-        "change_pct": round((price / max(_num(position.get("entry_price_usd")), 1e-12) - 1) * 100, 4),
+        "entry_price_usd": entry,
+        "change_pct": round((price / max(entry, 1e-12) - 1) * 100, 4),
         "timestamp": time.time(), "mode": "paper",
     }
     _paper_trades.append(trade)
@@ -288,8 +304,7 @@ async def update_paper_prices():
         quantity = _num(position.get("quantity"))
         invested = _num(position.get("invested_usd"))
         value = quantity * price
-        pnl = value - invested
-        position["unrealized_pnl_usd"] = round(pnl, 8)
+        position["unrealized_pnl_usd"] = round(value - invested, 8)
         updated += 1
         entry = _num(position.get("entry_price_usd"))
         opened_at = _num(position.get("opened_at"))
@@ -323,7 +338,8 @@ def get_paper_status():
         "simulated_trade_count": len(_paper_trades), "open_positions": positions,
         "realized_pnl_usd": round(_realized_pnl_usd, 8),
         "take_profit_pct": 10.0, "stop_loss_pct": -5.0,
-        "paper_invested_usd": round(invested, 8), "paper_current_value_usd": round(value, 8),
+        "paper_invested_usd": round(invested, 8),
+        "paper_current_value_usd": round(value, 8),
         "paper_unrealized_pnl_usd": round(unrealized, 8),
         "paper_realized_pnl_usd": round(_realized_pnl_usd, 8),
         "paper_total_pnl_usd": round(unrealized + _realized_pnl_usd, 8),
@@ -334,8 +350,8 @@ def get_paper_status():
 def portfolio_status():
     status = get_paper_status()
     return {key: status[key] for key in (
-        "paper_invested_usd", "paper_current_value_usd", "paper_unrealized_pnl_usd",
-        "paper_realized_pnl_usd", "paper_total_pnl_usd"
+        "paper_invested_usd", "paper_current_value_usd",
+        "paper_unrealized_pnl_usd", "paper_realized_pnl_usd", "paper_total_pnl_usd"
     )}
 
 
