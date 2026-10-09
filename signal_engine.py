@@ -1,15 +1,18 @@
 import asyncio
-import random
 import time
-
 import httpx
 
-DEX_SEARCH_URL = "https://api.dexscreener.com/latest/dex/search"
+BASE_URL = "https://api.geckoterminal.com/api/v2"
+TRENDING_URL = f"{BASE_URL}/networks/solana/trending_pools"
+NEW_POOLS_URL = f"{BASE_URL}/networks/solana/new_pools"
 
-REQUEST_TIMEOUT_SECONDS = 12
+REQUEST_TIMEOUT_SECONDS = 15
 CACHE_SECONDS = 90
-REQUEST_COOLDOWN_SECONDS = 180
-MAX_PROVIDER_COOLDOWN_SECONDS = 900
+REQUEST_COOLDOWN_SECONDS = 90
+PROVIDER_COOLDOWN_SECONDS = 300
+
+MIN_LIQUIDITY_USD = 10000
+MIN_VOLUME_24H_USD = 20000
 
 _cache = {"at": 0.0, "pairs": None}
 _last_request_at = 0.0
@@ -28,141 +31,92 @@ def _num(value, default=0.0):
         return default
 
 
-def _retry_after_seconds(response):
-    value = response.headers.get("Retry-After")
+def _included_tokens(payload):
+    tokens = {}
 
-    if value:
-        try:
-            return min(
-                MAX_PROVIDER_COOLDOWN_SECONDS,
-                max(1, int(float(value))),
-            )
-        except (TypeError, ValueError):
-            pass
-
-    return 300
-
-
-def _filter_solana_pairs(payload):
-    pairs = []
-    seen = set()
-
-    for pair in payload.get("pairs") or []:
-        if not isinstance(pair, dict):
+    for item in payload.get("included") or []:
+        if item.get("type") != "token":
             continue
 
-        # Yalnızca Solana ağındaki çiftleri kullan.
-        if str(pair.get("chainId") or "").lower() != "solana":
-            continue
+        attrs = item.get("attributes") or {}
+        address = attrs.get("address")
 
-        base = pair.get("baseToken") or {}
-        quote = pair.get("quoteToken") or {}
+        if address:
+            tokens[str(address).lower()] = attrs
 
-        address = base.get("address")
-        symbol = str(base.get("symbol") or "").strip().upper()
-        name = str(base.get("name") or "").strip().upper()
-        price = _num(pair.get("priceUsd"))
-
-        if not address or price <= 0:
-            continue
-
-        # SOL ve WSOL gibi temel varlıkları aday listesinden çıkar.
-        if symbol in {"SOL", "WSOL"}:
-            continue
-
-        if name in {"SOL", "WSOL", "WRAPPED SOL", "SOLANA"}:
-            continue
-
-        liquidity = _num((pair.get("liquidity") or {}).get("usd"))
-        volume = _num((pair.get("volume") or {}).get("h24"))
-
-        # Düşük likiditeli ve düşük hacimli çiftleri ele.
-        if liquidity < 10000 or volume < 20000:
-            continue
-
-        pair_address = pair.get("pairAddress")
-        key = str(pair_address or address).lower()
-
-        if key in seen:
-            continue
-
-        seen.add(key)
-        pairs.append(pair)
-
-    return pairs
+    return tokens
 
 
-async def _fetch_pairs(client):
-    response = await client.get(
-        DEX_SEARCH_URL,
-        params={"q": "SOL"},
-    )
+def _relationship_address(pool, side, tokens):
+    relationships = pool.get("relationships") or {}
+    relation = relationships.get(side) or {}
+    data = relation.get("data") or {}
+    token_id = str(data.get("id") or "")
 
-    if response.status_code == 429:
-        raise RuntimeError(
-            f"rate_limited:{_retry_after_seconds(response)}"
+    if "_" in token_id:
+        address = token_id.split("_", 1)[1]
+        attrs = tokens.get(address.lower(), {})
+        return address, attrs
+
+    return "", {}
+
+
+def _normalize_pools(payload):
+    normalized = []
+    tokens = _included_tokens(payload)
+
+    for pool in payload.get("data") or []:
+        attrs = pool.get("attributes") or {}
+
+        base_address, base = _relationship_address(
+            pool, "base_token", tokens
+        )
+        quote_address, quote = _relationship_address(
+            pool, "quote_token", tokens
         )
 
-    response.raise_for_status()
-    payload = response.json()
+        base_symbol = str(base.get("symbol") or "").upper()
+        quote_symbol = str(quote.get("symbol") or "").upper()
 
-    if not isinstance(payload, dict):
-        raise ValueError("Invalid DexScreener JSON response")
+        # SOL/WSOL temel varlık olarak aday olmasın.
+        if base_symbol in {"SOL", "WSOL"}:
+            address = quote_address
+            token = quote
+            price = _num(attrs.get("quote_token_price_usd"))
+        else:
+            address = base_address
+            token = base
+            price = _num(attrs.get("base_token_price_usd"))
 
-    return _filter_solana_pairs(payload)
-
-
-def _build_signals(
-    pairs,
-    min_liquidity_usd=10000,
-    min_volume_24h_usd=20000,
-    min_buys_sells_ratio=1.0,
-    limit=20,
-):
-    signals = []
-
-    for pair in pairs or []:
-        base = pair.get("baseToken") or {}
-        address = base.get("address")
-        symbol = str(base.get("symbol") or "").strip()
-
-        if not address:
+        if not address or not price:
             continue
 
-        price = _num(pair.get("priceUsd"))
-        liquidity = _num(
-            (pair.get("liquidity") or {}).get("usd")
-        )
-        volume = _num(
-            (pair.get("volume") or {}).get("h24")
-        )
+        symbol = str(token.get("symbol") or "").strip()
 
-        if price <= 0:
+        if symbol.upper() in {"SOL", "WSOL"}:
             continue
 
-        if liquidity < min_liquidity_usd:
+        liquidity = _num(attrs.get("reserve_in_usd"))
+        volume_data = attrs.get("volume_usd") or {}
+        volume = _num(volume_data.get("h24"))
+
+        if liquidity < MIN_LIQUIDITY_USD:
             continue
 
-        if volume < min_volume_24h_usd:
+        if volume < MIN_VOLUME_24H_USD:
             continue
 
-        txns = (
-            (pair.get("txns") or {}).get("h24") or {}
-        )
+        txns = attrs.get("transactions") or {}
+        txns_24h = txns.get("h24") or {}
 
-        buys = int(max(0, _num(txns.get("buys"))))
-        sells = int(max(0, _num(txns.get("sells"))))
+        buys = int(max(0, _num(txns_24h.get("buys"))))
+        sells = int(max(0, _num(txns_24h.get("sells"))))
 
         ratio = buys / max(sells, 1)
 
-        if ratio < min_buys_sells_ratio:
-            continue
+        changes = attrs.get("price_change_percentage") or {}
 
-        price_change = (
-            (pair.get("priceChange") or {}).get("h24")
-        )
-
-        signals.append({
+        normalized.append({
             "token_address": address,
             "token_symbol": symbol,
             "price_usd": price,
@@ -172,21 +126,100 @@ def _build_signals(
             "sells": sells,
             "buys_to_sells_ratio": round(ratio, 4),
             "price_change_24h_pct": (
-                _num(price_change)
-                if price_change is not None
+                _num(changes.get("h24"))
+                if changes.get("h24") is not None
                 else None
             ),
-            "pair_address": pair.get("pairAddress"),
-            "dex_id": pair.get("dexId"),
-            "source": "DexScreener",
+            "pair_address": attrs.get("address"),
+            "dex_id": None,
+            "source": "GeckoTerminal",
             "mode": "paper",
         })
 
-    # Önce likidite, ardından hacim yüksek olanları sırala.
+    return normalized
+
+
+async def _fetch_endpoint(client, url):
+    response = await client.get(
+        url,
+        params={"include": "base_token,quote_token"},
+    )
+
+    if response.status_code == 429:
+        raise RuntimeError("rate_limited")
+
+    response.raise_for_status()
+    payload = response.json()
+
+    if not isinstance(payload, dict):
+        raise ValueError("Invalid GeckoTerminal response")
+
+    return _normalize_pools(payload)
+
+
+async def _fetch_candidates():
+    headers = {
+        "Accept": "application/json;version=20230302",
+        "User-Agent": "MemecoinSpyBot/2.0",
+    }
+
+    async with httpx.AsyncClient(
+        timeout=REQUEST_TIMEOUT_SECONDS,
+        headers=headers,
+    ) as client:
+        # İlk olarak popüler havuzları tara.
+        trending = await _fetch_endpoint(
+            client, TRENDING_URL
+        )
+
+        # Ardından yeni havuzları tara.
+        new_pools = await _fetch_endpoint(
+            client, NEW_POOLS_URL
+        )
+
+    # Aynı token farklı havuzlarda görünüyorsa
+    # likiditesi yüksek olan kaydı tut.
+    best_by_token = {}
+
+    for item in trending + new_pools:
+        address = item["token_address"].lower()
+        existing = best_by_token.get(address)
+
+        if (
+            existing is None
+            or item["liquidity_usd"] > existing["liquidity_usd"]
+        ):
+            best_by_token[address] = item
+
+    return list(best_by_token.values())
+
+
+def _build_signals(
+    pairs,
+    min_liquidity_usd=MIN_LIQUIDITY_USD,
+    min_volume_24h_usd=MIN_VOLUME_24H_USD,
+    min_buys_sells_ratio=1.0,
+    limit=20,
+):
+    signals = []
+
+    for item in pairs or []:
+        if item["liquidity_usd"] < min_liquidity_usd:
+            continue
+
+        if item["volume_24h_usd"] < min_volume_24h_usd:
+            continue
+
+        if item["buys_to_sells_ratio"] < min_buys_sells_ratio:
+            continue
+
+        signals.append(item)
+
     signals.sort(
         key=lambda item: (
             item["liquidity_usd"],
             item["volume_24h_usd"],
+            item["buys_to_sells_ratio"],
         ),
         reverse=True,
     )
@@ -218,123 +251,98 @@ def _response(
         "signals": signals,
         "mode": "paper",
         "real_trading_enabled": False,
-        "note": (
-            note
-            or "Experimental filters only; signals do not guarantee profits."
+        "note": note or (
+            "Experimental filters only; signals do not guarantee profits."
         ),
     }
 
 
 async def get_signal_candidates(
-    min_liquidity_usd=10000,
-    min_volume_24h_usd=20000,
+    min_liquidity_usd=MIN_LIQUIDITY_USD,
+    min_volume_24h_usd=MIN_VOLUME_24H_USD,
     min_buys_sells_ratio=1.0,
     limit=20,
 ):
     global _last_request_at
-    global _provider_cooldown_until, _last_error
+    global _provider_cooldown_until
+    global _last_error
 
     now = time.monotonic()
-    cached_pairs = _cache["pairs"]
+    cached = _cache["pairs"]
 
-    # Taze önbellek varsa API'ye yeniden gitme.
-    if (
-        cached_pairs is not None
-        and now - _cache["at"] < CACHE_SECONDS
-    ):
+    if cached is not None and now - _cache["at"] < CACHE_SECONDS:
         return _response(
-            cached_pairs,
+            cached,
             min_liquidity_usd,
             min_volume_24h_usd,
             min_buys_sells_ratio,
             limit,
-            "DexScreener cache",
-            "Cached data; verify prices before simulated entries.",
+            "GeckoTerminal cache",
+            "Cached data; prices may have changed.",
         )
 
     async with _lock:
         now = time.monotonic()
-        cached_pairs = _cache["pairs"]
+        cached = _cache["pairs"]
 
-        if (
-            cached_pairs is not None
-            and now - _cache["at"] < CACHE_SECONDS
-        ):
+        if cached is not None and now - _cache["at"] < CACHE_SECONDS:
             return _response(
-                cached_pairs,
+                cached,
                 min_liquidity_usd,
                 min_volume_24h_usd,
                 min_buys_sells_ratio,
                 limit,
-                "DexScreener cache",
-                "Cached data; verify prices before simulated entries.",
+                "GeckoTerminal cache",
             )
 
-        # Sağlayıcı bekleme süresindeyse yeni istek gönderme.
         if now < _provider_cooldown_until:
-            if cached_pairs is not None:
+            if cached is not None:
                 return _response(
-                    cached_pairs,
+                    cached,
                     min_liquidity_usd,
                     min_volume_24h_usd,
                     min_buys_sells_ratio,
                     limit,
-                    "DexScreener stale cache",
-                    "Provider cooldown active; cached prices may be stale.",
+                    "GeckoTerminal stale cache",
+                    "Provider cooldown active; data may be stale.",
                 )
 
             return {
-                "provider": "DexScreener",
+                "provider": "GeckoTerminal",
                 "checked": 0,
                 "candidate_count": 0,
                 "signals": [],
                 "mode": "paper",
                 "real_trading_enabled": False,
-                "note": (
-                    "Provider rate-limited; waiting before retry."
-                ),
+                "note": "Provider cooldown active.",
                 "last_error": _last_error,
-                "retry_in_seconds": max(
-                    1, int(_provider_cooldown_until - now)
-                ),
             }
 
-        # İstekler arasında minimum süre bırak.
-        elapsed = now - _last_request_at
-
-        if elapsed < REQUEST_COOLDOWN_SECONDS:
-            if cached_pairs is not None:
+        if now - _last_request_at < REQUEST_COOLDOWN_SECONDS:
+            if cached is not None:
                 return _response(
-                    cached_pairs,
+                    cached,
                     min_liquidity_usd,
                     min_volume_24h_usd,
                     min_buys_sells_ratio,
                     limit,
-                    "DexScreener stale cache",
-                    "Request cooldown active; cached data may be stale.",
+                    "GeckoTerminal stale cache",
                 )
 
             return {
-                "provider": "DexScreener",
+                "provider": "GeckoTerminal",
                 "checked": 0,
                 "candidate_count": 0,
                 "signals": [],
                 "mode": "paper",
                 "real_trading_enabled": False,
-                "note": "Request cooldown active; no fresh data available.",
+                "note": "Request cooldown active.",
             }
 
         _last_request_at = time.monotonic()
 
         try:
-            async with httpx.AsyncClient(
-                timeout=REQUEST_TIMEOUT_SECONDS,
-                headers={
-                    "Accept": "application/json",
-                    "User-Agent": "MemecoinSpyBot/1.7",
-                },
-            ) as client:
-                pairs = await _fetch_pairs(client)
+            pairs = await _fetch_candidates()
 
             _cache["pairs"] = pairs
             _cache["at"] = time.monotonic()
@@ -346,7 +354,7 @@ async def get_signal_candidates(
                 min_volume_24h_usd,
                 min_buys_sells_ratio,
                 limit,
-                "DexScreener",
+                "GeckoTerminal",
             )
 
         except Exception as exc:
@@ -355,38 +363,29 @@ async def get_signal_candidates(
             )
 
             print(
-                f"DexScreener request failed: {_last_error}",
+                f"GeckoTerminal request failed: {_last_error}",
                 flush=True,
             )
 
-            if str(exc).startswith("rate_limited:"):
-                try:
-                    wait_seconds = int(str(exc).split(":")[1])
-                except (ValueError, IndexError):
-                    wait_seconds = 300
-
+            if "rate_limited" in str(exc):
                 _provider_cooldown_until = (
                     time.monotonic()
-                    + min(
-                        MAX_PROVIDER_COOLDOWN_SECONDS,
-                        max(1, wait_seconds),
-                    )
-                    + random.uniform(1, 5)
+                    + PROVIDER_COOLDOWN_SECONDS
                 )
 
-            if cached_pairs is not None:
+            if cached is not None:
                 return _response(
-                    cached_pairs,
+                    cached,
                     min_liquidity_usd,
                     min_volume_24h_usd,
                     min_buys_sells_ratio,
                     limit,
-                    "DexScreener stale cache",
+                    "GeckoTerminal stale cache",
                     "Provider failed; cached data may be stale.",
                 )
 
             return {
-                "provider": "DexScreener",
+                "provider": "GeckoTerminal",
                 "checked": 0,
                 "candidate_count": 0,
                 "signals": [],
