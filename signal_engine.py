@@ -35,9 +35,7 @@ async def _fetch_base_data():
         profiles = response.json()
 
         if not isinstance(profiles, list):
-            raise httpx.HTTPError(
-                "Unexpected token profile response"
-            )
+            raise httpx.HTTPError("Unexpected token profile response")
 
         sol_profiles = []
         seen = set()
@@ -45,12 +43,9 @@ async def _fetch_base_data():
         for item in profiles:
             if not isinstance(item, dict):
                 continue
-
             if item.get("chainId") != "solana":
                 continue
-
             address = item.get("tokenAddress")
-
             if address and address not in seen:
                 seen.add(address)
                 sol_profiles.append(item)
@@ -61,11 +56,10 @@ async def _fetch_base_data():
         ]
 
         if not addresses:
-            return []        response = await client.get(
-            TOKENS_URL + ",".join(addresses)
-        )
-        response.raise_for_status()
+            return []
 
+        response = await client.get(TOKENS_URL + ",".join(addresses))
+        response.raise_for_status()
         payload = response.json()
         pairs = (
             payload.get("pairs") or []
@@ -74,37 +68,26 @@ async def _fetch_base_data():
         )
 
         profile_by_address = {
-            item.get("tokenAddress"): item
-            for item in sol_profiles
+            item.get("tokenAddress"): item for item in sol_profiles
         }
-
         base = []
 
         for pair in pairs:
             if not isinstance(pair, dict):
                 continue
-
             if pair.get("chainId") != "solana":
                 continue
 
             token = pair.get("baseToken") or {}
             address = token.get("address")
-
             if not address:
                 continue
 
-            liquidity = _num(
-                (pair.get("liquidity") or {}).get("usd")
-            )
-
-            volume24 = _num(
-                (pair.get("volume") or {}).get("h24")
-            )
-
+            liquidity = _num((pair.get("liquidity") or {}).get("usd"))
+            volume24 = _num((pair.get("volume") or {}).get("h24"))
             h24 = (pair.get("txns") or {}).get("h24") or {}
             buys = int(_num(h24.get("buys")))
             sells = int(_num(h24.get("sells")))
-
             ratio = round(buys / max(sells, 1), 3)
 
             base.append({
@@ -128,7 +111,10 @@ async def _fetch_base_data():
                 "profile": profile_by_address.get(address, {}),
             })
 
-        return baseasync def get_signal_candidates(
+        return base
+
+
+async def get_signal_candidates(
     min_liquidity_usd=10000,
     min_volume_24h_usd=20000,
     min_buys_sells_ratio=1.0,
@@ -138,7 +124,6 @@ async def _fetch_base_data():
 
     async with _lock:
         now = time.monotonic()
-
         cache_is_fresh = (
             _cache["value"] is not None
             and now - _cache["at"] < CACHE_SECONDS
@@ -146,57 +131,44 @@ async def _fetch_base_data():
 
         if cache_is_fresh:
             base = _cache["value"]
-
         elif now < _blocked_until:
             if _cache["value"] is None:
                 raise httpx.HTTPError(
                     "DexScreener rate limit cooldown active"
                 )
-
             base = _cache["value"]
-
         else:
             try:
                 base = await _fetch_base_data()
-
                 _cache["value"] = base
                 _cache["at"] = time.monotonic()
                 _blocked_until = 0.0
                 _last_error = None
-
             except httpx.HTTPStatusError as exc:
                 if exc.response.status_code == 429:
                     _blocked_until = (
-                        time.monotonic()
-                        + RATE_LIMIT_COOLDOWN_SECONDS
+                        time.monotonic() + RATE_LIMIT_COOLDOWN_SECONDS
                     )
                     _last_error = "DexScreener rate limit (429)"
                 else:
-                    _last_error = (
-                        f"HTTP {exc.response.status_code}"
-                    )
-
+                    _last_error = f"HTTP {exc.response.status_code}"
                 if _cache["value"] is None:
                     raise
-
-                base = _cache["value"]            except (httpx.HTTPError, ValueError) as exc:
+                base = _cache["value"]
+            except (httpx.HTTPError, ValueError) as exc:
                 _last_error = (
                     f"{type(exc).__name__}: {str(exc)[:160]}"
                 )
-
                 if _cache["value"] is None:
                     raise
-
                 base = _cache["value"]
 
         filtered = [
             item for item in base
             if item["liquidity_usd"] >= min_liquidity_usd
             and item["volume_24h_usd"] >= min_volume_24h_usd
-            and item["buys_to_sells_ratio"]
-            >= min_buys_sells_ratio
+            and item["buys_to_sells_ratio"] >= min_buys_sells_ratio
         ]
-
         filtered.sort(
             key=lambda item: (
                 item["liquidity_usd"],
