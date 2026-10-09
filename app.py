@@ -1,9 +1,12 @@
 import os
 from datetime import datetime, timezone
 
+import httpx
 from fastapi import FastAPI
 
-app = FastAPI(title="Memecoin Spy Pro", version="1.0.0")
+app = FastAPI(title="Memecoin Spy Pro")
+
+DEX_URL = "https://api.dexscreener.com/token-profiles/latest/v1"
 
 
 @app.get("/")
@@ -21,11 +24,28 @@ def health():
     return {"status": "ok"}
 
 
-if __name__ == "__main__":
-    import uvicorn
+@app.get("/signals")
+async def signals():
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.get(DEX_URL)
+            response.raise_for_status()
+            data = response.json()
 
-    uvicorn.run(
-        "app:app",
-        host="0.0.0.0",
-        port=int(os.getenv("PORT", "8000")),
-    )
+        tokens = [
+            token for token in data
+            if token.get("chainId") == "solana"
+        ]
+
+        return {
+            "mode": "paper",
+            "count": len(tokens),
+            "signals": tokens[:20],
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+    except Exception as exc:
+        return {
+            "status": "error",
+            "message": str(exc),
+        }
