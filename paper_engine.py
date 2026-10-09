@@ -1,5 +1,7 @@
 import asyncio
 import time
+from email.utils import parsedate_to_datetime
+from datetime import datetime, timezone
 
 import httpx
 
@@ -10,10 +12,13 @@ DEX_TOKEN_URL = "https://api.dexscreener.com/latest/dex/tokens/"
 PRICE_TIMEOUT_SECONDS = 12
 PRICE_CACHE_SECONDS = 90
 PRICE_COOLDOWN_SECONDS = 60
+MAX_PROVIDER_COOLDOWN_SECONDS = 300
 
 _price_cache = {}
 _price_last_request = {}
 _price_lock = asyncio.Lock()
+_provider_cooldown_until = 0.0
+_provider_cooldown_reason = None
 
 _open_positions = {}
 _paper_trades = []
@@ -27,14 +32,45 @@ def _num(value, default=0.0):
         return default
 
 
+def _set_provider_cooldown(response):
+    """Respect Retry-After when available; otherwise wait 60 seconds."""
+    global _provider_cooldown_until, _provider_cooldown_reason
+
+    wait_seconds = PRICE_COOLDOWN_SECONDS
+    retry_after = response.headers.get("Retry-After")
+
+    if retry_after:
+        try:
+            wait_seconds = max(1, int(float(retry_after)))
+        except (TypeError, ValueError):
+            try:
+                retry_date = parsedate_to_datetime(retry_after)
+                if retry_date.tzinfo is None:
+                    retry_date = retry_date.replace(tzinfo=timezone.utc)
+                wait_seconds = max(
+                    1, int((retry_date - datetime.now(timezone.utc)).total_seconds())
+                )
+            except (TypeError, ValueError, OverflowError):
+                wait_seconds = PRICE_COOLDOWN_SECONDS
+
+    wait_seconds = min(wait_seconds, MAX_PROVIDER_COOLDOWN_SECONDS)
+    _provider_cooldown_until = max(
+        _provider_cooldown_until, time.monotonic() + wait_seconds
+    )
+    _provider_cooldown_reason = f"HTTP 429; pausing provider requests for {wait_seconds}s"
+
+
 async def _get_json(client, url):
     response = await client.get(url)
+    if response.status_code == 429:
+        _set_provider_cooldown(response)
     response.raise_for_status()
     return response.json()
 
 
 async def _fetch_price(client, token_address):
-    # DexScreener first: it directly returns pairs for a token address.
+    # DexScreener first. A 429 means pause all provider calls instead of
+    # immediately hitting the fallback and potentially worsening the limit.
     try:
         payload = await _get_json(client, DEX_TOKEN_URL + token_address)
         pairs = payload.get("pairs") or []
@@ -50,10 +86,16 @@ async def _fetch_price(client, token_address):
                 reverse=True,
             )
             return _num(sol_pairs[0].get("priceUsd"))
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 429:
+            return None
     except (httpx.HTTPError, ValueError):
         pass
 
-    # GeckoTerminal fallback: its token pools endpoint may be rate-limited.
+    # If a provider was rate-limited, do not immediately call the fallback.
+    if time.monotonic() < _provider_cooldown_until:
+        return None
+
     try:
         payload = await _get_json(
             client, GECKO_TOKEN_POOLS_URL + token_address + "/pools"
@@ -69,6 +111,9 @@ async def _fetch_price(client, token_address):
         if candidates:
             candidates.sort(reverse=True)
             return candidates[0][1]
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 429:
+            return None
     except (httpx.HTTPError, ValueError):
         pass
 
@@ -84,9 +129,14 @@ async def get_token_price_usd(token_address):
     if cached and now - cached["at"] < PRICE_CACHE_SECONDS:
         return cached["price"]
 
+    # Global provider cooldown prevents each open position from triggering
+    # another burst of requests after a 429 response.
+    if now < _provider_cooldown_until:
+        return None
+
     last = _price_last_request.get(token_address, 0.0)
     if now - last < PRICE_COOLDOWN_SECONDS:
-        return cached["price"] if cached else None
+        return None
 
     async with _price_lock:
         now = time.monotonic()
@@ -94,14 +144,17 @@ async def get_token_price_usd(token_address):
         if cached and now - cached["at"] < PRICE_CACHE_SECONDS:
             return cached["price"]
 
+        if now < _provider_cooldown_until:
+            return None
+
         last = _price_last_request.get(token_address, 0.0)
         if now - last < PRICE_COOLDOWN_SECONDS:
-            return cached["price"] if cached else None
+            return None
 
         _price_last_request[token_address] = now
         headers = {
             "Accept": "application/json",
-            "User-Agent": "MemecoinSpyBot/1.1",
+            "User-Agent": "MemecoinSpyBot/1.2",
         }
         try:
             async with httpx.AsyncClient(
@@ -296,15 +349,24 @@ async def update_paper_prices():
             _open_positions.pop(address, None)
             closed += 1
 
+    if not _open_positions:
+        note = "No open positions"
+    elif updated:
+        note = (
+            "Some prices updated; some unavailable"
+            if errors else "Paper prices updated"
+        )
+    elif time.monotonic() < _provider_cooldown_until:
+        remaining = max(1, int(_provider_cooldown_until - time.monotonic()))
+        note = f"Provider rate-limited; retry in about {remaining}s"
+    else:
+        note = "Price provider unavailable or cooling down"
+
     return {
         "updated": updated,
         "closed": closed,
         "price_errors": errors,
-        "note": (
-            "Paper prices updated" if updated
-            else "No open positions" if not _open_positions
-            else "Price provider unavailable or cooling down"
-        ),
+        "note": note,
     }
 
 
@@ -329,7 +391,10 @@ def get_paper_status():
         "paper_unrealized_pnl_usd": round(unrealized, 8),
         "paper_realized_pnl_usd": round(_realized_pnl_usd, 8),
         "paper_total_pnl_usd": round(unrealized + _realized_pnl_usd, 8),
-        "note": "Paper simulation only. No wallet is connected and no real orders are sent.",
+        "note": (
+            "Paper simulation only. No wallet is connected and no real orders are sent. "
+            "If prices cannot be refreshed, displayed values may be stale."
+        ),
     }
 
 
