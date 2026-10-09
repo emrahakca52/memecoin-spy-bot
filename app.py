@@ -1,20 +1,13 @@
-import asyncio
-import time
+import os
 from datetime import datetime, timezone
-
+from fastapi import FastAPI, HTTPException, Query
 import httpx
-from fastapi import FastAPI
 
-app = FastAPI(title="Memecoin Spy Pro")
+from signal_engine import get_signal_candidates
+from wallet_tracker import get_wallet_stats
+from paper_engine import paper_status, record_paper_trade, list_paper_trades
 
-DEX_URL = "https://api.dexscreener.com/token-profiles/latest/v1"
-
-# İstekleri sıklaştırmamak için basit önbellek
-CACHE_SECONDS = 30
-cached_data = None
-cached_at = 0
-request_lock = asyncio.Lock()
-
+app = FastAPI(title="Memecoin Spy Pro", version="1.0.0")
 
 @app.get("/")
 def home():
@@ -22,77 +15,68 @@ def home():
         "name": "Memecoin Spy Pro",
         "status": "running",
         "mode": "paper",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "note": "No real orders are sent.",
+        "timestamp": datetime.now(timezone.utc).isoformat()
     }
-
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
-
+    return {"status": "ok", "mode": "paper"}
 
 @app.get("/signals")
-async def signals():
-    global cached_data, cached_at
+async def signals(
+    min_liquidity_usd: float = Query(10000, ge=0),
+    min_volume_24h_usd: float = Query(20000, ge=0),
+    min_buys_sells_ratio: float = Query(1.0, ge=0),
+    limit: int = Query(20, ge=1, le=50)
+):
+    """Discover and filter Solana token pairs using public DexScreener data."""
+    try:
+        result = await get_signal_candidates(
+            min_liquidity_usd=min_liquidity_usd,
+            min_volume_24h_usd=min_volume_24h_usd,
+            min_buys_sells_ratio=min_buys_sells_ratio,
+            limit=limit
+        )
+        return result
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code
+        if status == 429:
+            raise HTTPException(status_code=503, detail="DexScreener rate limit. Wait before retrying.")
+        raise HTTPException(status_code=502, detail=f"Market data provider returned HTTP {status}.")
+    except httpx.HTTPError:
+        raise HTTPException(status_code=502, detail="Could not reach market data provider.")
 
-    async with request_lock:
-        now = time.monotonic()
+@app.get("/wallet/{wallet_address}")
+async def wallet(wallet_address: str, limit: int = Query(20, ge=1, le=100)):
+    """Summarize public Solana transaction activity; this is not a profitability score."""
+    try:
+        return await get_wallet_stats(wallet_address, limit=limit)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except httpx.HTTPError:
+        raise HTTPException(status_code=502, detail="Could not reach the Solana RPC provider.")
 
-        # Son 30 saniyedeki veriyi yeniden kullan
-        if cached_data is not None and now - cached_at < CACHE_SECONDS:
-            return cached_data
+@app.get("/paper/status")
+def get_paper_status():
+    return paper_status()
 
-        try:
-            async with httpx.AsyncClient(timeout=20) as client:
-                response = await client.get(DEX_URL)
+@app.get("/paper/trades")
+def get_paper_trades():
+    return {"mode": "paper", "trades": list_paper_trades()}
 
-                if response.status_code == 429:
-                    return {
-                        "status": "rate_limited",
-                        "message": (
-                            "DexScreener istek sınırı uyguladı. "
-                            "Bir süre sonra yeniden dene."
-                        ),
-                        "mode": "paper",
-                    }
-
-                response.raise_for_status()
-                data = response.json()
-
-            if not isinstance(data, list):
-                return {
-                    "status": "error",
-                    "message": "Beklenmeyen API yanıtı.",
-                }
-
-            tokens = [
-                token for token in data
-                if isinstance(token, dict)
-                and token.get("chainId") == "solana"
-            ]
-
-            result = {
-                "mode": "paper",
-                "count": len(tokens),
-                "signals": tokens[:20],
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            }
-
-            cached_data = result
-            cached_at = time.monotonic()
-
-            return result
-
-        except httpx.HTTPError as exc:
-            return {
-                "status": "error",
-                "message": str(exc),
-                "mode": "paper",
-            }
-
-        except Exception as exc:
-            return {
-                "status": "error",
-                "message": str(exc),
-                "mode": "paper",
-            }
+@app.post("/paper/trades")
+def add_paper_trade(payload: dict):
+    """Manually record a simulated trade only. Does not connect to a wallet."""
+    required = {"token_address", "side", "amount_usd", "price_usd"}
+    if not required.issubset(payload):
+        raise HTTPException(status_code=400, detail=f"Required fields: {sorted(required)}")
+    try:
+        return record_paper_trade(
+            token_address=str(payload["token_address"]),
+            side=str(payload["side"]),
+            amount_usd=float(payload["amount_usd"]),
+            price_usd=float(payload["price_usd"])
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
