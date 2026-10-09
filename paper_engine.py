@@ -12,6 +12,7 @@ PRICE_CACHE_SECONDS = 90
 PRICE_COOLDOWN_SECONDS = 60
 MAX_PROVIDER_COOLDOWN_SECONDS = 300
 MIN_HOLD_SECONDS = 30
+MAX_ACCEPTED_PRICE_JUMP_PCT = 35.0
 
 _price_cache = {}
 _price_last_request = {}
@@ -25,7 +26,8 @@ _realized_pnl_usd = 0.0
 
 def _num(value, default=0.0):
     try:
-        return float(value or 0)
+        result = float(value or 0)
+        return result if result == result and abs(result) != float("inf") else default
     except (TypeError, ValueError):
         return default
 
@@ -42,15 +44,11 @@ def _set_provider_cooldown(response):
                 retry_date = parsedate_to_datetime(retry_after)
                 if retry_date.tzinfo is None:
                     retry_date = retry_date.replace(tzinfo=timezone.utc)
-                wait_seconds = max(1, int(
-                    (retry_date - datetime.now(timezone.utc)).total_seconds()
-                ))
+                wait_seconds = max(1, int((retry_date - datetime.now(timezone.utc)).total_seconds()))
             except (TypeError, ValueError, OverflowError):
                 wait_seconds = PRICE_COOLDOWN_SECONDS
     wait_seconds = min(wait_seconds, MAX_PROVIDER_COOLDOWN_SECONDS)
-    _provider_cooldown_until = max(
-        _provider_cooldown_until, time.monotonic() + wait_seconds
-    )
+    _provider_cooldown_until = max(_provider_cooldown_until, time.monotonic() + wait_seconds)
     _provider_cooldown_reason = f"HTTP 429; pausing provider requests for {wait_seconds}s"
 
 
@@ -72,11 +70,8 @@ async def _fetch_prices_batch(client, token_addresses):
         try:
             payload = await _get_json(client, DEX_TOKEN_URL + ",".join(chunk))
             for pair in payload.get("pairs") or []:
-                if not isinstance(pair, dict):
+                if not isinstance(pair, dict) or (pair.get("chainId") or "").lower() != "solana":
                     continue
-                if (pair.get("chainId") or "").lower() != "solana":
-                    continue
-                # DexScreener's priceUsd belongs to baseToken only.
                 base = (pair.get("baseToken") or {}).get("address")
                 price = _num(pair.get("priceUsd"))
                 if base in chunk and price > 0:
@@ -90,8 +85,6 @@ async def _fetch_prices_batch(client, token_addresses):
         except (httpx.HTTPError, ValueError):
             pass
 
-    # Only one per-token fallback per batch; avoid a burst when DexScreener
-    # omits tokens, and never call fallback after a provider cooldown begins.
     missing = [a for a in addresses if a not in results]
     if missing and time.monotonic() >= _provider_cooldown_until:
         address = missing[0]
@@ -155,16 +148,27 @@ async def get_token_prices_usd(token_addresses):
         try:
             async with httpx.AsyncClient(
                 timeout=PRICE_TIMEOUT_SECONDS,
-                headers={"Accept": "application/json", "User-Agent": "MemecoinSpyBot/1.4"},
+                headers={"Accept": "application/json", "User-Agent": "MemecoinSpyBot/1.7"},
             ) as client:
                 fetched = await _fetch_prices_batch(client, still_missing)
         except (httpx.HTTPError, ValueError):
             fetched = {}
+
         for address in still_missing:
             price = _num(fetched.get(address))
-            if price > 0:
-                _price_cache[address] = {"at": time.monotonic(), "price": price}
-                prices[address] = price
+            if price <= 0:
+                continue
+            previous = _price_cache.get(address)
+            if previous:
+                old_price = _num(previous.get("price"))
+                if old_price > 0:
+                    jump = abs(price / old_price - 1) * 100
+                    # Conservative: reject a large jump rather than acting on a
+                    # potentially mismatched or erroneous quote. Recheck next cycle.
+                    if jump > MAX_ACCEPTED_PRICE_JUMP_PCT:
+                        continue
+            _price_cache[address] = {"at": time.monotonic(), "price": price}
+            prices[address] = price
     return prices
 
 
@@ -236,11 +240,9 @@ def open_paper_position(token_address, token_symbol="", amount_usd=10.0, price_u
     if price_usd is None or _num(price_usd) <= 0:
         raise ValueError("price_usd is required and must be positive")
     if token_address in _open_positions:
-        return {"ok": True, "mode": "paper", "skipped": True,
-                "reason": "position_already_open", "token_address": token_address}
+        return {"ok": True, "mode": "paper", "skipped": True, "reason": "position_already_open"}
     if max_open_positions is not None and len(_open_positions) >= int(max_open_positions):
-        return {"ok": True, "mode": "paper", "skipped": True,
-                "reason": "max_open_positions_reached"}
+        return {"ok": True, "mode": "paper", "skipped": True, "reason": "max_open_positions_reached"}
     result = record_paper_trade(token_address, "BUY", amount_usd, price_usd, token_symbol, source)
     position = _open_positions.get(token_address)
     if position is not None and metadata:
@@ -248,17 +250,32 @@ def open_paper_position(token_address, token_symbol="", amount_usd=10.0, price_u
     return result
 
 
-async def update_paper_prices():
+def _close_position(address, position, price, reason):
     global _realized_pnl_usd
+    quantity = _num(position.get("quantity"))
+    invested = _num(position.get("invested_usd"))
+    value = quantity * price
+    pnl = value - invested
+    trade = {
+        "token_address": address,
+        "token_symbol": position.get("token_symbol", address[:8]),
+        "side": "SELL", "amount_usd": round(value, 8), "price_usd": price,
+        "source": "auto", "reason": reason, "realized_pnl_usd": round(pnl, 8),
+        "entry_price_usd": _num(position.get("entry_price_usd")),
+        "change_pct": round((price / max(_num(position.get("entry_price_usd")), 1e-12) - 1) * 100, 4),
+        "timestamp": time.time(), "mode": "paper",
+    }
+    _paper_trades.append(trade)
+    _realized_pnl_usd += pnl
+    _open_positions.pop(address, None)
+
+
+async def update_paper_prices():
     updated = closed = errors = 0
     addresses = list(_open_positions)
     if not addresses:
         return {"updated": 0, "closed": 0, "price_errors": 0, "note": "No open positions"}
-    try:
-        prices = await get_token_prices_usd(addresses)
-    except Exception:
-        prices = {}
-
+    prices = await get_token_prices_usd(addresses)
     for address in addresses:
         position = _open_positions.get(address)
         if not position:
@@ -274,35 +291,23 @@ async def update_paper_prices():
         pnl = value - invested
         position["unrealized_pnl_usd"] = round(pnl, 8)
         updated += 1
-
         entry = _num(position.get("entry_price_usd"))
-        if entry <= 0:
-            continue
         opened_at = _num(position.get("opened_at"))
-        # First 30 seconds are a quote-consistency grace period, not a guarantee.
-        if opened_at and time.time() - opened_at < MIN_HOLD_SECONDS:
+        if entry <= 0 or (opened_at and time.time() - opened_at < MIN_HOLD_SECONDS):
             continue
         change_pct = (price / entry - 1) * 100
-        if change_pct >= 10 or change_pct <= -5:
-            reason = "take_profit_10pct" if change_pct >= 10 else "stop_loss_5pct"
-            _paper_trades.append({
-                "token_address": address, "token_symbol": position.get("token_symbol", address[:8]),
-                "side": "SELL", "amount_usd": round(value, 8), "price_usd": price,
-                "source": "auto", "reason": reason,
-                "realized_pnl_usd": round(pnl, 8), "entry_price_usd": entry,
-                "change_pct": round(change_pct, 4), "timestamp": time.time(), "mode": "paper",
-            })
-            _realized_pnl_usd += pnl
-            _open_positions.pop(address, None)
+        if change_pct >= 10:
+            _close_position(address, position, price, "take_profit_10pct")
             closed += 1
-
+        elif change_pct <= -5:
+            _close_position(address, position, price, "stop_loss_5pct")
+            closed += 1
     if not _open_positions:
         note = "No open positions"
     elif updated:
         note = "Some prices updated; some unavailable" if errors else "Paper prices updated"
     elif time.monotonic() < _provider_cooldown_until:
-        remaining = max(1, int(_provider_cooldown_until - time.monotonic()))
-        note = f"Provider rate-limited; retry in about {remaining}s"
+        note = f"Provider rate-limited; retry in about {max(1, int(_provider_cooldown_until-time.monotonic()))}s"
     else:
         note = "Price provider unavailable or cooling down"
     return {"updated": updated, "closed": closed, "price_errors": errors, "note": note}
@@ -322,8 +327,7 @@ def get_paper_status():
         "paper_unrealized_pnl_usd": round(unrealized, 8),
         "paper_realized_pnl_usd": round(_realized_pnl_usd, 8),
         "paper_total_pnl_usd": round(unrealized + _realized_pnl_usd, 8),
-        "note": "Paper simulation only. No wallet is connected and no real orders are sent. "
-                "If prices cannot be refreshed, displayed values may be stale.",
+        "note": "Paper simulation only; no wallet connected and no real orders. Values can be stale if prices fail.",
     }
 
 
