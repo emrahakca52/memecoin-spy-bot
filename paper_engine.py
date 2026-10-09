@@ -68,111 +68,154 @@ async def _get_json(client, url):
     return response.json()
 
 
+async def _fetch_prices_batch(client, token_addresses):
+    """Fetch multiple Solana token prices with one DexScreener request when possible."""
+    addresses = [a for a in dict.fromkeys(token_addresses) if a]
+    if not addresses:
+        return {}
+
+    results = {}
+
+    # DexScreener supports comma-separated token addresses; keep the URL
+    # reasonably small and process in chunks if more positions are added.
+    for offset in range(0, len(addresses), 30):
+        chunk = addresses[offset:offset + 30]
+        url = DEX_TOKEN_URL + ",".join(chunk)
+        try:
+            payload = await _get_json(client, url)
+            pairs = payload.get("pairs") or []
+            for pair in pairs:
+                if not isinstance(pair, dict):
+                    continue
+                if (pair.get("chainId") or "").lower() != "solana":
+                    continue
+                address = (
+                    (pair.get("baseToken") or {}).get("address")
+                    or (pair.get("quoteToken") or {}).get("address")
+                )
+                price = _num(pair.get("priceUsd"))
+                if address in chunk and price > 0:
+                    liquidity = _num((pair.get("liquidity") or {}).get("usd"))
+                    old = results.get(address)
+                    if old is None or liquidity > old[0]:
+                        results[address] = (liquidity, price)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 429:
+                # Do not hit another provider immediately after a rate limit.
+                return {address: None for address in addresses}
+        except (httpx.HTTPError, ValueError):
+            pass
+
+    # Fallback only for addresses not returned by DexScreener, and only if
+    # no provider-wide cooldown was triggered.
+    missing = [a for a in addresses if a not in results]
+    if missing and time.monotonic() >= _provider_cooldown_until:
+        for address in missing:
+            try:
+                payload = await _get_json(
+                    client, GECKO_TOKEN_POOLS_URL + address + "/pools"
+                )
+                candidates = []
+                for pool in payload.get("data") or []:
+                    if not isinstance(pool, dict):
+                        continue
+                    attrs = pool.get("attributes") or {}
+                    price = _num(attrs.get("base_token_price_usd"))
+                    if price > 0:
+                        candidates.append((_num(attrs.get("reserve_in_usd")), price))
+                if candidates:
+                    candidates.sort(reverse=True)
+                    results[address] = candidates[0][1]
+                else:
+                    results[address] = None
+            except httpx.HTTPStatusError as exc:
+                results[address] = None
+                if exc.response.status_code == 429:
+                    break
+            except (httpx.HTTPError, ValueError):
+                results[address] = None
+
+    for address in addresses:
+        value = results.get(address)
+        if isinstance(value, tuple):
+            results[address] = value[1]
+        elif address not in results:
+            results[address] = None
+
+    return results
+
+
 async def _fetch_price(client, token_address):
-    # DexScreener first. A 429 means pause all provider calls instead of
-    # immediately hitting the fallback and potentially worsening the limit.
-    try:
-        payload = await _get_json(client, DEX_TOKEN_URL + token_address)
-        pairs = payload.get("pairs") or []
-        sol_pairs = [
-            p for p in pairs
-            if isinstance(p, dict)
-            and (p.get("chainId") or "").lower() == "solana"
-            and _num(p.get("priceUsd")) > 0
-        ]
-        if sol_pairs:
-            sol_pairs.sort(
-                key=lambda p: _num((p.get("liquidity") or {}).get("usd")),
-                reverse=True,
-            )
-            return _num(sol_pairs[0].get("priceUsd"))
-    except httpx.HTTPStatusError as exc:
-        if exc.response.status_code == 429:
-            return None
-    except (httpx.HTTPError, ValueError):
-        pass
-
-    # If a provider was rate-limited, do not immediately call the fallback.
-    if time.monotonic() < _provider_cooldown_until:
-        return None
-
-    try:
-        payload = await _get_json(
-            client, GECKO_TOKEN_POOLS_URL + token_address + "/pools"
-        )
-        candidates = []
-        for pool in payload.get("data") or []:
-            if not isinstance(pool, dict):
-                continue
-            attrs = pool.get("attributes") or {}
-            price = _num(attrs.get("base_token_price_usd"))
-            if price > 0:
-                candidates.append((_num(attrs.get("reserve_in_usd")), price))
-        if candidates:
-            candidates.sort(reverse=True)
-            return candidates[0][1]
-    except httpx.HTTPStatusError as exc:
-        if exc.response.status_code == 429:
-            return None
-    except (httpx.HTTPError, ValueError):
-        pass
-
-    return None
+    prices = await _fetch_prices_batch(client, [token_address])
+    return prices.get(token_address)
 
 
-async def get_token_price_usd(token_address):
-    if not token_address:
-        return None
+async def get_token_prices_usd(token_addresses):
+    """Return fresh/cached prices for multiple tokens, minimizing API requests."""
+    addresses = [a for a in dict.fromkeys(token_addresses) if a]
+    if not addresses:
+        return {}
 
     now = time.monotonic()
-    cached = _price_cache.get(token_address)
-    if cached and now - cached["at"] < PRICE_CACHE_SECONDS:
-        return cached["price"]
+    prices = {}
+    missing = []
 
-    # Global provider cooldown prevents each open position from triggering
-    # another burst of requests after a 429 response.
-    if now < _provider_cooldown_until:
-        return None
+    for address in addresses:
+        cached = _price_cache.get(address)
+        if cached and now - cached["at"] < PRICE_CACHE_SECONDS:
+            prices[address] = cached["price"]
+        else:
+            prices[address] = None
+            missing.append(address)
 
-    last = _price_last_request.get(token_address, 0.0)
-    if now - last < PRICE_COOLDOWN_SECONDS:
-        return None
+    if not missing or now < _provider_cooldown_until:
+        return prices
 
     async with _price_lock:
         now = time.monotonic()
-        cached = _price_cache.get(token_address)
-        if cached and now - cached["at"] < PRICE_CACHE_SECONDS:
-            return cached["price"]
+        still_missing = []
+        for address in missing:
+            cached = _price_cache.get(address)
+            if cached and now - cached["at"] < PRICE_CACHE_SECONDS:
+                prices[address] = cached["price"]
+            elif now - _price_last_request.get(address, 0.0) >= PRICE_COOLDOWN_SECONDS:
+                still_missing.append(address)
 
-        if now < _provider_cooldown_until:
-            return None
+        if not still_missing or now < _provider_cooldown_until:
+            return prices
 
-        last = _price_last_request.get(token_address, 0.0)
-        if now - last < PRICE_COOLDOWN_SECONDS:
-            return None
+        for address in still_missing:
+            _price_last_request[address] = now
 
-        _price_last_request[token_address] = now
         headers = {
             "Accept": "application/json",
-            "User-Agent": "MemecoinSpyBot/1.2",
+            "User-Agent": "MemecoinSpyBot/1.3",
         }
         try:
             async with httpx.AsyncClient(
                 timeout=PRICE_TIMEOUT_SECONDS,
                 headers=headers,
             ) as client:
-                price = await _fetch_price(client, token_address)
+                fetched = await _fetch_prices_batch(client, still_missing)
         except (httpx.HTTPError, ValueError):
-            price = None
+            fetched = {}
 
-        if price is not None and price > 0:
-            _price_cache[token_address] = {
-                "at": time.monotonic(),
-                "price": price,
-            }
-            return price
+        for address in still_missing:
+            price = _num(fetched.get(address))
+            if price > 0:
+                _price_cache[address] = {
+                    "at": time.monotonic(),
+                    "price": price,
+                }
+                prices[address] = price
 
-    return None
+    return prices
+
+
+async def get_token_price_usd(token_address):
+    if not token_address:
+        return None
+    return (await get_token_prices_usd([token_address])).get(token_address)
 
 
 def record_paper_trade(
@@ -301,16 +344,26 @@ async def update_paper_prices():
     closed = 0
     errors = 0
 
-    for address in list(_open_positions):
+    addresses = list(_open_positions)
+    if not addresses:
+        return {
+            "updated": 0,
+            "closed": 0,
+            "price_errors": 0,
+            "note": "No open positions",
+        }
+
+    try:
+        prices = await get_token_prices_usd(addresses)
+    except Exception:
+        prices = {}
+
+    for address in addresses:
         position = _open_positions.get(address)
         if not position:
             continue
 
-        try:
-            price = await get_token_price_usd(address)
-        except Exception:
-            price = None
-
+        price = prices.get(address)
         if price is None or price <= 0:
             errors += 1
             continue
