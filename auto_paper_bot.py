@@ -20,28 +20,27 @@ _last_price_update = None
 
 async def _loop():
     global _last_run, _last_error, _last_price_update
-
     while not _stop_event.is_set():
         try:
-            # Refresh prices first so existing positions can hit simulated exits.
+            _last_error = None
+            # Update existing positions once at the start of the cycle.
             _last_price_update = await update_paper_prices()
-
             data = await get_signal_candidates(
                 min_liquidity_usd=MIN_LIQUIDITY_USD,
                 min_volume_24h_usd=MIN_VOLUME_24H_USD,
                 min_buys_sells_ratio=MIN_BUYS_SELLS_RATIO,
                 limit=20,
             )
-            candidates = data.get("signals", [])
-
-            for token in candidates:
+            for token in data.get("signals", []):
                 if _stop_event.is_set():
                     break
-                price = float(token.get("price_usd") or 0)
+                try:
+                    price = float(token.get("price_usd") or 0)
+                except (TypeError, ValueError):
+                    continue
                 address = token.get("token_address")
                 if not address or price <= 0:
                     continue
-
                 open_paper_position(
                     token_address=address,
                     token_symbol=token.get("token_symbol", ""),
@@ -57,17 +56,11 @@ async def _loop():
                         "stop_loss_pct": -5,
                     },
                 )
-
-            # Refresh again after any new simulated entries.
-            _last_price_update = await update_paper_prices()
-            _last_error = None
-            if _last_price_update.get("error"):
-                _last_error = _last_price_update["error"]
+            # No second update immediately after entries; next scheduled cycle
+            # handles their first price/exit check.
             _last_run = datetime.now(timezone.utc).isoformat()
-
         except Exception as exc:
             _last_error = f"{type(exc).__name__}: {str(exc)[:200]}"
-
         try:
             await asyncio.wait_for(_stop_event.wait(), timeout=POLL_SECONDS)
         except asyncio.TimeoutError:
@@ -98,10 +91,9 @@ async def stop_bot():
 
 
 def bot_status():
-    running = _task is not None and not _task.done()
     return {
         "mode": "paper",
-        "running": running,
+        "running": _task is not None and not _task.done(),
         "real_trading_enabled": False,
         "poll_interval_seconds": POLL_SECONDS,
         "paper_amount_per_position_usd": PAPER_BUY_USD,
