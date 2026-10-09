@@ -4,13 +4,12 @@ from datetime import datetime, timezone
 
 import httpx
 
-PROFILES_URL = "https://api.dexscreener.com/token-profiles/latest/v1"
-TOKENS_URL = "https://api.dexscreener.com/latest/dex/tokens/"
-
-CACHE_SECONDS = 900
-RATE_LIMIT_COOLDOWN_SECONDS = 900
+# GeckoTerminal public API; Solana trending pools.
+GECKO_URL = "https://api.geckoterminal.com/api/v2/networks/solana/trending_pools"
 REQUEST_TIMEOUT_SECONDS = 20
-MAX_TOKEN_ADDRESSES = 30
+CACHE_SECONDS = 180
+RATE_LIMIT_COOLDOWN_SECONDS = 60
+MAX_POOLS = 20
 
 _cache = {"at": 0.0, "value": None}
 _lock = asyncio.Lock()
@@ -25,93 +24,77 @@ def _num(value, default=0.0):
         return default
 
 
+def _token_address_from_pool(pool):
+    relationships = pool.get("relationships") or {}
+    base = (relationships.get("base_token") or {}).get("data") or {}
+    token_id = base.get("id") or ""
+    # GeckoTerminal IDs commonly look like "solana_<mint address>".
+    if token_id.startswith("solana_"):
+        return token_id[len("solana_"):]
+    return token_id
+
+
 async def _fetch_base_data():
+    headers = {
+        "Accept": "application/json;version=20230302",
+        "User-Agent": "MemecoinSpyPro/1.0",
+    }
+
     async with httpx.AsyncClient(
         timeout=REQUEST_TIMEOUT_SECONDS,
-        headers={"User-Agent": "MemecoinSpyPro/1.0"},
+        headers=headers,
     ) as client:
-        response = await client.get(PROFILES_URL)
-        response.raise_for_status()
-        profiles = response.json()
-
-        if not isinstance(profiles, list):
-            raise httpx.HTTPError("Unexpected token profile response")
-
-        sol_profiles = []
-        seen = set()
-
-        for item in profiles:
-            if not isinstance(item, dict):
-                continue
-            if item.get("chainId") != "solana":
-                continue
-            address = item.get("tokenAddress")
-            if address and address not in seen:
-                seen.add(address)
-                sol_profiles.append(item)
-
-        addresses = [
-            item["tokenAddress"]
-            for item in sol_profiles[:MAX_TOKEN_ADDRESSES]
-        ]
-
-        if not addresses:
-            return []
-
-        response = await client.get(TOKENS_URL + ",".join(addresses))
+        response = await client.get(GECKO_URL)
         response.raise_for_status()
         payload = response.json()
-        pairs = (
-            payload.get("pairs") or []
-            if isinstance(payload, dict)
-            else []
-        )
 
-        profile_by_address = {
-            item.get("tokenAddress"): item for item in sol_profiles
-        }
-        base = []
+    pools = payload.get("data") or []
+    base = []
 
-        for pair in pairs:
-            if not isinstance(pair, dict):
-                continue
-            if pair.get("chainId") != "solana":
-                continue
+    for item in pools[:MAX_POOLS]:
+        if not isinstance(item, dict):
+            continue
 
-            token = pair.get("baseToken") or {}
-            address = token.get("address")
-            if not address:
-                continue
+        attrs = item.get("attributes") or {}
+        transactions = attrs.get("transactions") or {}
+        h24 = transactions.get("h24") or {}
+        volume = attrs.get("volume_usd") or {}
+        price_change = attrs.get("price_change_percentage") or {}
 
-            liquidity = _num((pair.get("liquidity") or {}).get("usd"))
-            volume24 = _num((pair.get("volume") or {}).get("h24"))
-            h24 = (pair.get("txns") or {}).get("h24") or {}
-            buys = int(_num(h24.get("buys")))
-            sells = int(_num(h24.get("sells")))
-            ratio = round(buys / max(sells, 1), 3)
+        buys = int(_num(h24.get("buys")))
+        sells = int(_num(h24.get("sells")))
+        ratio = round(buys / max(sells, 1), 3)
 
-            base.append({
-                "chain": "solana",
-                "token_name": token.get("name"),
-                "token_symbol": token.get("symbol"),
-                "token_address": address,
-                "pair_address": pair.get("pairAddress"),
-                "dex": pair.get("dexId"),
-                "price_usd": pair.get("priceUsd"),
-                "liquidity_usd": round(liquidity, 2),
-                "volume_24h_usd": round(volume24, 2),
-                "buys_24h": buys,
-                "sells_24h": sells,
-                "buys_to_sells_ratio": ratio,
-                "price_change_24h_pct": _num(
-                    (pair.get("priceChange") or {}).get("h24")
-                ),
-                "fdv_usd": pair.get("fdv"),
-                "pair_created_at_ms": pair.get("pairCreatedAt"),
-                "profile": profile_by_address.get(address, {}),
-            })
+        pool_address = attrs.get("address") or ""
+        token_address = _token_address_from_pool(item)
 
-        return base
+        # Pool name is a fallback label if token metadata is not included.
+        pool_name = attrs.get("name") or "Unknown pool"
+        name_parts = pool_name.split(" / ", 1)
+        token_name = name_parts[0].strip() if name_parts else pool_name
+        token_symbol = token_name
+
+        base.append({
+            "chain": "solana",
+            "token_name": token_name,
+            "token_symbol": token_symbol,
+            "token_address": token_address,
+            "pair_address": pool_address,
+            "dex": attrs.get("dex_id"),
+            "price_usd": attrs.get("base_token_price_usd"),
+            "liquidity_usd": round(_num(attrs.get("reserve_in_usd")), 2),
+            "volume_24h_usd": round(_num(volume.get("h24")), 2),
+            "buys_24h": buys,
+            "sells_24h": sells,
+            "buys_to_sells_ratio": ratio,
+            "price_change_24h_pct": _num(price_change.get("h24")),
+            "fdv_usd": attrs.get("fdv_usd"),
+            "pair_created_at_ms": None,
+            "profile": {},
+            "source": "GeckoTerminal",
+        })
+
+    return base
 
 
 async def get_signal_candidates(
@@ -134,7 +117,7 @@ async def get_signal_candidates(
         elif now < _blocked_until:
             if _cache["value"] is None:
                 raise httpx.HTTPError(
-                    "DexScreener rate limit cooldown active"
+                    "GeckoTerminal rate-limit cooldown active"
                 )
             base = _cache["value"]
         else:
@@ -149,16 +132,15 @@ async def get_signal_candidates(
                     _blocked_until = (
                         time.monotonic() + RATE_LIMIT_COOLDOWN_SECONDS
                     )
-                    _last_error = "DexScreener rate limit (429)"
+                    _last_error = "GeckoTerminal rate limit (429)"
                 else:
                     _last_error = f"HTTP {exc.response.status_code}"
+
                 if _cache["value"] is None:
                     raise
                 base = _cache["value"]
             except (httpx.HTTPError, ValueError) as exc:
-                _last_error = (
-                    f"{type(exc).__name__}: {str(exc)[:160]}"
-                )
+                _last_error = f"{type(exc).__name__}: {str(exc)[:160]}"
                 if _cache["value"] is None:
                     raise
                 base = _cache["value"]
@@ -179,7 +161,7 @@ async def get_signal_candidates(
 
         return {
             "mode": "paper",
-            "provider": "DexScreener public API",
+            "provider": "GeckoTerminal public API",
             "profiles_and_pairs_checked": len(base),
             "candidates_count": len(filtered[:limit]),
             "filters": {
@@ -189,8 +171,8 @@ async def get_signal_candidates(
             },
             "warning": (
                 "Rule-based candidates only. Not buy recommendations "
-                "or proof of profitability. Data may be incomplete "
-                "or delayed."
+                "or proof of profitability. GeckoTerminal public API "
+                "is rate-limited and pool data may be incomplete."
             ),
             "signals": filtered[:limit],
             "timestamp": datetime.now(timezone.utc).isoformat(),
