@@ -186,8 +186,7 @@ async def get_signal_candidates(
             return _response(
                 pairs, min_liquidity_usd, min_volume_24h_usd,
                 min_buys_sells_ratio, limit, "DexScreener",
-            )
-                        except Exception as exc:
+            )        except Exception as exc:
             _last_error = str(exc)[:250]
 
             print(
