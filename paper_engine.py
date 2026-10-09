@@ -34,6 +34,7 @@ async def _get_json(client, url):
 
 
 async def _fetch_price(client, token_address):
+    # DexScreener first: it directly returns pairs for a token address.
     try:
         payload = await _get_json(client, DEX_TOKEN_URL + token_address)
         pairs = payload.get("pairs") or []
@@ -49,22 +50,22 @@ async def _fetch_price(client, token_address):
                 reverse=True,
             )
             return _num(sol_pairs[0].get("priceUsd"))
-
     except (httpx.HTTPError, ValueError):
         pass
 
+    # GeckoTerminal fallback: its token pools endpoint may be rate-limited.
     try:
         payload = await _get_json(
             client, GECKO_TOKEN_POOLS_URL + token_address + "/pools"
         )
         candidates = []
         for pool in payload.get("data") or []:
+            if not isinstance(pool, dict):
+                continue
             attrs = pool.get("attributes") or {}
             price = _num(attrs.get("base_token_price_usd"))
             if price > 0:
-                candidates.append(
-                    (_num(attrs.get("reserve_in_usd")), price)
-                )
+                candidates.append((_num(attrs.get("reserve_in_usd")), price))
         if candidates:
             candidates.sort(reverse=True)
             return candidates[0][1]
@@ -93,16 +94,23 @@ async def get_token_price_usd(token_address):
         if cached and now - cached["at"] < PRICE_CACHE_SECONDS:
             return cached["price"]
 
+        last = _price_last_request.get(token_address, 0.0)
+        if now - last < PRICE_COOLDOWN_SECONDS:
+            return cached["price"] if cached else None
+
         _price_last_request[token_address] = now
         headers = {
             "Accept": "application/json",
             "User-Agent": "MemecoinSpyBot/1.1",
         }
-        async with httpx.AsyncClient(
-            timeout=PRICE_TIMEOUT_SECONDS,
-            headers=headers,
-        ) as client:
-            price = await _fetch_price(client, token_address)
+        try:
+            async with httpx.AsyncClient(
+                timeout=PRICE_TIMEOUT_SECONDS,
+                headers=headers,
+            ) as client:
+                price = await _fetch_price(client, token_address)
+        except (httpx.HTTPError, ValueError):
+            price = None
 
         if price is not None and price > 0:
             _price_cache[token_address] = {
@@ -163,12 +171,12 @@ def record_paper_trade(
             }
         else:
             old_qty = _num(position.get("quantity"))
-            new_qty = quantity
-            total_qty = old_qty + new_qty
-            position["entry_price_usd"] = (
-                _num(position.get("entry_price_usd")) * old_qty
-                + price_usd * new_qty
-            ) / total_qty
+            total_qty = old_qty + quantity
+            if total_qty > 0:
+                position["entry_price_usd"] = (
+                    _num(position.get("entry_price_usd")) * old_qty
+                    + price_usd * quantity
+                ) / total_qty
             position["quantity"] = total_qty
             position["invested_usd"] = _num(position.get("invested_usd")) + amount_usd
             position["current_price_usd"] = price_usd
@@ -209,10 +217,11 @@ def open_paper_position(
     if price_usd is None or _num(price_usd) <= 0:
         raise ValueError("price_usd is required and must be positive")
 
-    # Do not repeatedly buy the same token on every polling cycle.
     if token_address in _open_positions:
-        return {"ok": True, "mode": "paper", "skipped": True,
-                "reason": "position_already_open", "token_address": token_address}
+        return {
+            "ok": True, "mode": "paper", "skipped": True,
+            "reason": "position_already_open", "token_address": token_address,
+        }
 
     if max_open_positions is not None and len(_open_positions) >= int(max_open_positions):
         return {"ok": True, "mode": "paper", "skipped": True,
@@ -244,7 +253,11 @@ async def update_paper_prices():
         if not position:
             continue
 
-        price = await get_token_price_usd(address)
+        try:
+            price = await get_token_price_usd(address)
+        except Exception:
+            price = None
+
         if price is None or price <= 0:
             errors += 1
             continue
