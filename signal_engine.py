@@ -1,32 +1,32 @@
+import asyncio
 import logging
 import os
 import time
-import asyncio
 from typing import Any
 
 import httpx
 
 logger = logging.getLogger(__name__)
 
-# Güvenlik: gerçek işlem kesinlikle kapalı.
+# Güvenlik: gerçek işlem kapalı.
 REAL_TRADING_ENABLED = False
 TRADING_MODE = "paper"
 
-TRENDING_URL = (
-    "https://api.geckoterminal.com/api/v2/"
-    "networks/solana/trending_pools"
+DEXSCREENER_URL = (
+    "https://api.dexscreener.com/latest/dex/search"
 )
 
 MIN_LIQUIDITY_USD = float(
     os.getenv("MIN_LIQUIDITY_USD", "10000")
 )
+
 MIN_VOLUME_24H_USD = float(
     os.getenv("MIN_VOLUME_24H_USD", "20000")
 )
 
-CACHE_SECONDS = 90
-ERROR_COOLDOWN_SECONDS = 300
-REQUEST_TIMEOUT_SECONDS = 15
+CACHE_SECONDS = 600
+ERROR_COOLDOWN_SECONDS = 600
+REQUEST_TIMEOUT_SECONDS = 20
 
 _cache: dict[str, Any] = {
     "time": 0.0,
@@ -38,7 +38,7 @@ _next_request_time = 0.0
 _lock = asyncio.Lock()
 
 
-def _number(value: Any, default: float = 0.0) -> float:
+def _number(value, default=0.0):
     try:
         if value is None:
             return default
@@ -47,83 +47,55 @@ def _number(value: Any, default: float = 0.0) -> float:
         return default
 
 
-def _address_from_relationship(
-    pool: dict,
-    name: str,
-) -> str:
-    relationships = pool.get("relationships") or {}
-    relation = relationships.get(name) or {}
-    data = relation.get("data") or {}
-    token_id = str(data.get("id") or "")
-
-    if token_id.startswith("solana_"):
-        return token_id[len("solana_"):]
-
-    return token_id
-
-
-def _included_tokens(payload: dict) -> dict[str, dict]:
-    result = {}
-
-    for item in payload.get("included") or []:
-        if item.get("type") != "token":
-            continue
-
-        item_id = str(item.get("id") or "")
-        attrs = item.get("attributes") or {}
-
-        if item_id.startswith("solana_"):
-            address = item_id[len("solana_"):]
-            result[address] = attrs
-
-    return result
-
-
-def _normalize_pools(payload: dict) -> list[dict]:
-    pools = payload.get("data") or []
-    tokens = _included_tokens(payload)
+def _normalize_pairs(payload):
+    pairs = payload.get("pairs") or []
     candidates = []
 
-    for pool in pools:
-        attrs = pool.get("attributes") or {}
+    for pair in pairs:
+        if pair.get("chainId") != "solana":
+            continue
 
-        base_address = _address_from_relationship(
-            pool, "base_token"
-        )
-        quote_address = _address_from_relationship(
-            pool, "quote_token"
-        )
+        base = pair.get("baseToken") or {}
+        quote = pair.get("quoteToken") or {}
+
+        base_symbol = str(
+            base.get("symbol") or ""
+        ).strip()
+
+        quote_symbol = str(
+            quote.get("symbol") or ""
+        ).strip()
+
+        base_address = str(
+            base.get("address") or ""
+        ).strip()
 
         if not base_address:
             continue
 
-        base_attrs = tokens.get(base_address, {})
-        quote_attrs = tokens.get(quote_address, {})
-
-        pool_name = str(attrs.get("name") or "")
-        parts = [
-            item.strip()
-            for item in pool_name.split("/")
-        ]
-
-        base_symbol = str(
-            base_attrs.get("symbol")
-            or (parts[0] if parts else "")
-        ).strip()
-
-        quote_symbol = str(
-            quote_attrs.get("symbol")
-            or (parts[1] if len(parts) > 1 else "")
-        ).strip()
-
-        # SOL havuzunu coin adayı olarak ekleme.
+        # SOL'un kendisini aday olarak ekleme.
         if base_symbol.upper() in {"SOL", "WSOL"}:
             continue
 
-        liquidity = _number(attrs.get("reserve_in_usd"))
+        # SOL aramasında ilgisiz pariteleri azalt.
+        if quote_symbol.upper() not in {
+            "SOL", "WSOL", "USDC", "USDT"
+        }:
+            continue
 
-        volume_data = attrs.get("volume_usd") or {}
+        liquidity_data = pair.get("liquidity") or {}
+        liquidity = _number(liquidity_data.get("usd"))
+
+        volume_data = pair.get("volume") or {}
         volume_24h = _number(volume_data.get("h24"))
+
+        txns = pair.get("txns") or {}
+        h24 = txns.get("h24") or {}
+
+        buys = _number(h24.get("buys"))
+        sells = _number(h24.get("sells"))
+
+        price = _number(pair.get("priceUsd"))
 
         if liquidity < MIN_LIQUIDITY_USD:
             continue
@@ -131,25 +103,12 @@ def _normalize_pools(payload: dict) -> list[dict]:
         if volume_24h < MIN_VOLUME_24H_USD:
             continue
 
-        transactions = attrs.get("transactions") or {}
-        h24 = transactions.get("h24") or {}
-
-        buys = _number(h24.get("buys"))
-        sells = _number(h24.get("sells"))
-
-        if buys + sells <= 0:
-            continue
-
-        price = _number(
-            attrs.get("base_token_price_usd")
-        )
-
-        if price <= 0:
+        if buys + sells <= 0 or price <= 0:
             continue
 
         ratio = buys / max(sells, 1.0)
 
-        # Sıralama puanı; kâr olasılığı değildir.
+        # Sıralama puanıdır; kârlılık tahmini değildir.
         score = (
             min(volume_24h / max(liquidity, 1.0), 10.0) * 5
             + min(ratio, 3.0) * 5
@@ -158,10 +117,10 @@ def _normalize_pools(payload: dict) -> list[dict]:
         candidates.append({
             "token_address": base_address,
             "symbol": base_symbol or "UNKNOWN",
-            "name": pool_name,
+            "name": str(base.get("name") or ""),
             "quote_symbol": quote_symbol,
             "pool_address": str(
-                attrs.get("address") or ""
+                pair.get("pairAddress") or ""
             ),
             "price_usd": price,
             "liquidity_usd": liquidity,
@@ -170,23 +129,23 @@ def _normalize_pools(payload: dict) -> list[dict]:
             "sells_24h": int(sells),
             "buy_sell_ratio": round(ratio, 3),
             "score": round(score, 3),
-            "source": "GeckoTerminal",
+            "source": "DEX Screener",
+            "url": str(pair.get("url") or ""),
         })
 
-    # Aynı tokenin birden fazla havuzunu tek kayda indir.
+    # Aynı token farklı havuzlarda bulunabilir.
     unique = {}
 
-    for candidate in candidates:
-        address = candidate["token_address"]
-
+    for item in candidates:
+        address = item["token_address"]
         previous = unique.get(address)
 
         if (
             previous is None
-            or candidate["liquidity_usd"]
+            or item["liquidity_usd"]
             > previous["liquidity_usd"]
         ):
-            unique[address] = candidate
+            unique[address] = item
 
     return sorted(
         unique.values(),
@@ -195,12 +154,10 @@ def _normalize_pools(payload: dict) -> list[dict]:
     )
 
 
-async def _fetch_candidates() -> list[dict]:
+async def _fetch_candidates():
     global _next_request_time
 
-    now = time.time()
-
-    if now < _next_request_time:
+    if time.time() < _next_request_time:
         raise RuntimeError("provider_cooldown")
 
     headers = {
@@ -212,13 +169,16 @@ async def _fetch_candidates() -> list[dict]:
         timeout=REQUEST_TIMEOUT_SECONDS,
         headers=headers,
     ) as client:
-        response = await client.get(TRENDING_URL)
+        response = await client.get(
+            DEXSCREENER_URL,
+            params={"q": "SOL"},
+        )
 
     if response.status_code == 429:
         _next_request_time = (
             time.time() + ERROR_COOLDOWN_SECONDS
         )
-        raise RuntimeError("geckoterminal_rate_limited")
+        raise RuntimeError("dexscreener_rate_limited")
 
     response.raise_for_status()
 
@@ -227,7 +187,7 @@ async def _fetch_candidates() -> list[dict]:
     if not isinstance(payload, dict):
         raise RuntimeError("invalid_market_data")
 
-    candidates = _normalize_pools(payload)
+    candidates = _normalize_pairs(payload)
 
     _next_request_time = time.time() + CACHE_SECONDS
 
@@ -235,17 +195,12 @@ async def _fetch_candidates() -> list[dict]:
 
 
 async def get_signal_candidates(
-    limit: int = 20,
+    limit=20,
     **kwargs,
-) -> dict:
-    """
-    Piyasa adaylarını asenkron olarak getirir.
-    Gerçek emir göndermez.
-    """
+):
     async with _lock:
         now = time.time()
 
-        # Başarılı sonuçları önbellekten kullan.
         if now - _cache["time"] < CACHE_SECONDS:
             candidates = _cache["candidates"]
             error = _cache["error"]
@@ -266,11 +221,10 @@ async def get_signal_candidates(
                 error = f"{type(exc).__name__}: {exc}"
 
                 logger.warning(
-                    "GeckoTerminal tarama hatası: %s",
+                    "DEX Screener tarama hatası: %s",
                     error,
                 )
 
-                # Hata varsa eski veriyi güncel gibi gösterme.
                 _cache.update({
                     "time": time.time(),
                     "candidates": [],
@@ -279,24 +233,31 @@ async def get_signal_candidates(
 
                 candidates = []
 
-    safe_limit = max(1, min(int(limit), 20))
+    try:
+        safe_limit = max(1, min(int(limit), 20))
+    except (TypeError, ValueError):
+        safe_limit = 20
+
     signals = candidates[:safe_limit]
 
     if signals:
         note = (
-            "Piyasa adayları puanlarına göre sıralandı. "
-            "Bu sonuçlar alım tavsiyesi veya kâr garantisi değildir."
+            "Adaylar piyasa verilerine göre sıralandı. "
+            "Bu sonuçlar yatırım tavsiyesi veya kâr garantisi değildir."
         )
     elif error:
         note = (
             "Piyasa verisi alınamadı. "
-            "Veri sağlayıcısı ve istek sınırları kontrol edilmeli."
+            "last_error alanını kontrol edin."
         )
     else:
-        note = "Belirlenen koşullarda uygun aday bulunamadı."
+        note = (
+            "Arama sonuçlarında filtrelerden geçen aday bulunamadı. "
+            "Bu, piyasada hiç fırsat olmadığı anlamına gelmez."
+        )
 
     return {
-        "provider": "GeckoTerminal",
+        "provider": "DEX Screener",
         "checked": len(candidates),
         "candidate_count": len(candidates),
         "signals": signals,
