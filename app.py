@@ -1,5 +1,6 @@
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+import logging
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query
@@ -13,15 +14,29 @@ from paper_engine import (
 )
 from auto_paper_bot import bot_status, start_bot, stop_bot
 
+logger = logging.getLogger("memecoin_spy")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Paper bot is off by default.
-    yield
-    await stop_bot()
+    # Start the paper simulator automatically after deployment.
+    try:
+        await start_bot()
+        logger.info("Paper bot startup requested; real trading disabled.")
+    except Exception:
+        logger.exception("Paper bot failed to start during application startup.")
+
+    try:
+        yield
+    finally:
+        try:
+            await stop_bot()
+            logger.info("Paper bot stopped during application shutdown.")
+        except Exception:
+            logger.exception("Error while stopping paper bot.")
 
 
-app = FastAPI(title="Memecoin Spy Pro", version="1.2.0", lifespan=lifespan)
+app = FastAPI(title="Memecoin Spy Pro", version="1.3.0", lifespan=lifespan)
 
 
 @app.get("/")
@@ -37,7 +52,12 @@ def home():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "mode": "paper", "real_trading_enabled": False}
+    return {
+        "status": "ok",
+        "mode": "paper",
+        "real_trading_enabled": False,
+        "bot": bot_status(),
+    }
 
 
 @app.get("/signals")
@@ -48,15 +68,12 @@ async def signals(
     limit: int = Query(20, ge=1, le=50),
 ):
     try:
-        result = await get_signal_candidates(
+        return await get_signal_candidates(
             min_liquidity_usd=min_liquidity_usd,
             min_volume_24h_usd=min_volume_24h_usd,
             min_buys_sells_ratio=min_buys_sells_ratio,
             limit=limit,
         )
-        # The scanner reports provider failures as structured JSON so callers
-        # can inspect last_error without crashing the endpoint.
-        return result
     except httpx.HTTPStatusError as exc:
         status = 503 if exc.response.status_code == 429 else 502
         raise HTTPException(
