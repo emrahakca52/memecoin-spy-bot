@@ -2,7 +2,11 @@ import asyncio
 from datetime import datetime, timezone
 
 from signal_engine import get_signal_candidates
-from paper_engine import get_token_price_usd, open_paper_position, update_paper_prices
+from paper_engine import (
+    get_token_prices_usd,
+    open_paper_position,
+    update_paper_prices,
+)
 
 POLL_SECONDS = 180
 PAPER_BUY_USD = 10.0
@@ -23,38 +27,56 @@ _last_skipped = []
 
 async def _loop(stop_event):
     global _last_run, _last_error, _last_price_update, _last_scan, _last_skipped
+
     while not stop_event.is_set():
         try:
             _last_error = None
             _last_skipped = []
             _last_price_update = await update_paper_prices()
+
             data = await get_signal_candidates(
                 min_liquidity_usd=MIN_LIQUIDITY_USD,
                 min_volume_24h_usd=MIN_VOLUME_24H_USD,
                 min_buys_sells_ratio=MIN_BUYS_SELLS_RATIO,
                 limit=20,
             )
+            signals = data.get("signals", []) or []
             _last_scan = {
                 "provider": data.get("provider"),
                 "checked": data.get("checked", 0),
-                "candidate_count": data.get("candidate_count", len(data.get("signals", []))),
+                "candidate_count": data.get("candidate_count", len(signals)),
                 "note": data.get("note"),
                 "last_error": data.get("last_error"),
             }
 
-            for token in data.get("signals", []):
-                if stop_event.is_set():
-                    break
+            # Fetch entry quotes in one batch instead of one request per token.
+            valid_signals = []
+            for token in signals:
                 address = token.get("token_address")
-                symbol = token.get("symbol", token.get("token_symbol", ""))
+                symbol = token.get("symbol") or token.get("token_symbol") or ""
                 signal_price = float(token.get("price_usd") or 0)
                 if not address or signal_price <= 0:
-                    _last_skipped.append({"symbol": symbol, "reason": "invalid_signal_price"})
+                    _last_skipped.append({
+                        "symbol": symbol,
+                        "reason": "invalid_signal_price",
+                    })
                     continue
+                valid_signals.append((token, address, symbol, signal_price))
 
-                live_price = await get_token_price_usd(address)
+            prices = await get_token_prices_usd(
+                [address for _, address, _, _ in valid_signals]
+            )
+
+            for token, address, symbol, signal_price in valid_signals:
+                if stop_event.is_set():
+                    break
+
+                live_price = prices.get(address)
                 if live_price is None or live_price <= 0:
-                    _last_skipped.append({"symbol": symbol, "reason": "live_price_unavailable"})
+                    _last_skipped.append({
+                        "symbol": symbol,
+                        "reason": "live_price_unavailable",
+                    })
                     continue
 
                 deviation = abs(live_price / signal_price - 1) * 100
@@ -73,7 +95,7 @@ async def _loop(stop_event):
                     price_usd=live_price,
                     max_open_positions=MAX_OPEN_POSITIONS,
                     metadata={
-                        "pair_address": token.get("pool_address", token.get("pair_address")),
+                        "pair_address": token.get("pool_address") or token.get("pair_address"),
                         "liquidity_usd": token.get("liquidity_usd"),
                         "volume_24h_usd": token.get("volume_24h_usd"),
                         "buy_sell_ratio": token.get("buy_sell_ratio", token.get("buys_to_sells_ratio")),
@@ -85,9 +107,13 @@ async def _loop(stop_event):
                     },
                 )
                 if result.get("skipped"):
-                    _last_skipped.append({"symbol": symbol, "reason": result.get("reason")})
+                    _last_skipped.append({
+                        "symbol": symbol,
+                        "reason": result.get("reason"),
+                    })
 
             _last_run = datetime.now(timezone.utc).isoformat()
+
         except Exception as exc:
             _last_error = f"{type(exc).__name__}: {str(exc)[:200]}"
 
