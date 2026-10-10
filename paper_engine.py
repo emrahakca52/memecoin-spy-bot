@@ -30,6 +30,40 @@ _paper_trades = []
 _realized_pnl_usd = 0.0
 _price_lock = asyncio.Lock()
 
+# Provider-level diagnostics are exposed by /paper-bot/status so rate limits,
+# endpoint/schema issues, and empty price responses can be distinguished.
+_price_diagnostics = {
+    "dex": {"requests": 0, "last_attempt_utc": None, "last_endpoint": None,
+            "last_http_status": None, "last_error": None, "last_prices_found": 0,
+            "cooldown_seconds_remaining": 0},
+    "gecko": {"requests": 0, "last_attempt_utc": None, "last_endpoint": None,
+              "last_http_status": None, "last_error": None, "last_prices_found": 0,
+              "cooldown_seconds_remaining": 0},
+}
+
+
+def _utc_now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _record_provider(provider, **updates):
+    item = _price_diagnostics.setdefault(provider, {})
+    item.update(updates)
+
+
+def get_price_diagnostics():
+    """Return a safe copy of provider health and latest price lookup details."""
+    result = {}
+    now = time.monotonic()
+    for provider, details in _price_diagnostics.items():
+        item = dict(details)
+        item["cooldown_seconds_remaining"] = max(
+            0, int(_provider_cooldown_until.get(provider, 0.0) - now)
+        )
+        item["cooldown_reason"] = _provider_cooldown_reason.get(provider)
+        result[provider] = item
+    return result
+
 
 def _num(value, default=0.0):
     try:
@@ -65,11 +99,7 @@ def _set_provider_cooldown(provider, response):
                     retry_date = retry_date.replace(tzinfo=timezone.utc)
                 wait_seconds = max(
                     1,
-                    int(
-                        (
-                            retry_date - datetime.now(timezone.utc)
-                        ).total_seconds()
-                    ),
+                    int((retry_date - datetime.now(timezone.utc)).total_seconds()),
                 )
             except (TypeError, ValueError, OverflowError):
                 wait_seconds = PRICE_COOLDOWN_SECONDS
@@ -80,7 +110,7 @@ def _set_provider_cooldown(provider, response):
         time.monotonic() + wait_seconds,
     )
     _provider_cooldown_reason[provider] = (
-        f"HTTP 429; bekleme süresi {wait_seconds}s"
+        f"HTTP 429; bekleme sÃ¼resi {wait_seconds}s"
     )
 
 
@@ -88,22 +118,48 @@ async def _get_json(client, url):
     provider = _provider_name(url)
 
     if _provider_is_cooling(provider):
+        remaining = max(1, int(_provider_cooldown_until.get(provider, 0.0) - time.monotonic()))
+        _record_provider(provider, last_error=f"provider cooldown ({remaining}s)")
         raise RuntimeError(f"{provider}_price_provider_cooldown")
 
-    response = await client.get(url)
-
-    if response.status_code == 429:
-        _set_provider_cooldown(provider, response)
-
-    response.raise_for_status()
-    return response.json()
+    _record_provider(
+        provider,
+        requests=int(_price_diagnostics.get(provider, {}).get("requests", 0)) + 1,
+        last_attempt_utc=_utc_now(),
+        last_endpoint=url.split("?")[0],
+        last_http_status=None,
+        last_error=None,
+        last_prices_found=0,
+    )
+    try:
+        response = await client.get(url)
+        _record_provider(provider, last_http_status=response.status_code)
+        if response.status_code == 429:
+            _set_provider_cooldown(provider, response)
+            _record_provider(provider, last_error="HTTP 429 rate limited")
+        response.raise_for_status()
+        try:
+            return response.json()
+        except ValueError as exc:
+            _record_provider(provider, last_error=f"invalid JSON: {type(exc).__name__}")
+            raise
+    except httpx.HTTPStatusError as exc:
+        _record_provider(
+            provider,
+            last_http_status=exc.response.status_code,
+            last_error=f"HTTP {exc.response.status_code}",
+        )
+        raise
+    except httpx.HTTPError as exc:
+        _record_provider(provider, last_error=f"network error: {type(exc).__name__}")
+        raise
 
 
 def _extract_gecko_batch_prices(payload):
+    """Return normalized token-address -> USD-price values from GeckoTerminal."""
     data = payload.get("data") or {}
     attrs = data.get("attributes") or {}
     raw = attrs.get("token_prices") or {}
-
     if not isinstance(raw, dict):
         return {}
 
@@ -112,7 +168,6 @@ def _extract_gecko_batch_prices(payload):
         price = _num(value)
         if address and price > 0:
             normalized[str(address).lower()] = price
-
     return normalized
 
 
@@ -123,139 +178,101 @@ async def _fetch_prices_batch(client, token_addresses):
 
     results = {}
 
-    # 1. DexScreener: en fazla 30 token adresini bir istekte sorgula.
+    # 1) DexScreener: one request per chunk, up to 30 token addresses.
     for offset in range(0, len(addresses), 30):
         chunk = addresses[offset:offset + 30]
-
         if _provider_is_cooling("dex"):
             break
 
         try:
             payload = await _get_json(
-                client,
-                DEX_TOKEN_URL + ",".join(chunk),
+                client, DEX_TOKEN_URL + ",".join(chunk)
             )
-
-            chunk_lower = {address.lower() for address in chunk}
-
+            found_before = len(results)
             for pair in payload.get("pairs") or []:
                 if not isinstance(pair, dict):
                     continue
-
                 if str(pair.get("chainId", "")).lower() != "solana":
                     continue
 
                 base = (pair.get("baseToken") or {}).get("address")
                 price = _num(pair.get("priceUsd"))
-
-                if (
-                    not base
-                    or base.lower() not in chunk_lower
-                    or price <= 0
-                ):
+                if not base or base.lower() not in {a.lower() for a in chunk} or price <= 0:
                     continue
 
-                liquidity = _num(
-                    (pair.get("liquidity") or {}).get("usd")
-                )
-                key = next(
-                    (a for a in chunk if a.lower() == base.lower()),
-                    base,
-                )
+                liquidity = _num((pair.get("liquidity") or {}).get("usd"))
+                key = next((a for a in chunk if a.lower() == base.lower()), base)
                 previous = results.get(key)
-
                 if previous is None or liquidity > previous[0]:
                     results[key] = (liquidity, price)
+            _record_provider("dex", last_prices_found=max(0, len(results) - found_before), last_error=None)
 
         except httpx.HTTPStatusError as exc:
+            _record_provider("dex", last_error=f"HTTP {exc.response.status_code}")
             if exc.response.status_code == 429:
                 _set_provider_cooldown("dex", exc.response)
                 break
-        except (httpx.HTTPError, ValueError, RuntimeError):
-            pass
+        except (httpx.HTTPError, ValueError, RuntimeError) as exc:
+            _record_provider("dex", last_error=f"{type(exc).__name__}: {str(exc)[:140]}")
 
-    # 2. GeckoTerminal: eksik tokenların fiyatlarını toplu sorgula.
-    missing = [
-        address for address in addresses
-        if not any(key.lower() == address.lower() for key in results)
-    ]
-
+    # 2) GeckoTerminal batch endpoint: request all still-missing tokens together.
+    missing = [a for a in addresses if not any(k.lower() == a.lower() for k in results)]
     if missing and not _provider_is_cooling("gecko"):
         try:
             payload = await _get_json(
-                client,
-                GECKO_BATCH_PRICE_URL + ",".join(missing),
+                client, GECKO_BATCH_PRICE_URL + ",".join(missing)
             )
             batch_prices = _extract_gecko_batch_prices(payload)
-
+            found = 0
             for address in missing:
                 price = batch_prices.get(address.lower())
                 if price and price > 0:
                     results[address] = (0.0, price)
-
+                    found += 1
+            _record_provider("gecko", last_prices_found=found, last_error=None if found else "HTTP 200 but no usable prices parsed from batch response")
         except httpx.HTTPStatusError as exc:
+            _record_provider("gecko", last_error=f"HTTP {exc.response.status_code}")
             if exc.response.status_code == 429:
                 _set_provider_cooldown("gecko", exc.response)
-        except (
-            httpx.HTTPError,
-            ValueError,
-            RuntimeError,
-            AttributeError,
-        ):
-            pass
+        except (httpx.HTTPError, ValueError, RuntimeError, AttributeError) as exc:
+            _record_provider("gecko", last_error=f"{type(exc).__name__}: {str(exc)[:140]}")
 
-    # 3. Yedek: toplu sorguda bulunamayan tokenların havuzlarını sorgula.
-    missing = [
-        address for address in addresses
-        if not any(key.lower() == address.lower() for key in results)
-    ]
-
+    # 3) Fallback: individual token-pool requests only for unresolved addresses.
+    missing = [a for a in addresses if not any(k.lower() == a.lower() for k in results)]
     for address in missing:
         if _provider_is_cooling("gecko"):
             break
-
         try:
             payload = await _get_json(
-                client,
-                GECKO_TOKEN_POOLS_URL + address + "/pools",
+                client, GECKO_TOKEN_POOLS_URL + address + "/pools"
             )
-
             candidates = []
-
             for pool in payload.get("data") or []:
                 if not isinstance(pool, dict):
                     continue
-
                 attrs = pool.get("attributes") or {}
                 price = _num(attrs.get("base_token_price_usd"))
                 liquidity = _num(attrs.get("reserve_in_usd"))
-
                 if price > 0:
                     candidates.append((liquidity, price))
-
             if candidates:
                 candidates.sort(reverse=True)
                 results[address] = candidates[0]
-
+                _record_provider("gecko", last_prices_found=1, last_error=None)
+            else:
+                _record_provider("gecko", last_prices_found=0, last_error="HTTP 200 but no usable pool prices found")
         except httpx.HTTPStatusError as exc:
+            _record_provider("gecko", last_error=f"HTTP {exc.response.status_code}")
             if exc.response.status_code == 429:
                 _set_provider_cooldown("gecko", exc.response)
                 break
-        except (httpx.HTTPError, ValueError, RuntimeError):
-            pass
+        except (httpx.HTTPError, ValueError, RuntimeError) as exc:
+            _record_provider("gecko", last_error=f"{type(exc).__name__}: {str(exc)[:140]}")
 
     output = {}
-
     for address in addresses:
-        match = next(
-            (
-                value for key, value in results.items()
-                if key.lower() == address.lower()
-            ),
-            None,
-        )
+        match = next((v for k, v in results.items() if k.lower() == address.lower()), None)
         output[address] = match[1] if match else None
-
     return output
 
 
@@ -270,7 +287,6 @@ async def get_token_prices_usd(token_addresses):
 
     for address in addresses:
         cached = _price_cache.get(address)
-
         if cached and now - cached["at"] < PRICE_CACHE_SECONDS:
             prices[address] = cached["price"]
         else:
@@ -286,13 +302,11 @@ async def get_token_prices_usd(token_addresses):
 
         for address in missing:
             cached = _price_cache.get(address)
-
             if cached and now - cached["at"] < PRICE_CACHE_SECONDS:
                 prices[address] = cached["price"]
                 continue
 
             last_request = _price_last_request.get(address, 0.0)
-
             if now - last_request >= PRICE_COOLDOWN_SECONDS:
                 still_missing.append(address)
 
@@ -310,28 +324,20 @@ async def get_token_prices_usd(token_addresses):
                     "User-Agent": "MemecoinSpyBot/2.0",
                 },
             ) as client:
-                fetched = await _fetch_prices_batch(
-                    client,
-                    still_missing,
-                )
-
+                fetched = await _fetch_prices_batch(client, still_missing)
         except (httpx.HTTPError, ValueError, RuntimeError):
             fetched = {}
 
         for address in still_missing:
             price = _num(fetched.get(address))
-
             if price <= 0:
                 continue
 
             previous = _price_cache.get(address)
-
             if previous:
                 old_price = _num(previous.get("price"))
-
                 if old_price > 0:
                     jump = abs(price / old_price - 1) * 100
-
                     if jump > MAX_ACCEPTED_PRICE_JUMP_PCT:
                         continue
 
@@ -347,7 +353,6 @@ async def get_token_prices_usd(token_addresses):
 async def get_token_price_usd(token_address):
     if not token_address:
         return None
-
     prices = await get_token_prices_usd([token_address])
     return prices.get(token_address)
 
@@ -369,11 +374,8 @@ def record_paper_trade(
 
     if side not in ("BUY", "SELL"):
         raise ValueError("side must be BUY or SELL")
-
     if not token_address or amount_usd <= 0 or price_usd <= 0:
-        raise ValueError(
-            "token_address, amount_usd and price_usd must be valid"
-        )
+        raise ValueError("token_address, amount_usd and price_usd must be valid")
 
     trade = {
         "token_address": token_address,
@@ -391,7 +393,6 @@ def record_paper_trade(
     if side == "BUY":
         quantity = amount_usd / price_usd
         position = _open_positions.get(token_address)
-
         if position is None:
             _open_positions[token_address] = {
                 "token_address": token_address,
@@ -406,43 +407,32 @@ def record_paper_trade(
         else:
             old_qty = _num(position.get("quantity"))
             total_qty = old_qty + quantity
-
             if total_qty > 0:
                 position["entry_price_usd"] = (
                     _num(position.get("entry_price_usd")) * old_qty
                     + price_usd * quantity
                 ) / total_qty
-
             position["quantity"] = total_qty
-            position["invested_usd"] = (
-                _num(position.get("invested_usd")) + amount_usd
-            )
+            position["invested_usd"] = _num(position.get("invested_usd")) + amount_usd
             position["current_price_usd"] = price_usd
-
     else:
         position = _open_positions.get(token_address)
-
         if position:
             qty = _num(position.get("quantity"))
             sell_qty = min(qty, amount_usd / price_usd)
-            cost_per_unit = (
-                _num(position.get("invested_usd")) / max(qty, 1e-12)
-            )
+            cost_per_unit = _num(position.get("invested_usd")) / max(qty, 1e-12)
             proceeds = sell_qty * price_usd
             cost = sell_qty * cost_per_unit
             realized = proceeds - cost
             _realized_pnl_usd += realized
             trade["realized_pnl_usd"] = round(realized, 8)
-
             remaining_qty = qty - sell_qty
-
             if remaining_qty <= 1e-12:
                 _open_positions.pop(token_address, None)
             else:
                 position["quantity"] = remaining_qty
                 position["invested_usd"] = max(
-                    0.0,
-                    _num(position.get("invested_usd")) - cost,
+                    0.0, _num(position.get("invested_usd")) - cost
                 )
 
     return {"ok": True, "mode": "paper", "trade": trade}
@@ -459,46 +449,27 @@ def open_paper_position(
 ):
     if not token_address:
         raise ValueError("token_address is required")
-
     if price_usd is None or _num(price_usd) <= 0:
         raise ValueError("price_usd is required and must be positive")
-
     if _num(amount_usd) <= 0:
         raise ValueError("amount_usd must be positive")
-
     if token_address in _open_positions:
         return {
-            "ok": True,
-            "mode": "paper",
-            "skipped": True,
+            "ok": True, "mode": "paper", "skipped": True,
             "reason": "position_already_open",
         }
-
-    if (
-        max_open_positions is not None
-        and len(_open_positions) >= int(max_open_positions)
-    ):
+    if max_open_positions is not None and len(_open_positions) >= int(max_open_positions):
         return {
-            "ok": True,
-            "mode": "paper",
-            "skipped": True,
+            "ok": True, "mode": "paper", "skipped": True,
             "reason": "max_open_positions_reached",
         }
 
     result = record_paper_trade(
-        token_address,
-        "BUY",
-        amount_usd,
-        price_usd,
-        token_symbol,
-        source,
+        token_address, "BUY", amount_usd, price_usd, token_symbol, source
     )
-
     position = _open_positions.get(token_address)
-
     if position is not None and metadata:
         position["metadata"] = dict(metadata)
-
     return result
 
 
@@ -510,7 +481,6 @@ def _close_position(address, position, price, reason):
     value = quantity * price
     pnl = value - invested
     entry = _num(position.get("entry_price_usd"))
-
     trade = {
         "token_address": address,
         "token_symbol": position.get("token_symbol", address[:8]),
@@ -521,14 +491,10 @@ def _close_position(address, position, price, reason):
         "reason": reason,
         "realized_pnl_usd": round(pnl, 8),
         "entry_price_usd": entry,
-        "change_pct": round(
-            (price / max(entry, 1e-12) - 1) * 100,
-            4,
-        ),
+        "change_pct": round((price / max(entry, 1e-12) - 1) * 100, 4),
         "timestamp": time.time(),
         "mode": "paper",
     }
-
     _paper_trades.append(trade)
     _realized_pnl_usd += pnl
     _open_positions.pop(address, None)
@@ -537,25 +503,18 @@ def _close_position(address, position, price, reason):
 async def update_paper_prices():
     updated = closed = errors = 0
     addresses = list(_open_positions)
-
     if not addresses:
         return {
-            "updated": 0,
-            "closed": 0,
-            "price_errors": 0,
+            "updated": 0, "closed": 0, "price_errors": 0,
             "note": "No open positions",
         }
 
     prices = await get_token_prices_usd(addresses)
-
     for address in addresses:
         position = _open_positions.get(address)
-
         if not position:
             continue
-
         price = prices.get(address)
-
         if price is None or price <= 0:
             errors += 1
             continue
@@ -569,44 +528,21 @@ async def update_paper_prices():
 
         entry = _num(position.get("entry_price_usd"))
         opened_at = _num(position.get("opened_at"))
-
-        if (
-            entry <= 0
-            or (
-                opened_at
-                and time.time() - opened_at < MIN_HOLD_SECONDS
-            )
-        ):
+        if entry <= 0 or (opened_at and time.time() - opened_at < MIN_HOLD_SECONDS):
             continue
 
         change_pct = (price / entry - 1) * 100
-
         if change_pct >= 10:
-            _close_position(
-                address,
-                position,
-                price,
-                "take_profit_10pct",
-            )
+            _close_position(address, position, price, "take_profit_10pct")
             closed += 1
-
         elif change_pct <= -5:
-            _close_position(
-                address,
-                position,
-                price,
-                "stop_loss_5pct",
-            )
+            _close_position(address, position, price, "stop_loss_5pct")
             closed += 1
 
     if not _open_positions:
         note = "No open positions"
     elif updated:
-        note = (
-            "Some prices updated; some unavailable"
-            if errors
-            else "Paper prices updated"
-        )
+        note = "Some prices updated; some unavailable" if errors else "Paper prices updated"
     elif any(_provider_is_cooling(p) for p in ("dex", "gecko")):
         note = "Price provider rate-limited; waiting before retry"
     else:
@@ -622,18 +558,9 @@ async def update_paper_prices():
 
 def get_paper_status():
     positions = list(_open_positions.values())
-
-    invested = sum(
-        _num(p.get("invested_usd")) for p in positions
-    )
-    value = sum(
-        _num(p.get("quantity")) * _num(p.get("current_price_usd"))
-        for p in positions
-    )
-    unrealized = sum(
-        _num(p.get("unrealized_pnl_usd")) for p in positions
-    )
-
+    invested = sum(_num(p.get("invested_usd")) for p in positions)
+    value = sum(_num(p.get("quantity")) * _num(p.get("current_price_usd")) for p in positions)
+    unrealized = sum(_num(p.get("unrealized_pnl_usd")) for p in positions)
     return {
         "mode": "paper",
         "real_trading_enabled": False,
@@ -646,14 +573,8 @@ def get_paper_status():
         "paper_current_value_usd": round(value, 8),
         "paper_unrealized_pnl_usd": round(unrealized, 8),
         "paper_realized_pnl_usd": round(_realized_pnl_usd, 8),
-        "paper_total_pnl_usd": round(
-            unrealized + _realized_pnl_usd,
-            8,
-        ),
-        "note": (
-            "Paper simulation only; no wallet connected and no real orders. "
-            "Values can be stale if prices fail."
-        ),
+        "paper_total_pnl_usd": round(unrealized + _realized_pnl_usd, 8),
+        "note": "Paper simulation only; no wallet connected and no real orders. Values can be stale if prices fail.",
     }
 
 
