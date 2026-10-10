@@ -7,12 +7,21 @@ import httpx
 
 BIRDEYE_PRICE_URL = "https://public-api.birdeye.so/defi/price"
 
-PRICE_TIMEOUT_SECONDS = 12
-PRICE_CACHE_SECONDS = 90
-PRICE_COOLDOWN_SECONDS = 60
-MIN_HOLD_SECONDS = 30
-MAX_ACCEPTED_PRICE_JUMP_PCT = 35.0
-BIRDEYE_MIN_REQUEST_INTERVAL_SECONDS = 1.1
+PRICE_TIMEOUT_SECONDS = float(os.getenv("PRICE_TIMEOUT_SECONDS", "12"))
+PRICE_CACHE_SECONDS = max(5, int(os.getenv("PRICE_CACHE_SECONDS", "90")))
+PRICE_COOLDOWN_SECONDS = max(1, int(os.getenv("PRICE_COOLDOWN_SECONDS", "60")))
+MIN_HOLD_SECONDS = max(0, int(os.getenv("MIN_HOLD_SECONDS", "30")))
+MAX_ACCEPTED_PRICE_JUMP_PCT = max(
+    1.0, float(os.getenv("MAX_ACCEPTED_PRICE_JUMP_PCT", "35.0"))
+)
+BIRDEYE_MIN_REQUEST_INTERVAL_SECONDS = max(
+    1.1, float(os.getenv("BIRDEYE_MIN_REQUEST_INTERVAL_SECONDS", "3.0"))
+)
+# A cached quote older than this is not used as the reference for jump detection.
+PRICE_JUMP_REFERENCE_MAX_AGE_SECONDS = max(
+    PRICE_CACHE_SECONDS,
+    int(os.getenv("PRICE_JUMP_REFERENCE_MAX_AGE_SECONDS", "180")),
+)
 
 _price_cache = {}
 _price_last_request = {}
@@ -24,7 +33,6 @@ _realized_pnl_usd = 0.0
 _price_lock = asyncio.Lock()
 _birdeye_last_request_at = 0.0
 
-# Birdeye is the sole price provider. Diagnostics never expose the API key.
 _price_diagnostics = {
     "birdeye": {
         "requests": 0,
@@ -43,12 +51,11 @@ def _utc_now():
 
 
 def _record_provider(provider, **updates):
-    item = _price_diagnostics.setdefault(provider, {})
-    item.update(updates)
+    _price_diagnostics.setdefault(provider, {}).update(updates)
 
 
 def get_price_diagnostics():
-    """Return a safe copy of provider health and latest price lookup details."""
+    """Return provider diagnostics without exposing credentials."""
     result = {}
     now = time.monotonic()
     for provider, details in _price_diagnostics.items():
@@ -85,7 +92,7 @@ def _set_provider_cooldown(provider, seconds, reason):
 
 
 async def _respect_birdeye_rate_limit():
-    """Stay within the configured one-request-per-second package limit."""
+    """Serialize request timing to respect the configured minimum interval."""
     global _birdeye_last_request_at
     now = time.monotonic()
     wait = BIRDEYE_MIN_REQUEST_INTERVAL_SECONDS - (now - _birdeye_last_request_at)
@@ -133,9 +140,9 @@ async def _fetch_birdeye_price(client, address):
         if response.status_code == 429:
             retry_after = response.headers.get("Retry-After", "")
             try:
-                cooldown = min(300, max(60, int(float(retry_after))))
+                cooldown = min(900, max(60, int(float(retry_after))))
             except (TypeError, ValueError, OverflowError):
-                cooldown = 60
+                cooldown = 300
             _set_provider_cooldown(
                 "birdeye", cooldown, f"HTTP 429; cooldown {cooldown}s"
             )
@@ -173,19 +180,15 @@ async def _fetch_birdeye_price(client, address):
         _record_provider("birdeye", last_error="request timed out")
         return None
     except httpx.HTTPError as exc:
-        _record_provider(
-            "birdeye", last_error=f"network error: {type(exc).__name__}"
-        )
+        _record_provider("birdeye", last_error=f"network error: {type(exc).__name__}")
         return None
     except (ValueError, AttributeError, TypeError) as exc:
-        _record_provider(
-            "birdeye", last_error=f"invalid response: {type(exc).__name__}"
-        )
+        _record_provider("birdeye", last_error=f"invalid response: {type(exc).__name__}")
         return None
 
 
 async def _fetch_prices_batch(client, token_addresses):
-    """Fetch prices only from Birdeye, sequentially respecting the 1 RPS limit."""
+    """Fetch sequentially; stop after provider cooldown activates."""
     results = {}
     for address in token_addresses:
         results[address] = await _fetch_birdeye_price(client, address)
@@ -217,22 +220,17 @@ async def get_token_prices_usd(token_addresses):
     async with _price_lock:
         now = time.monotonic()
         still_missing = []
-
         for address in missing:
             cached = _price_cache.get(address)
             if cached and now - cached["at"] < PRICE_CACHE_SECONDS:
                 prices[address] = cached["price"]
                 continue
-
             last_request = _price_last_request.get(address, 0.0)
             if now - last_request >= PRICE_COOLDOWN_SECONDS:
                 still_missing.append(address)
 
         if not still_missing:
             return prices
-
-        for address in still_missing:
-            _price_last_request[address] = now
 
         try:
             async with httpx.AsyncClient(
@@ -246,6 +244,12 @@ async def get_token_prices_usd(token_addresses):
         except (httpx.HTTPError, ValueError, RuntimeError):
             fetched = {}
 
+        # Mark each address attempted at the time of the attempt, not before
+        # waiting for network calls. Addresses not reached after a 429 remain retryable.
+        for address in still_missing:
+            if address in fetched:
+                _price_last_request[address] = time.monotonic()
+
         for address in still_missing:
             price = _num(fetched.get(address))
             if price <= 0:
@@ -254,22 +258,27 @@ async def get_token_prices_usd(token_addresses):
             previous = _price_cache.get(address)
             if previous:
                 old_price = _num(previous.get("price"))
-                if old_price > 0:
+                previous_age = time.monotonic() - _num(previous.get("at"))
+
+                # Only compare with a recent quote. An old cached quote should
+                # not reject every future price update indefinitely.
+                if (
+                    old_price > 0
+                    and previous_age <= PRICE_JUMP_REFERENCE_MAX_AGE_SECONDS
+                ):
                     jump = abs(price / old_price - 1) * 100
                     if jump > MAX_ACCEPTED_PRICE_JUMP_PCT:
                         _record_provider(
                             "birdeye",
                             last_error=(
                                 f"price jump rejected ({jump:.2f}% > "
-                                f"{MAX_ACCEPTED_PRICE_JUMP_PCT:.1f}%)"
+                                f"{MAX_ACCEPTED_PRICE_JUMP_PCT:.1f}%; "
+                                f"reference age {previous_age:.1f}s)"
                             ),
                         )
                         continue
 
-            _price_cache[address] = {
-                "at": time.monotonic(),
-                "price": price,
-            }
+            _price_cache[address] = {"at": time.monotonic(), "price": price}
             prices[address] = price
 
     return prices
@@ -484,7 +493,10 @@ async def update_paper_prices():
 def get_paper_status():
     positions = list(_open_positions.values())
     invested = sum(_num(p.get("invested_usd")) for p in positions)
-    value = sum(_num(p.get("quantity")) * _num(p.get("current_price_usd")) for p in positions)
+    value = sum(
+        _num(p.get("quantity")) * _num(p.get("current_price_usd"))
+        for p in positions
+    )
     unrealized = sum(_num(p.get("unrealized_pnl_usd")) for p in positions)
     return {
         "mode": "paper",
@@ -499,7 +511,10 @@ def get_paper_status():
         "paper_unrealized_pnl_usd": round(unrealized, 8),
         "paper_realized_pnl_usd": round(_realized_pnl_usd, 8),
         "paper_total_pnl_usd": round(unrealized + _realized_pnl_usd, 8),
-        "note": "Paper simulation only; no wallet connected and no real orders. Values can be stale if Birdeye prices fail.",
+        "note": (
+            "Paper simulation only; no wallet connected and no real orders. "
+            "Values can be stale if Birdeye prices fail."
+        ),
     }
 
 
