@@ -224,6 +224,7 @@ def _normalize_dex_pair(pair: dict) -> dict | None:
 async def _fetch_coingecko(client: httpx.AsyncClient) -> tuple[list[dict], list[str]]:
     pools: list[dict] = []
     errors: list[str] = []
+    raw_pool_count = 0
     headers = {"accept": "application/json"}
     if COINGECKO_DEMO_API_KEY:
         headers["x-cg-demo-api-key"] = COINGECKO_DEMO_API_KEY
@@ -234,10 +235,11 @@ async def _fetch_coingecko(client: httpx.AsyncClient) -> tuple[list[dict], list[
                 client,
                 COINGECKO_NEW_POOLS_URL,
                 provider="coingecko",
-                params={"page": page},
+                params={"page": page, "include": "base_token"},
                 headers=headers,
             )
             data = payload.get("data", []) if isinstance(payload, dict) else []
+            raw_pool_count += len(data) if isinstance(data, list) else 0
             included = payload.get("included", []) if isinstance(payload, dict) else []
             included_by_id = {
                 obj.get("id"): obj
@@ -299,7 +301,13 @@ async def _fetch_coingecko(client: httpx.AsyncClient) -> tuple[list[dict], list[
         if page != 3:
             await asyncio.sleep(0.35)
 
+    # Keep diagnostics separate from errors: a successful HTTP response can still
+    # contain no usable token records if the provider omits included base-token data.
+    _fetch_coingecko.last_raw_pool_count = raw_pool_count
     return pools, errors
+
+
+_fetch_coingecko.last_raw_pool_count = 0
 
 
 async def _fetch_gecko_fallback(client: httpx.AsyncClient) -> tuple[list[dict], list[str]]:
@@ -387,6 +395,9 @@ async def _fetch_candidates() -> tuple[list[dict], dict]:
         cg_pools, cg_errors = await _fetch_coingecko(client)
         source_errors.extend(cg_errors)
         source_counts["CoinGecko"] = len(cg_pools)
+        source_counts["CoinGecko_raw_pools"] = getattr(
+            _fetch_coingecko, "last_raw_pool_count", len(cg_pools)
+        )
         all_candidates.extend(cg_pools)
 
         gt_pools, gt_errors = await _fetch_gecko_fallback(client)
@@ -426,6 +437,7 @@ async def _fetch_candidates() -> tuple[list[dict], dict]:
         "candidate_count": len(candidates),
         "note": (
             "Provider rate limits can temporarily reduce coverage. "
+            "CoinGecko raw pool count is reported separately from parsed token candidates. "
             "Candidates are deduplicated across sources; paper mode only."
         ),
         "last_error": source_errors[-1] if source_errors else None,
