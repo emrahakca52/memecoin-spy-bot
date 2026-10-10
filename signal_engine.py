@@ -19,13 +19,8 @@ DEX_PROFILES_URL = f"{DEX_BASE}/token-profiles/latest/v1"
 DEX_BOOSTS_URL = f"{DEX_BASE}/token-boosts/latest/v1"
 DEX_TOKENS_URL = f"{DEX_BASE}/tokens/v1/solana"
 
-COINGECKO_BASE = "https://api.coingecko.com/api/v3"
 COINGECKO_NEW_POOLS_URL = (
     "https://api.coingecko.com/api/v3/onchain/networks/solana/new_pools"
-)
-GECKOTERMINAL_BASE = "https://api.geckoterminal.com/api/v2"
-GECKOTERMINAL_TRENDING_URL = (
-    f"{GECKOTERMINAL_BASE}/networks/solana/trending_pools"
 )
 
 COINGECKO_DEMO_API_KEY = (
@@ -48,6 +43,9 @@ PREVIEW_LIMIT = int(os.getenv("SIGNAL_PREVIEW_LIMIT", "20"))
 # Per-source cooldowns reduce repeated requests when a provider rate-limits us.
 _provider_cooldowns: dict[str, float] = {}
 _provider_errors: dict[str, int] = {}
+_provider_last_status: dict[str, int | None] = {}
+_provider_last_error: dict[str, str | None] = {}
+_provider_requests: dict[str, int] = {}
 _lock = asyncio.Lock()
 _cache: dict[str, Any] = {
     "timestamp": 0.0,
@@ -60,8 +58,9 @@ def _as_float(value: Any, default: float = 0.0) -> float:
     try:
         if value is None or value == "":
             return default
-        return float(value)
-    except (TypeError, ValueError):
+        result = float(value)
+        return result if result == result and abs(result) != float("inf") else default
+    except (TypeError, ValueError, OverflowError):
         return default
 
 
@@ -87,12 +86,16 @@ async def _get_json(
 ) -> Any:
     remaining = _cooldown_remaining(provider)
     if remaining > 0:
-        raise RuntimeError(
-            f"{provider} cooldown active ({int(remaining)}s remaining)"
-        )
+        message = f"{provider} cooldown active ({int(remaining)}s remaining)"
+        _provider_last_error[provider] = message
+        raise RuntimeError(message)
 
+    _provider_requests[provider] = _provider_requests.get(provider, 0) + 1
+    _provider_last_status[provider] = None
+    _provider_last_error[provider] = None
     try:
         response = await client.get(url, params=params, headers=headers)
+        _provider_last_status[provider] = response.status_code
         if response.status_code == 429:
             _provider_errors[provider] = _provider_errors.get(provider, 0) + 1
             exponent = min(_provider_errors[provider] - 1, 5)
@@ -108,7 +111,9 @@ async def _get_json(
                     pass
             delay += random.uniform(0, min(10.0, delay * 0.1))
             _provider_cooldowns[provider] = time.monotonic() + delay
-            raise RuntimeError(f"{provider} returned HTTP 429; cooldown {int(delay)}s")
+            message = f"{provider} returned HTTP 429; cooldown {int(delay)}s"
+            _provider_last_error[provider] = message
+            raise RuntimeError(message)
 
         response.raise_for_status()
         _provider_errors[provider] = 0
@@ -116,6 +121,8 @@ async def _get_json(
         return response.json()
     except httpx.HTTPStatusError as exc:
         status = exc.response.status_code
+        _provider_last_status[provider] = status
+        _provider_last_error[provider] = f"{provider} HTTP {status}"
         if status in (403, 408, 425, 500, 502, 503, 504):
             _provider_errors[provider] = _provider_errors.get(provider, 0) + 1
             exponent = min(_provider_errors[provider] - 1, 4)
@@ -124,6 +131,9 @@ async def _get_json(
                 ERROR_COOLDOWN_SECONDS * (2 ** exponent),
             )
             _provider_cooldowns[provider] = time.monotonic() + delay
+        raise
+    except httpx.HTTPError as exc:
+        _provider_last_error[provider] = f"{provider} network error: {type(exc).__name__}"
         raise
 
 
@@ -157,13 +167,11 @@ async def _discover_dex_pairs(client: httpx.AsyncClient) -> tuple[list[dict], li
                         addresses.append(address)
         except Exception as exc:
             errors.append(f"{label}: {type(exc).__name__}: {str(exc)[:160]}")
-            # A shared provider cooldown means another DEX request will fail too.
             if _cooldown_remaining("dexscreener") > 0:
                 break
 
     addresses = addresses[:MAX_DISCOVERED_ADDRESSES]
     pairs: list[dict] = []
-    # Dexscreener token endpoint accepts up to 30 token addresses per request.
     for start in range(0, len(addresses), 30):
         batch = addresses[start : start + 30]
         try:
@@ -255,10 +263,7 @@ async def _fetch_coingecko(client: httpx.AsyncClient) -> tuple[list[dict], list[
                 base_rel = (rels.get("base_token") or {}).get("data") or {}
                 base_obj = included_by_id.get(base_rel.get("id"), {})
                 base_attrs = base_obj.get("attributes") or {}
-                address = base_attrs.get("address")
-                if not address:
-                    # Geckoterminal-style pool IDs can include "solana_".
-                    address = attrs.get("base_token_address")
+                address = base_attrs.get("address") or attrs.get("base_token_address")
                 if not address:
                     continue
 
@@ -295,84 +300,16 @@ async def _fetch_coingecko(client: httpx.AsyncClient) -> tuple[list[dict], list[
                 })
         except Exception as exc:
             errors.append(f"coingecko_page_{page}: {type(exc).__name__}: {str(exc)[:160]}")
-            # Stop paging when this provider is in cooldown; preserve prior pages.
             if _cooldown_remaining("coingecko") > 0:
                 break
         if page != 3:
             await asyncio.sleep(0.35)
 
-    # Keep diagnostics separate from errors: a successful HTTP response can still
-    # contain no usable token records if the provider omits included base-token data.
     _fetch_coingecko.last_raw_pool_count = raw_pool_count
     return pools, errors
 
 
 _fetch_coingecko.last_raw_pool_count = 0
-
-
-async def _fetch_gecko_fallback(client: httpx.AsyncClient) -> tuple[list[dict], list[str]]:
-    pools: list[dict] = []
-    errors: list[str] = []
-    try:
-        payload = await _get_json(
-            client,
-            GECKOTERMINAL_TRENDING_URL,
-            provider="geckoterminal",
-            headers={"accept": "application/json;version=20230302"},
-        )
-        data = payload.get("data", []) if isinstance(payload, dict) else []
-        included = payload.get("included", []) if isinstance(payload, dict) else []
-        included_by_id = {
-            obj.get("id"): obj
-            for obj in included
-            if isinstance(obj, dict) and obj.get("id")
-        }
-
-        for pool in data:
-            if not isinstance(pool, dict):
-                continue
-            attrs = pool.get("attributes") or {}
-            rels = pool.get("relationships") or {}
-            base_rel = (rels.get("base_token") or {}).get("data") or {}
-            base_obj = included_by_id.get(base_rel.get("id"), {})
-            base_attrs = base_obj.get("attributes") or {}
-            address = base_attrs.get("address")
-            if not address:
-                continue
-
-            volume = attrs.get("volume_usd") or {}
-            txns = attrs.get("transactions") or {}
-            h24 = txns.get("h24") or {}
-            buys = _as_float(h24.get("buys"))
-            sells = _as_float(h24.get("sells"))
-            ratio = buys / max(sells, 1.0)
-            pool_id = pool.get("id", "")
-            pool_address = attrs.get("address") or (
-                pool_id.split("_", 1)[1] if "_" in pool_id else pool_id
-            )
-
-            pools.append({
-                "token_address": str(address),
-                "symbol": str(base_attrs.get("symbol") or "UNKNOWN"),
-                "token_symbol": str(base_attrs.get("symbol") or "UNKNOWN"),
-                "name": str(base_attrs.get("name") or ""),
-                "price_usd": _as_float(attrs.get("base_token_price_usd")),
-                "liquidity_usd": _as_float(attrs.get("reserve_in_usd")),
-                "volume_24h_usd": _as_float(volume.get("h24")),
-                "buys_24h": int(buys),
-                "sells_24h": int(sells),
-                "buy_sell_ratio": ratio,
-                "buys_to_sells_ratio": ratio,
-                "pool_address": pool_address,
-                "pair_address": pool_address,
-                "provider": "GeckoTerminal",
-                "url": None,
-                "created_at": attrs.get("pool_created_at"),
-            })
-    except Exception as exc:
-        errors.append(f"geckoterminal: {type(exc).__name__}: {str(exc)[:160]}")
-
-    return pools, errors
 
 
 async def _fetch_candidates() -> tuple[list[dict], dict]:
@@ -400,12 +337,8 @@ async def _fetch_candidates() -> tuple[list[dict], dict]:
         )
         all_candidates.extend(cg_pools)
 
-        gt_pools, gt_errors = await _fetch_gecko_fallback(client)
-        source_errors.extend(gt_errors)
-        source_counts["GeckoTerminal"] = len(gt_pools)
-        all_candidates.extend(gt_pools)
-
-    # Deduplicate by token address. Prefer the row with more useful market data.
+    # GeckoTerminal removed from discovery because its endpoint was returning 429.
+    # DexScreener and CoinGecko continue independently as discovery sources.
     by_address: dict[str, dict] = {}
     for candidate in all_candidates:
         address = candidate.get("token_address")
@@ -436,8 +369,8 @@ async def _fetch_candidates() -> tuple[list[dict], dict]:
         "source_errors": source_errors[-20:],
         "candidate_count": len(candidates),
         "note": (
-            "Provider rate limits can temporarily reduce coverage. "
-            "CoinGecko raw pool count is reported separately from parsed token candidates. "
+            "Discovery uses DexScreener and CoinGecko only. "
+            "GeckoTerminal discovery is disabled due to repeated HTTP 429 responses. "
             "Candidates are deduplicated across sources; paper mode only."
         ),
         "last_error": source_errors[-1] if source_errors else None,
@@ -451,7 +384,6 @@ def _score(candidate: dict) -> float:
     ratio = _as_float(
         _first(candidate, "buy_sell_ratio", "buys_to_sells_ratio", default=0)
     )
-    # A transparent ranking aid only; not a prediction or profitability claim.
     return round(
         min(liquidity / 10000.0, 5.0)
         + min(volume / 20000.0, 5.0)
@@ -466,7 +398,6 @@ async def get_signal_candidates(
     min_buys_sells_ratio: float | None = None,
     limit: int = 20,
 ) -> dict:
-    """Return filtered Solana token candidates and source diagnostics."""
     min_liquidity = (
         MIN_LIQUIDITY_USD if min_liquidity_usd is None else float(min_liquidity_usd)
     )
@@ -512,7 +443,6 @@ async def get_signal_candidates(
             or price <= 0
         ):
             continue
-
         item = dict(candidate)
         item["score"] = _score(item)
         filtered.append(item)
@@ -559,6 +489,7 @@ async def get_signal_candidates(
 
 def get_signal_engine_status() -> dict:
     now = time.monotonic()
+    providers = set(_provider_requests) | set(_provider_errors) | set(_provider_last_status)
     return {
         "mode": TRADING_MODE,
         "real_trading_enabled": REAL_TRADING_ENABLED,
@@ -574,4 +505,12 @@ def get_signal_engine_status() -> dict:
             if expiry > now
         },
         "provider_error_counts": dict(_provider_errors),
+        "provider_diagnostics": {
+            provider: {
+                "requests": _provider_requests.get(provider, 0),
+                "last_http_status": _provider_last_status.get(provider),
+                "last_error": _provider_last_error.get(provider),
+            }
+            for provider in sorted(providers)
+        },
     }
