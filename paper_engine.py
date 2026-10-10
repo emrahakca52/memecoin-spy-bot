@@ -1,9 +1,14 @@
 import asyncio
+import json
+import logging
 import os
 import time
 from datetime import datetime, timezone
 
 import httpx
+import psycopg
+
+logger = logging.getLogger("memecoin_spy.paper_engine")
 
 BIRDEYE_PRICE_URL = "https://public-api.birdeye.so/defi/price"
 
@@ -17,7 +22,6 @@ MAX_ACCEPTED_PRICE_JUMP_PCT = max(
 BIRDEYE_MIN_REQUEST_INTERVAL_SECONDS = max(
     1.1, float(os.getenv("BIRDEYE_MIN_REQUEST_INTERVAL_SECONDS", "3.0"))
 )
-# A cached quote older than this is not used as the reference for jump detection.
 PRICE_JUMP_REFERENCE_MAX_AGE_SECONDS = max(
     PRICE_CACHE_SECONDS,
     int(os.getenv("PRICE_JUMP_REFERENCE_MAX_AGE_SECONDS", "180")),
@@ -32,6 +36,7 @@ _paper_trades = []
 _realized_pnl_usd = 0.0
 _price_lock = asyncio.Lock()
 _birdeye_last_request_at = 0.0
+_database_status = {"configured": bool(os.getenv("DATABASE_URL", "").strip()), "connected": False, "last_error": None, "last_saved_utc": None, "last_loaded_utc": None}
 
 _price_diagnostics = {
     "birdeye": {
@@ -48,6 +53,107 @@ _price_diagnostics = {
 
 def _utc_now():
     return datetime.now(timezone.utc).isoformat()
+
+
+def _database_url():
+    url = os.getenv("DATABASE_URL", "").strip()
+    if url.startswith("postgres://"):
+        url = "postgresql://" + url[len("postgres://"):]
+    return url
+
+
+def get_persistence_status():
+    """Safe database diagnostics; never returns the connection string."""
+    return dict(_database_status)
+
+
+def _connect_database():
+    url = _database_url()
+    if not url:
+        _database_status.update(configured=False, connected=False, last_error="DATABASE_URL is not configured")
+        return None
+    return psycopg.connect(url, connect_timeout=8, autocommit=True)
+
+
+def _ensure_state_table(conn):
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS memecoin_paper_state (
+            id SMALLINT PRIMARY KEY CHECK (id = 1),
+            state JSONB NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )"""
+    )
+
+
+def _state_snapshot():
+    return {
+        "open_positions": _open_positions,
+        "paper_trades": _paper_trades,
+        "realized_pnl_usd": _realized_pnl_usd,
+        "saved_at_utc": _utc_now(),
+        "mode": "paper",
+    }
+
+
+def _save_paper_state():
+    """Persist the complete paper portfolio. Never exposes DATABASE_URL."""
+    if not _database_url():
+        _database_status.update(configured=False, connected=False, last_error="DATABASE_URL is not configured")
+        return False
+    try:
+        snapshot = json.dumps(_state_snapshot(), default=str, allow_nan=False)
+        with _connect_database() as conn:
+            _ensure_state_table(conn)
+            conn.execute(
+                """INSERT INTO memecoin_paper_state (id, state, updated_at)
+                   VALUES (1, %s::jsonb, NOW())
+                   ON CONFLICT (id) DO UPDATE
+                   SET state = EXCLUDED.state, updated_at = NOW()""",
+                (snapshot,),
+            )
+        _database_status.update(connected=True, last_error=None, last_saved_utc=_utc_now())
+        return True
+    except Exception as exc:
+        _database_status.update(connected=False, last_error=f"{type(exc).__name__}: {str(exc)[:240]}")
+        logger.exception("Could not save paper state to database.")
+        return False
+
+
+def load_paper_state():
+    """Load saved paper positions/trades. An empty database leaves current state unchanged."""
+    global _open_positions, _paper_trades, _realized_pnl_usd
+    if not _database_url():
+        _database_status.update(configured=False, connected=False, last_error="DATABASE_URL is not configured")
+        logger.warning("DATABASE_URL is not configured; paper state remains memory-only.")
+        return {"ok": False, "loaded": False, "reason": "database_url_missing"}
+    try:
+        with _connect_database() as conn:
+            _ensure_state_table(conn)
+            row = conn.execute(
+                "SELECT state FROM memecoin_paper_state WHERE id = 1"
+            ).fetchone()
+        _database_status.update(connected=True, last_error=None, last_loaded_utc=_utc_now())
+        if not row:
+            logger.info("No saved paper state found; starting with an empty paper portfolio.")
+            return {"ok": True, "loaded": False, "reason": "no_saved_state"}
+        state = row[0]
+        if isinstance(state, str):
+            state = json.loads(state)
+        if not isinstance(state, dict):
+            raise ValueError("Saved paper state has an invalid format")
+        positions = state.get("open_positions", {})
+        trades = state.get("paper_trades", [])
+        if not isinstance(positions, dict) or not isinstance(trades, list):
+            raise ValueError("Saved positions or trades have an invalid format")
+        _open_positions = positions
+        _paper_trades = trades
+        _realized_pnl_usd = _num(state.get("realized_pnl_usd"))
+        logger.info("Loaded paper state: %s open positions, %s trades.", len(_open_positions), len(_paper_trades))
+        return {"ok": True, "loaded": True, "open_positions": len(_open_positions), "trade_count": len(_paper_trades)}
+    except Exception as exc:
+        _database_status.update(connected=False, last_error=f"{type(exc).__name__}: {str(exc)[:240]}")
+        logger.exception("Could not load paper state from database.")
+        raise
 
 
 def _record_provider(provider, **updates):
@@ -92,7 +198,6 @@ def _set_provider_cooldown(provider, seconds, reason):
 
 
 async def _respect_birdeye_rate_limit():
-    """Serialize request timing to respect the configured minimum interval."""
     global _birdeye_last_request_at
     now = time.monotonic()
     wait = BIRDEYE_MIN_REQUEST_INTERVAL_SECONDS - (now - _birdeye_last_request_at)
@@ -106,72 +211,45 @@ async def _fetch_birdeye_price(client, address):
     if not api_key:
         _record_provider("birdeye", last_error="BIRDEYE_API_KEY is not configured")
         return None
-
     if _provider_is_cooling("birdeye"):
-        remaining = max(
-            1, int(_provider_cooldown_until.get("birdeye", 0.0) - time.monotonic())
-        )
+        remaining = max(1, int(_provider_cooldown_until.get("birdeye", 0.0) - time.monotonic()))
         _record_provider("birdeye", last_error=f"provider cooldown ({remaining}s)")
         return None
-
     await _respect_birdeye_rate_limit()
     _record_provider(
         "birdeye",
         requests=int(_price_diagnostics["birdeye"].get("requests", 0)) + 1,
-        last_attempt_utc=_utc_now(),
-        last_endpoint=BIRDEYE_PRICE_URL,
-        last_http_status=None,
-        last_error=None,
-        last_prices_found=0,
+        last_attempt_utc=_utc_now(), last_endpoint=BIRDEYE_PRICE_URL,
+        last_http_status=None, last_error=None, last_prices_found=0,
     )
-
     try:
         response = await client.get(
             BIRDEYE_PRICE_URL,
             params={"address": address},
-            headers={
-                "Accept": "application/json",
-                "X-API-KEY": api_key,
-                "x-chain": "solana",
-            },
+            headers={"Accept": "application/json", "X-API-KEY": api_key, "x-chain": "solana"},
         )
         _record_provider("birdeye", last_http_status=response.status_code)
-
         if response.status_code == 429:
             retry_after = response.headers.get("Retry-After", "")
             try:
                 cooldown = min(900, max(60, int(float(retry_after))))
             except (TypeError, ValueError, OverflowError):
                 cooldown = 300
-            _set_provider_cooldown(
-                "birdeye", cooldown, f"HTTP 429; cooldown {cooldown}s"
-            )
+            _set_provider_cooldown("birdeye", cooldown, f"HTTP 429; cooldown {cooldown}s")
             _record_provider("birdeye", last_error=f"HTTP 429; cooldown {cooldown}s")
             return None
-
         if response.status_code in (401, 403):
-            _record_provider(
-                "birdeye",
-                last_error=f"HTTP {response.status_code}; check API key and package access",
-            )
+            _record_provider("birdeye", last_error=f"HTTP {response.status_code}; check API key and package access")
             return None
-
         response.raise_for_status()
         payload = response.json()
         data = payload.get("data") if isinstance(payload, dict) else None
         price = _num(data.get("value")) if isinstance(data, dict) else 0.0
-
         if price <= 0:
-            _record_provider(
-                "birdeye",
-                last_error="HTTP 200 but no usable positive data.value price",
-                last_prices_found=0,
-            )
+            _record_provider("birdeye", last_error="HTTP 200 but no usable positive data.value price", last_prices_found=0)
             return None
-
         _record_provider("birdeye", last_prices_found=1, last_error=None)
         return price
-
     except httpx.HTTPStatusError as exc:
         status = exc.response.status_code
         _record_provider("birdeye", last_http_status=status, last_error=f"HTTP {status}")
@@ -188,7 +266,6 @@ async def _fetch_birdeye_price(client, address):
 
 
 async def _fetch_prices_batch(client, token_addresses):
-    """Fetch sequentially; stop after provider cooldown activates."""
     results = {}
     for address in token_addresses:
         results[address] = await _fetch_birdeye_price(client, address)
@@ -201,11 +278,9 @@ async def get_token_prices_usd(token_addresses):
     addresses = list(dict.fromkeys(str(a) for a in token_addresses if a))
     if not addresses:
         return {}
-
     now = time.monotonic()
     prices = {}
     missing = []
-
     for address in addresses:
         cached = _price_cache.get(address)
         if cached and now - cached["at"] < PRICE_CACHE_SECONDS:
@@ -213,10 +288,8 @@ async def get_token_prices_usd(token_addresses):
         else:
             prices[address] = None
             missing.append(address)
-
     if not missing:
         return prices
-
     async with _price_lock:
         now = time.monotonic()
         still_missing = []
@@ -228,59 +301,31 @@ async def get_token_prices_usd(token_addresses):
             last_request = _price_last_request.get(address, 0.0)
             if now - last_request >= PRICE_COOLDOWN_SECONDS:
                 still_missing.append(address)
-
         if not still_missing:
             return prices
-
         try:
-            async with httpx.AsyncClient(
-                timeout=PRICE_TIMEOUT_SECONDS,
-                headers={
-                    "Accept": "application/json",
-                    "User-Agent": "MemecoinSpyBot/2.1",
-                },
-            ) as client:
+            async with httpx.AsyncClient(timeout=PRICE_TIMEOUT_SECONDS, headers={"Accept": "application/json", "User-Agent": "MemecoinSpyBot/2.1"}) as client:
                 fetched = await _fetch_prices_batch(client, still_missing)
         except (httpx.HTTPError, ValueError, RuntimeError):
             fetched = {}
-
-        # Mark each address attempted at the time of the attempt, not before
-        # waiting for network calls. Addresses not reached after a 429 remain retryable.
         for address in still_missing:
             if address in fetched:
                 _price_last_request[address] = time.monotonic()
-
         for address in still_missing:
             price = _num(fetched.get(address))
             if price <= 0:
                 continue
-
             previous = _price_cache.get(address)
             if previous:
                 old_price = _num(previous.get("price"))
                 previous_age = time.monotonic() - _num(previous.get("at"))
-
-                # Only compare with a recent quote. An old cached quote should
-                # not reject every future price update indefinitely.
-                if (
-                    old_price > 0
-                    and previous_age <= PRICE_JUMP_REFERENCE_MAX_AGE_SECONDS
-                ):
+                if old_price > 0 and previous_age <= PRICE_JUMP_REFERENCE_MAX_AGE_SECONDS:
                     jump = abs(price / old_price - 1) * 100
                     if jump > MAX_ACCEPTED_PRICE_JUMP_PCT:
-                        _record_provider(
-                            "birdeye",
-                            last_error=(
-                                f"price jump rejected ({jump:.2f}% > "
-                                f"{MAX_ACCEPTED_PRICE_JUMP_PCT:.1f}%; "
-                                f"reference age {previous_age:.1f}s)"
-                            ),
-                        )
+                        _record_provider("birdeye", last_error=(f"price jump rejected ({jump:.2f}% > {MAX_ACCEPTED_PRICE_JUMP_PCT:.1f}%; reference age {previous_age:.1f}s)"))
                         continue
-
             _price_cache[address] = {"at": time.monotonic(), "price": price}
             prices[address] = price
-
     return prices
 
 
@@ -291,26 +336,15 @@ async def get_token_price_usd(token_address):
     return prices.get(token_address)
 
 
-def record_paper_trade(
-    token_address,
-    side,
-    amount_usd,
-    price_usd,
-    token_symbol="",
-    source="manual",
-    reason=None,
-):
+def record_paper_trade(token_address, side, amount_usd, price_usd, token_symbol="", source="manual", reason=None):
     global _realized_pnl_usd
-
     side = str(side).upper()
     amount_usd = _num(amount_usd)
     price_usd = _num(price_usd)
-
     if side not in ("BUY", "SELL"):
         raise ValueError("side must be BUY or SELL")
     if not token_address or amount_usd <= 0 or price_usd <= 0:
         raise ValueError("token_address, amount_usd and price_usd must be valid")
-
     trade = {
         "token_address": token_address,
         "token_symbol": token_symbol or token_address[:8],
@@ -323,7 +357,6 @@ def record_paper_trade(
         "mode": "paper",
     }
     _paper_trades.append(trade)
-
     if side == "BUY":
         quantity = amount_usd / price_usd
         position = _open_positions.get(token_address)
@@ -342,10 +375,7 @@ def record_paper_trade(
             old_qty = _num(position.get("quantity"))
             total_qty = old_qty + quantity
             if total_qty > 0:
-                position["entry_price_usd"] = (
-                    _num(position.get("entry_price_usd")) * old_qty
-                    + price_usd * quantity
-                ) / total_qty
+                position["entry_price_usd"] = (_num(position.get("entry_price_usd")) * old_qty + price_usd * quantity) / total_qty
             position["quantity"] = total_qty
             position["invested_usd"] = _num(position.get("invested_usd")) + amount_usd
             position["current_price_usd"] = price_usd
@@ -365,22 +395,12 @@ def record_paper_trade(
                 _open_positions.pop(token_address, None)
             else:
                 position["quantity"] = remaining_qty
-                position["invested_usd"] = max(
-                    0.0, _num(position.get("invested_usd")) - cost
-                )
-
+                position["invested_usd"] = max(0.0, _num(position.get("invested_usd")) - cost)
+    _save_paper_state()
     return {"ok": True, "mode": "paper", "trade": trade}
 
 
-def open_paper_position(
-    token_address,
-    token_symbol="",
-    amount_usd=10.0,
-    price_usd=None,
-    source="auto",
-    max_open_positions=None,
-    metadata=None,
-):
+def open_paper_position(token_address, token_symbol="", amount_usd=10.0, price_usd=None, source="auto", max_open_positions=None, metadata=None):
     if not token_address:
         raise ValueError("token_address is required")
     if price_usd is None or _num(price_usd) <= 0:
@@ -388,28 +408,19 @@ def open_paper_position(
     if _num(amount_usd) <= 0:
         raise ValueError("amount_usd must be positive")
     if token_address in _open_positions:
-        return {
-            "ok": True, "mode": "paper", "skipped": True,
-            "reason": "position_already_open",
-        }
+        return {"ok": True, "mode": "paper", "skipped": True, "reason": "position_already_open"}
     if max_open_positions is not None and len(_open_positions) >= int(max_open_positions):
-        return {
-            "ok": True, "mode": "paper", "skipped": True,
-            "reason": "max_open_positions_reached",
-        }
-
-    result = record_paper_trade(
-        token_address, "BUY", amount_usd, price_usd, token_symbol, source
-    )
+        return {"ok": True, "mode": "paper", "skipped": True, "reason": "max_open_positions_reached"}
+    result = record_paper_trade(token_address, "BUY", amount_usd, price_usd, token_symbol, source)
     position = _open_positions.get(token_address)
     if position is not None and metadata:
         position["metadata"] = dict(metadata)
+        _save_paper_state()
     return result
 
 
 def _close_position(address, position, price, reason):
     global _realized_pnl_usd
-
     quantity = _num(position.get("quantity"))
     invested = _num(position.get("invested_usd"))
     value = quantity * price
@@ -432,17 +443,14 @@ def _close_position(address, position, price, reason):
     _paper_trades.append(trade)
     _realized_pnl_usd += pnl
     _open_positions.pop(address, None)
+    _save_paper_state()
 
 
 async def update_paper_prices():
     updated = closed = errors = 0
     addresses = list(_open_positions)
     if not addresses:
-        return {
-            "updated": 0, "closed": 0, "price_errors": 0,
-            "note": "No open positions",
-        }
-
+        return {"updated": 0, "closed": 0, "price_errors": 0, "note": "No open positions"}
     prices = await get_token_prices_usd(addresses)
     for address in addresses:
         position = _open_positions.get(address)
@@ -452,19 +460,16 @@ async def update_paper_prices():
         if price is None or price <= 0:
             errors += 1
             continue
-
         position["current_price_usd"] = price
         quantity = _num(position.get("quantity"))
         invested = _num(position.get("invested_usd"))
         value = quantity * price
         position["unrealized_pnl_usd"] = round(value - invested, 8)
         updated += 1
-
         entry = _num(position.get("entry_price_usd"))
         opened_at = _num(position.get("opened_at"))
         if entry <= 0 or (opened_at and time.time() - opened_at < MIN_HOLD_SECONDS):
             continue
-
         change_pct = (price / entry - 1) * 100
         if change_pct >= 10:
             _close_position(address, position, price, "take_profit_10pct")
@@ -472,7 +477,7 @@ async def update_paper_prices():
         elif change_pct <= -5:
             _close_position(address, position, price, "stop_loss_5pct")
             closed += 1
-
+    _save_paper_state()
     if not _open_positions:
         note = "No open positions"
     elif updated:
@@ -481,22 +486,13 @@ async def update_paper_prices():
         note = "Birdeye rate-limited; waiting before retry"
     else:
         note = "Birdeye price unavailable or cooling down"
-
-    return {
-        "updated": updated,
-        "closed": closed,
-        "price_errors": errors,
-        "note": note,
-    }
+    return {"updated": updated, "closed": closed, "price_errors": errors, "note": note}
 
 
 def get_paper_status():
     positions = list(_open_positions.values())
     invested = sum(_num(p.get("invested_usd")) for p in positions)
-    value = sum(
-        _num(p.get("quantity")) * _num(p.get("current_price_usd"))
-        for p in positions
-    )
+    value = sum(_num(p.get("quantity")) * _num(p.get("current_price_usd")) for p in positions)
     unrealized = sum(_num(p.get("unrealized_pnl_usd")) for p in positions)
     return {
         "mode": "paper",
@@ -511,25 +507,14 @@ def get_paper_status():
         "paper_unrealized_pnl_usd": round(unrealized, 8),
         "paper_realized_pnl_usd": round(_realized_pnl_usd, 8),
         "paper_total_pnl_usd": round(unrealized + _realized_pnl_usd, 8),
-        "note": (
-            "Paper simulation only; no wallet connected and no real orders. "
-            "Values can be stale if Birdeye prices fail."
-        ),
+        "persistence": get_persistence_status(),
+        "note": "Paper simulation only; no wallet connected and no real orders. Values can be stale if Birdeye prices fail.",
     }
 
 
 def portfolio_status():
     status = get_paper_status()
-    return {
-        key: status[key]
-        for key in (
-            "paper_invested_usd",
-            "paper_current_value_usd",
-            "paper_unrealized_pnl_usd",
-            "paper_realized_pnl_usd",
-            "paper_total_pnl_usd",
-        )
-    }
+    return {key: status[key] for key in ("paper_invested_usd", "paper_current_value_usd", "paper_unrealized_pnl_usd", "paper_realized_pnl_usd", "paper_total_pnl_usd")}
 
 
 def paper_status():
