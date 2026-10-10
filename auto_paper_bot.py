@@ -26,12 +26,14 @@ _last_skipped = []
 
 
 async def _loop(stop_event):
-    global _last_run, _last_error, _last_price_update, _last_scan, _last_skipped
+    global _last_run, _last_error, _last_price_update
+    global _last_scan, _last_skipped
 
     while not stop_event.is_set():
         try:
             _last_error = None
             _last_skipped = []
+
             _last_price_update = await update_paper_prices()
 
             data = await get_signal_candidates(
@@ -40,38 +42,53 @@ async def _loop(stop_event):
                 min_buys_sells_ratio=MIN_BUYS_SELLS_RATIO,
                 limit=20,
             )
+
             signals = data.get("signals", []) or []
+
             _last_scan = {
                 "provider": data.get("provider"),
                 "checked": data.get("checked", 0),
-                "candidate_count": data.get("candidate_count", len(signals)),
+                "candidate_count": data.get(
+                    "candidate_count", len(signals)
+                ),
                 "note": data.get("note"),
                 "last_error": data.get("last_error"),
             }
 
-            # Fetch entry quotes in one batch instead of one request per token.
+            # Adayların fiyatlarını tek seferde sorgula.
             valid_signals = []
+
             for token in signals:
                 address = token.get("token_address")
-                symbol = token.get("symbol") or token.get("token_symbol") or ""
+                symbol = (
+                    token.get("symbol")
+                    or token.get("token_symbol")
+                    or ""
+                )
                 signal_price = float(token.get("price_usd") or 0)
+
                 if not address or signal_price <= 0:
                     _last_skipped.append({
                         "symbol": symbol,
                         "reason": "invalid_signal_price",
                     })
                     continue
-                valid_signals.append((token, address, symbol, signal_price))
 
-            prices = await get_token_prices_usd(
-                [address for _, address, _, _ in valid_signals]
-            )
+                valid_signals.append(
+                    (token, address, symbol, signal_price)
+                )
+
+            prices = await get_token_prices_usd([
+                address
+                for _, address, _, _ in valid_signals
+            ])
 
             for token, address, symbol, signal_price in valid_signals:
                 if stop_event.is_set():
                     break
 
                 live_price = prices.get(address)
+
                 if live_price is None or live_price <= 0:
                     _last_skipped.append({
                         "symbol": symbol,
@@ -79,7 +96,10 @@ async def _loop(stop_event):
                     })
                     continue
 
-                deviation = abs(live_price / signal_price - 1) * 100
+                deviation = abs(
+                    live_price / signal_price - 1
+                ) * 100
+
                 if deviation > MAX_ENTRY_PRICE_DEVIATION_PCT:
                     _last_skipped.append({
                         "symbol": symbol,
@@ -95,17 +115,30 @@ async def _loop(stop_event):
                     price_usd=live_price,
                     max_open_positions=MAX_OPEN_POSITIONS,
                     metadata={
-                        "pair_address": token.get("pool_address") or token.get("pair_address"),
+                        "pair_address": (
+                            token.get("pool_address")
+                            or token.get("pair_address")
+                        ),
                         "liquidity_usd": token.get("liquidity_usd"),
-                        "volume_24h_usd": token.get("volume_24h_usd"),
-                        "buy_sell_ratio": token.get("buy_sell_ratio", token.get("buys_to_sells_ratio")),
-                        "strategy": "experimental_candidate_filter_not_validated",
+                        "volume_24h_usd": token.get(
+                            "volume_24h_usd"
+                        ),
+                        "buy_sell_ratio": token.get(
+                            "buy_sell_ratio",
+                            token.get("buys_to_sells_ratio"),
+                        ),
+                        "strategy": (
+                            "experimental_candidate_filter_not_validated"
+                        ),
                         "signal_price_usd": signal_price,
-                        "entry_price_deviation_pct": round(deviation, 4),
+                        "entry_price_deviation_pct": round(
+                            deviation, 4
+                        ),
                         "take_profit_pct": 10,
                         "stop_loss_pct": -5,
                     },
                 )
+
                 if result.get("skipped"):
                     _last_skipped.append({
                         "symbol": symbol,
@@ -115,40 +148,54 @@ async def _loop(stop_event):
             _last_run = datetime.now(timezone.utc).isoformat()
 
         except Exception as exc:
-            _last_error = f"{type(exc).__name__}: {str(exc)[:200]}"
+            _last_error = (
+                f"{type(exc).__name__}: {str(exc)[:200]}"
+            )
 
         try:
-            await asyncio.wait_for(stop_event.wait(), timeout=POLL_SECONDS)
+            await asyncio.wait_for(
+                stop_event.wait(),
+                timeout=POLL_SECONDS,
+            )
         except asyncio.TimeoutError:
             pass
 
 
 async def start_bot():
     global _task, _stop_event
+
     if _task is not None and not _task.done():
         return bot_status()
+
     _stop_event = asyncio.Event()
     _task = asyncio.create_task(_loop(_stop_event))
+
     return bot_status()
 
 
 async def stop_bot():
     global _task, _stop_event
+
     task = _task
     event = _stop_event
+
     if event is not None:
         event.set()
+
     if task is not None:
         try:
             await asyncio.wait_for(task, timeout=5)
         except asyncio.TimeoutError:
             task.cancel()
+
             try:
                 await task
             except asyncio.CancelledError:
                 pass
+
     _task = None
     _stop_event = None
+
     return bot_status()
 
 
@@ -160,7 +207,9 @@ def bot_status():
         "poll_interval_seconds": POLL_SECONDS,
         "paper_amount_per_position_usd": PAPER_BUY_USD,
         "max_open_positions": MAX_OPEN_POSITIONS,
-        "max_entry_price_deviation_pct": MAX_ENTRY_PRICE_DEVIATION_PCT,
+        "max_entry_price_deviation_pct": (
+            MAX_ENTRY_PRICE_DEVIATION_PCT
+        ),
         "filters": {
             "min_liquidity_usd": MIN_LIQUIDITY_USD,
             "min_volume_24h_usd": MIN_VOLUME_24H_USD,
@@ -173,7 +222,9 @@ def bot_status():
         "last_skipped": _last_skipped[-10:],
         "warning": (
             "Experimental paper simulation only. No real orders are sent. "
-            "Entry quotes are checked against a second provider call; large price jumps are rejected. "
-            "Take-profit +10% and stop-loss -5% are unvalidated simulation rules."
+            "Entry quotes are checked against a second provider call; "
+            "large price jumps are rejected. "
+            "Take-profit +10% and stop-loss -5% are unvalidated "
+            "simulation rules."
         ),
     }
