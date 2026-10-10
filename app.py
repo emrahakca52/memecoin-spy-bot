@@ -142,6 +142,77 @@ async def birdeye_price_test(
     }
 
 
+@app.get("/paper-bot/birdeye-listing-test")
+async def birdeye_listing_test():
+    """Diagnostic only: test Birdeye new-token discovery; never creates a trade."""
+    api_key = os.getenv("BIRDEYE_API_KEY", "").strip()
+    if not api_key:
+        raise HTTPException(status_code=503, detail="BIRDEYE_API_KEY is not configured.")
+
+    url = "https://public-api.birdeye.so/defi/v2/tokens/new_listing"
+    headers = {
+        "accept": "application/json",
+        "X-API-KEY": api_key,
+        "x-chain": "solana",
+    }
+    params = {"limit": 10, "meme_platform_enabled": "true"}
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=8.0)) as client:
+            response = await client.get(url, params=params, headers=headers)
+        status_code = response.status_code
+        if status_code != 200:
+            return {
+                "provider": "birdeye",
+                "result": "error",
+                "endpoint": url,
+                "http_status": status_code,
+                "response_preview": response.text[:500],
+                "mode": "paper",
+                "real_trading_enabled": False,
+                "message": "Discovery diagnostic only; no trade or position was created.",
+            }
+        payload = response.json()
+        data = payload.get("data", {}) if isinstance(payload, dict) else {}
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict):
+            items = next((data.get(k) for k in ("items", "tokens", "list", "result") if isinstance(data.get(k), list)), [])
+        else:
+            items = []
+        preview = []
+        for item in items[:5]:
+            if not isinstance(item, dict):
+                continue
+            preview.append({
+                key: item.get(key)
+                for key in (
+                    "address", "token_address", "symbol", "name", "decimals",
+                    "price", "priceUsd", "liquidity", "liquidity_usd",
+                    "volume24h", "volume_24h_usd", "market_cap", "marketCap",
+                    "listedAt", "listTime", "blockUnixTime",
+                )
+                if item.get(key) is not None
+            })
+        return {
+            "provider": "birdeye",
+            "result": "success" if payload.get("success", True) and items else ("empty" if payload.get("success", True) else "api_error"),
+            "endpoint": url,
+            "http_status": status_code,
+            "api_success": payload.get("success") if isinstance(payload, dict) else None,
+            "data_keys": list(data.keys())[:30] if isinstance(data, dict) else None,
+            "items_found": len(items),
+            "sample_tokens": preview,
+            "mode": "paper",
+            "real_trading_enabled": False,
+            "message": "Discovery diagnostic only; no trade or position was created.",
+        }
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Birdeye listing request failed: {type(exc).__name__}",
+        ) from exc
+
+
 @app.get("/paper-bot/birdeye-engine-test")
 async def birdeye_engine_test(
     token_address: str = Query(BIRDEYE_TEST_TOKEN, min_length=32, max_length=64)
