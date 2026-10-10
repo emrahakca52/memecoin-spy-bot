@@ -1,6 +1,7 @@
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import logging
+import os
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query
@@ -15,6 +16,9 @@ from paper_engine import (
 from auto_paper_bot import bot_status, start_bot, stop_bot
 
 logger = logging.getLogger("memecoin_spy")
+
+BIRDEYE_PRICE_URL = "https://public-api.birdeye.so/defi/price"
+BIRDEYE_TEST_TOKEN = "So11111111111111111111111111111111111111112"
 
 
 @asynccontextmanager
@@ -36,7 +40,7 @@ async def lifespan(app: FastAPI):
             logger.exception("Error while stopping paper bot.")
 
 
-app = FastAPI(title="Memecoin Spy Pro", version="1.3.0", lifespan=lifespan)
+app = FastAPI(title="Memecoin Spy Pro", version="1.3.1", lifespan=lifespan)
 
 
 @app.get("/")
@@ -57,6 +61,113 @@ def health():
         "mode": "paper",
         "real_trading_enabled": False,
         "bot": bot_status(),
+    }
+
+
+@app.get("/paper-bot/birdeye-test")
+async def birdeye_price_test(
+    token_address: str = Query(
+        BIRDEYE_TEST_TOKEN,
+        min_length=32,
+        max_length=64,
+        description="Solana token mint address. Defaults to wrapped SOL for a one-request test.",
+    )
+):
+    """
+    Make exactly one on-demand Birdeye price request.
+    The API key is read from BIRDEYE_API_KEY and is never returned.
+    This diagnostic does not change the bot's price provider or trade anything.
+    """
+    api_key = os.getenv("BIRDEYE_API_KEY", "").strip()
+    if not api_key:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "provider": "birdeye",
+                "result": "api_key_missing",
+                "message": "Set BIRDEYE_API_KEY in Render Environment, then redeploy.",
+            },
+        )
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=12.0,
+            headers={
+                "Accept": "application/json",
+                "X-API-KEY": api_key,
+                "x-chain": "solana",
+            },
+        ) as client:
+            response = await client.get(
+                BIRDEYE_PRICE_URL,
+                params={"address": token_address},
+            )
+    except httpx.TimeoutException:
+        return {
+            "provider": "birdeye",
+            "result": "timeout",
+            "token_address": token_address,
+            "message": "Birdeye did not respond within 12 seconds.",
+        }
+    except httpx.HTTPError as exc:
+        return {
+            "provider": "birdeye",
+            "result": "network_error",
+            "token_address": token_address,
+            "error_type": type(exc).__name__,
+        }
+
+    if response.status_code != 200:
+        messages = {
+            401: "API key missing or invalid.",
+            403: "Access denied; this endpoint may not be included in the current package.",
+            429: "Birdeye rate limit reached; wait before retrying.",
+        }
+        return {
+            "provider": "birdeye",
+            "result": "http_error",
+            "http_status": response.status_code,
+            "token_address": token_address,
+            "message": messages.get(
+                response.status_code,
+                "Birdeye returned a non-200 response.",
+            ),
+        }
+
+    try:
+        payload = response.json()
+    except ValueError:
+        return {
+            "provider": "birdeye",
+            "result": "invalid_json",
+            "http_status": response.status_code,
+            "token_address": token_address,
+        }
+
+    data = payload.get("data") if isinstance(payload, dict) else None
+    price = data.get("value") if isinstance(data, dict) else None
+    try:
+        price = float(price)
+    except (TypeError, ValueError, OverflowError):
+        price = None
+
+    if price is None or price <= 0:
+        return {
+            "provider": "birdeye",
+            "result": "no_usable_price",
+            "http_status": response.status_code,
+            "token_address": token_address,
+            "response_success": payload.get("success") if isinstance(payload, dict) else None,
+            "message": "HTTP 200 received, but no positive data.value price was found.",
+        }
+
+    return {
+        "provider": "birdeye",
+        "result": "success",
+        "http_status": response.status_code,
+        "token_address": token_address,
+        "price_usd": price,
+        "message": "Birdeye returned a usable price. Existing bot providers have not been changed.",
     }
 
 
