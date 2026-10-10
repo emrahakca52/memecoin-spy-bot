@@ -6,7 +6,7 @@ import os
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 
-from signal_engine import get_signal_candidates
+from signal_engine import get_signal_candidates, get_signal_engine_status
 from wallet_tracker import get_wallet_stats
 from paper_engine import (
     get_paper_status as paper_status,
@@ -242,6 +242,12 @@ async def birdeye_engine_test(
             "Called the paper engine price function; no trade or position was created."
         ),
     }
+
+
+@app.get("/paper-bot/signal-engine-status")
+def signal_engine_status():
+    """Safe discovery diagnostics; never places trades."""
+    return get_signal_engine_status()
 
 
 @app.get("/signals")
