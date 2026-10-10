@@ -1,25 +1,18 @@
 import asyncio
+import os
 import time
-from email.utils import parsedate_to_datetime
 from datetime import datetime, timezone
 
 import httpx
 
-GECKO_TOKEN_POOLS_URL = (
-    "https://api.geckoterminal.com/api/v2/networks/solana/tokens/"
-)
-GECKO_BATCH_PRICE_URL = (
-    "https://api.geckoterminal.com/api/v2/simple/networks/"
-    "solana/token_price/"
-)
-DEX_TOKEN_URL = "https://api.dexscreener.com/latest/dex/tokens/"
+BIRDEYE_PRICE_URL = "https://public-api.birdeye.so/defi/price"
 
 PRICE_TIMEOUT_SECONDS = 12
 PRICE_CACHE_SECONDS = 90
 PRICE_COOLDOWN_SECONDS = 60
-MAX_PROVIDER_COOLDOWN_SECONDS = 300
 MIN_HOLD_SECONDS = 30
 MAX_ACCEPTED_PRICE_JUMP_PCT = 35.0
+BIRDEYE_MIN_REQUEST_INTERVAL_SECONDS = 1.1
 
 _price_cache = {}
 _price_last_request = {}
@@ -29,16 +22,19 @@ _open_positions = {}
 _paper_trades = []
 _realized_pnl_usd = 0.0
 _price_lock = asyncio.Lock()
+_birdeye_last_request_at = 0.0
 
-# Provider-level diagnostics are exposed by /paper-bot/status so rate limits,
-# endpoint/schema issues, and empty price responses can be distinguished.
+# Birdeye is the sole price provider. Diagnostics never expose the API key.
 _price_diagnostics = {
-    "dex": {"requests": 0, "last_attempt_utc": None, "last_endpoint": None,
-            "last_http_status": None, "last_error": None, "last_prices_found": 0,
-            "cooldown_seconds_remaining": 0},
-    "gecko": {"requests": 0, "last_attempt_utc": None, "last_endpoint": None,
-              "last_http_status": None, "last_error": None, "last_prices_found": 0,
-              "cooldown_seconds_remaining": 0},
+    "birdeye": {
+        "requests": 0,
+        "last_attempt_utc": None,
+        "last_endpoint": None,
+        "last_http_status": None,
+        "last_error": None,
+        "last_prices_found": 0,
+        "cooldown_seconds_remaining": 0,
+    }
 }
 
 
@@ -75,205 +71,127 @@ def _num(value, default=0.0):
         return default
 
 
-def _provider_name(url):
-    if "dexscreener.com" in url:
-        return "dex"
-    return "gecko"
-
-
-def _provider_is_cooling(provider):
+def _provider_is_cooling(provider="birdeye"):
     return time.monotonic() < _provider_cooldown_until.get(provider, 0.0)
 
 
-def _set_provider_cooldown(provider, response):
-    wait_seconds = PRICE_COOLDOWN_SECONDS
-    retry_after = response.headers.get("Retry-After")
-
-    if retry_after:
-        try:
-            wait_seconds = max(1, int(float(retry_after)))
-        except (TypeError, ValueError):
-            try:
-                retry_date = parsedate_to_datetime(retry_after)
-                if retry_date.tzinfo is None:
-                    retry_date = retry_date.replace(tzinfo=timezone.utc)
-                wait_seconds = max(
-                    1,
-                    int((retry_date - datetime.now(timezone.utc)).total_seconds()),
-                )
-            except (TypeError, ValueError, OverflowError):
-                wait_seconds = PRICE_COOLDOWN_SECONDS
-
-    wait_seconds = min(wait_seconds, MAX_PROVIDER_COOLDOWN_SECONDS)
+def _set_provider_cooldown(provider, seconds, reason):
+    wait_seconds = max(1, int(seconds))
     _provider_cooldown_until[provider] = max(
         _provider_cooldown_until.get(provider, 0.0),
         time.monotonic() + wait_seconds,
     )
-    _provider_cooldown_reason[provider] = (
-        f"HTTP 429; bekleme sÃ¼resi {wait_seconds}s"
-    )
+    _provider_cooldown_reason[provider] = reason
 
 
-async def _get_json(client, url):
-    provider = _provider_name(url)
+async def _respect_birdeye_rate_limit():
+    """Stay within the configured one-request-per-second package limit."""
+    global _birdeye_last_request_at
+    now = time.monotonic()
+    wait = BIRDEYE_MIN_REQUEST_INTERVAL_SECONDS - (now - _birdeye_last_request_at)
+    if wait > 0:
+        await asyncio.sleep(wait)
+    _birdeye_last_request_at = time.monotonic()
 
-    if _provider_is_cooling(provider):
-        remaining = max(1, int(_provider_cooldown_until.get(provider, 0.0) - time.monotonic()))
-        _record_provider(provider, last_error=f"provider cooldown ({remaining}s)")
-        raise RuntimeError(f"{provider}_price_provider_cooldown")
 
+async def _fetch_birdeye_price(client, address):
+    api_key = os.getenv("BIRDEYE_API_KEY", "").strip()
+    if not api_key:
+        _record_provider("birdeye", last_error="BIRDEYE_API_KEY is not configured")
+        return None
+
+    if _provider_is_cooling("birdeye"):
+        remaining = max(
+            1, int(_provider_cooldown_until.get("birdeye", 0.0) - time.monotonic())
+        )
+        _record_provider("birdeye", last_error=f"provider cooldown ({remaining}s)")
+        return None
+
+    await _respect_birdeye_rate_limit()
     _record_provider(
-        provider,
-        requests=int(_price_diagnostics.get(provider, {}).get("requests", 0)) + 1,
+        "birdeye",
+        requests=int(_price_diagnostics["birdeye"].get("requests", 0)) + 1,
         last_attempt_utc=_utc_now(),
-        last_endpoint=url.split("?")[0],
+        last_endpoint=BIRDEYE_PRICE_URL,
         last_http_status=None,
         last_error=None,
         last_prices_found=0,
     )
+
     try:
-        response = await client.get(url)
-        _record_provider(provider, last_http_status=response.status_code)
-        if response.status_code == 429:
-            _set_provider_cooldown(provider, response)
-            _record_provider(provider, last_error="HTTP 429 rate limited")
-        response.raise_for_status()
-        try:
-            return response.json()
-        except ValueError as exc:
-            _record_provider(provider, last_error=f"invalid JSON: {type(exc).__name__}")
-            raise
-    except httpx.HTTPStatusError as exc:
-        _record_provider(
-            provider,
-            last_http_status=exc.response.status_code,
-            last_error=f"HTTP {exc.response.status_code}",
+        response = await client.get(
+            BIRDEYE_PRICE_URL,
+            params={"address": address},
+            headers={
+                "Accept": "application/json",
+                "X-API-KEY": api_key,
+                "x-chain": "solana",
+            },
         )
-        raise
+        _record_provider("birdeye", last_http_status=response.status_code)
+
+        if response.status_code == 429:
+            retry_after = response.headers.get("Retry-After", "")
+            try:
+                cooldown = min(300, max(60, int(float(retry_after))))
+            except (TypeError, ValueError, OverflowError):
+                cooldown = 60
+            _set_provider_cooldown(
+                "birdeye", cooldown, f"HTTP 429; cooldown {cooldown}s"
+            )
+            _record_provider("birdeye", last_error=f"HTTP 429; cooldown {cooldown}s")
+            return None
+
+        if response.status_code in (401, 403):
+            _record_provider(
+                "birdeye",
+                last_error=f"HTTP {response.status_code}; check API key and package access",
+            )
+            return None
+
+        response.raise_for_status()
+        payload = response.json()
+        data = payload.get("data") if isinstance(payload, dict) else None
+        price = _num(data.get("value")) if isinstance(data, dict) else 0.0
+
+        if price <= 0:
+            _record_provider(
+                "birdeye",
+                last_error="HTTP 200 but no usable positive data.value price",
+                last_prices_found=0,
+            )
+            return None
+
+        _record_provider("birdeye", last_prices_found=1, last_error=None)
+        return price
+
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code
+        _record_provider("birdeye", last_http_status=status, last_error=f"HTTP {status}")
+        return None
+    except httpx.TimeoutException:
+        _record_provider("birdeye", last_error="request timed out")
+        return None
     except httpx.HTTPError as exc:
-        _record_provider(provider, last_error=f"network error: {type(exc).__name__}")
-        raise
-
-
-def _extract_gecko_batch_prices(payload):
-    """Return normalized token-address -> USD-price values from GeckoTerminal."""
-    data = payload.get("data") or {}
-    attrs = data.get("attributes") or {}
-    raw = attrs.get("token_prices") or {}
-    if not isinstance(raw, dict):
-        return {}
-
-    normalized = {}
-    for address, value in raw.items():
-        price = _num(value)
-        if address and price > 0:
-            normalized[str(address).lower()] = price
-    return normalized
+        _record_provider(
+            "birdeye", last_error=f"network error: {type(exc).__name__}"
+        )
+        return None
+    except (ValueError, AttributeError, TypeError) as exc:
+        _record_provider(
+            "birdeye", last_error=f"invalid response: {type(exc).__name__}"
+        )
+        return None
 
 
 async def _fetch_prices_batch(client, token_addresses):
-    addresses = list(dict.fromkeys(str(a) for a in token_addresses if a))
-    if not addresses:
-        return {}
-
+    """Fetch prices only from Birdeye, sequentially respecting the 1 RPS limit."""
     results = {}
-
-    # 1) DexScreener: one request per chunk, up to 30 token addresses.
-    for offset in range(0, len(addresses), 30):
-        chunk = addresses[offset:offset + 30]
-        if _provider_is_cooling("dex"):
+    for address in token_addresses:
+        results[address] = await _fetch_birdeye_price(client, address)
+        if _provider_is_cooling("birdeye"):
             break
-
-        try:
-            payload = await _get_json(
-                client, DEX_TOKEN_URL + ",".join(chunk)
-            )
-            found_before = len(results)
-            for pair in payload.get("pairs") or []:
-                if not isinstance(pair, dict):
-                    continue
-                if str(pair.get("chainId", "")).lower() != "solana":
-                    continue
-
-                base = (pair.get("baseToken") or {}).get("address")
-                price = _num(pair.get("priceUsd"))
-                if not base or base.lower() not in {a.lower() for a in chunk} or price <= 0:
-                    continue
-
-                liquidity = _num((pair.get("liquidity") or {}).get("usd"))
-                key = next((a for a in chunk if a.lower() == base.lower()), base)
-                previous = results.get(key)
-                if previous is None or liquidity > previous[0]:
-                    results[key] = (liquidity, price)
-            _record_provider("dex", last_prices_found=max(0, len(results) - found_before), last_error=None)
-
-        except httpx.HTTPStatusError as exc:
-            _record_provider("dex", last_error=f"HTTP {exc.response.status_code}")
-            if exc.response.status_code == 429:
-                _set_provider_cooldown("dex", exc.response)
-                break
-        except (httpx.HTTPError, ValueError, RuntimeError) as exc:
-            _record_provider("dex", last_error=f"{type(exc).__name__}: {str(exc)[:140]}")
-
-    # 2) GeckoTerminal batch endpoint: request all still-missing tokens together.
-    missing = [a for a in addresses if not any(k.lower() == a.lower() for k in results)]
-    if missing and not _provider_is_cooling("gecko"):
-        try:
-            payload = await _get_json(
-                client, GECKO_BATCH_PRICE_URL + ",".join(missing)
-            )
-            batch_prices = _extract_gecko_batch_prices(payload)
-            found = 0
-            for address in missing:
-                price = batch_prices.get(address.lower())
-                if price and price > 0:
-                    results[address] = (0.0, price)
-                    found += 1
-            _record_provider("gecko", last_prices_found=found, last_error=None if found else "HTTP 200 but no usable prices parsed from batch response")
-        except httpx.HTTPStatusError as exc:
-            _record_provider("gecko", last_error=f"HTTP {exc.response.status_code}")
-            if exc.response.status_code == 429:
-                _set_provider_cooldown("gecko", exc.response)
-        except (httpx.HTTPError, ValueError, RuntimeError, AttributeError) as exc:
-            _record_provider("gecko", last_error=f"{type(exc).__name__}: {str(exc)[:140]}")
-
-    # 3) Fallback: individual token-pool requests only for unresolved addresses.
-    missing = [a for a in addresses if not any(k.lower() == a.lower() for k in results)]
-    for address in missing:
-        if _provider_is_cooling("gecko"):
-            break
-        try:
-            payload = await _get_json(
-                client, GECKO_TOKEN_POOLS_URL + address + "/pools"
-            )
-            candidates = []
-            for pool in payload.get("data") or []:
-                if not isinstance(pool, dict):
-                    continue
-                attrs = pool.get("attributes") or {}
-                price = _num(attrs.get("base_token_price_usd"))
-                liquidity = _num(attrs.get("reserve_in_usd"))
-                if price > 0:
-                    candidates.append((liquidity, price))
-            if candidates:
-                candidates.sort(reverse=True)
-                results[address] = candidates[0]
-                _record_provider("gecko", last_prices_found=1, last_error=None)
-            else:
-                _record_provider("gecko", last_prices_found=0, last_error="HTTP 200 but no usable pool prices found")
-        except httpx.HTTPStatusError as exc:
-            _record_provider("gecko", last_error=f"HTTP {exc.response.status_code}")
-            if exc.response.status_code == 429:
-                _set_provider_cooldown("gecko", exc.response)
-                break
-        except (httpx.HTTPError, ValueError, RuntimeError) as exc:
-            _record_provider("gecko", last_error=f"{type(exc).__name__}: {str(exc)[:140]}")
-
-    output = {}
-    for address in addresses:
-        match = next((v for k, v in results.items() if k.lower() == address.lower()), None)
-        output[address] = match[1] if match else None
-    return output
+    return results
 
 
 async def get_token_prices_usd(token_addresses):
@@ -321,7 +239,7 @@ async def get_token_prices_usd(token_addresses):
                 timeout=PRICE_TIMEOUT_SECONDS,
                 headers={
                     "Accept": "application/json",
-                    "User-Agent": "MemecoinSpyBot/2.0",
+                    "User-Agent": "MemecoinSpyBot/2.1",
                 },
             ) as client:
                 fetched = await _fetch_prices_batch(client, still_missing)
@@ -339,6 +257,13 @@ async def get_token_prices_usd(token_addresses):
                 if old_price > 0:
                     jump = abs(price / old_price - 1) * 100
                     if jump > MAX_ACCEPTED_PRICE_JUMP_PCT:
+                        _record_provider(
+                            "birdeye",
+                            last_error=(
+                                f"price jump rejected ({jump:.2f}% > "
+                                f"{MAX_ACCEPTED_PRICE_JUMP_PCT:.1f}%)"
+                            ),
+                        )
                         continue
 
             _price_cache[address] = {
@@ -543,10 +468,10 @@ async def update_paper_prices():
         note = "No open positions"
     elif updated:
         note = "Some prices updated; some unavailable" if errors else "Paper prices updated"
-    elif any(_provider_is_cooling(p) for p in ("dex", "gecko")):
-        note = "Price provider rate-limited; waiting before retry"
+    elif _provider_is_cooling("birdeye"):
+        note = "Birdeye rate-limited; waiting before retry"
     else:
-        note = "Price provider unavailable or cooling down"
+        note = "Birdeye price unavailable or cooling down"
 
     return {
         "updated": updated,
@@ -574,7 +499,7 @@ def get_paper_status():
         "paper_unrealized_pnl_usd": round(unrealized, 8),
         "paper_realized_pnl_usd": round(_realized_pnl_usd, 8),
         "paper_total_pnl_usd": round(unrealized + _realized_pnl_usd, 8),
-        "note": "Paper simulation only; no wallet connected and no real orders. Values can be stale if prices fail.",
+        "note": "Paper simulation only; no wallet connected and no real orders. Values can be stale if Birdeye prices fail.",
     }
 
 
