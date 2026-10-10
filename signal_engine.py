@@ -28,7 +28,11 @@ GECKOTERMINAL_TRENDING_URL = (
     f"{GECKOTERMINAL_BASE}/networks/solana/trending_pools"
 )
 
-COINGECKO_DEMO_API_KEY = os.getenv("COINGECKO_DEMO_API_KEY", "").strip()
+COINGECKO_DEMO_API_KEY = (
+    os.getenv("COINGECKO_DEMO_API_KEY")
+    or os.getenv("COINGECKO_API_KEY")
+    or ""
+).strip()
 
 MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "10000"))
 MIN_VOLUME_24H_USD = float(os.getenv("MIN_VOLUME_24H_USD", "20000"))
