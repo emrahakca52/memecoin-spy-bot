@@ -25,7 +25,7 @@ CACHE_SECONDS = max(60, min(150, int(os.getenv("SIGNAL_CACHE_SECONDS", "150"))))
 REQUEST_TIMEOUT_SECONDS = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "15"))
 LISTING_LIMIT = max(1, min(20, int(os.getenv("BIRDEYE_LISTING_LIMIT", "20"))))
 MAX_OVERVIEWS_PER_SCAN = max(
-    1, min(5, int(os.getenv("BIRDEYE_MAX_OVERVIEWS_PER_SCAN", "5")))
+    1, min(LISTING_LIMIT, int(os.getenv("BIRDEYE_MAX_OVERVIEWS_PER_SCAN", str(LISTING_LIMIT))))
 )
 REQUEST_INTERVAL_SECONDS = max(3.0, float(os.getenv("BIRDEYE_REQUEST_INTERVAL_SECONDS", "3.0")))
 COOLDOWN_DEFAULT_SECONDS = max(300, int(os.getenv("BIRDEYE_429_COOLDOWN_SECONDS", "300")))
@@ -198,10 +198,17 @@ async def _fetch_candidates() -> tuple[list[dict], dict]:
             listing_count = len(listings)
             _stats["listing_items"] = listing_count
             addressed = [item for item in listings if _first(item, "address", "token_address")]
-            addressed.sort(
-                key=lambda item: _num(_first(item, "liquidity", "liquidity_usd", default=0)),
-                reverse=True
-            )
+            # Preserve listing order so missing listing-side liquidity does not
+            # push the same incomplete tokens to the front of every scan.
+            # Overview metrics are the source of truth for the filters below.
+            seen_addresses: set[str] = set()
+            unique_addressed: list[dict] = []
+            for item in addressed:
+                address = str(_first(item, "address", "token_address", default="")).strip()
+                if address and address not in seen_addresses:
+                    seen_addresses.add(address)
+                    unique_addressed.append(item)
+            addressed = unique_addressed
             liquidity_eligible_count = sum(
                 1 for item in addressed
                 if _num(_first(item, "liquidity", "liquidity_usd", default=0)) >= MIN_LIQUIDITY_USD
@@ -240,6 +247,7 @@ async def _fetch_candidates() -> tuple[list[dict], dict]:
         },
         "source_errors": errors[-20:], "last_error": errors[-1] if errors else None,
         "overview_batch_size": len(eligible), "listing_rotation_next_index": _listing_cursor,
+        "overview_scan_strategy": "scan all unique addressed listings up to the configured listing limit",
         "overview_frames_requested": "24h", "request_interval_seconds": REQUEST_INTERVAL_SECONDS,
         "cooldown_default_seconds": COOLDOWN_DEFAULT_SECONDS,
         "note": "Discovery and market metrics use Birdeye only. Paper mode only.",
