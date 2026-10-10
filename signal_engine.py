@@ -182,16 +182,22 @@ async def _fetch_candidates() -> tuple[list[dict], dict]:
             listings = _listing_items(listing_payload)
             listing_count = len(listings)
             _stats["listing_items"] = listing_count
-            # Apply known listing liquidity first, to avoid spending credits on
-            # tokens that cannot meet the existing minimum liquidity filter.
-            eligible = []
-            for item in listings:
-                address = _first(item, "address", "token_address")
-                liquidity = _num(_first(item, "liquidity", "liquidity_usd", default=0))
-                if address and liquidity >= MIN_LIQUIDITY_USD:
-                    eligible.append(item)
-            eligible = eligible[:MAX_OVERVIEWS_PER_SCAN]
-            liquidity_eligible_count = len(eligible)
+            # Listing liquidity can be stale or incomplete. Rank listings by
+            # reported liquidity, then verify the top few with token_overview.
+            # Final eligibility is always decided from the overview metrics.
+            addressed = [
+                item for item in listings
+                if _first(item, "address", "token_address")
+            ]
+            addressed.sort(
+                key=lambda item: _num(_first(item, "liquidity", "liquidity_usd", default=0)),
+                reverse=True,
+            )
+            liquidity_eligible_count = sum(
+                1 for item in addressed
+                if _num(_first(item, "liquidity", "liquidity_usd", default=0)) >= MIN_LIQUIDITY_USD
+            )
+            eligible = addressed[:MAX_OVERVIEWS_PER_SCAN]
 
             for listing in eligible:
                 address = str(_first(listing, "address", "token_address", default=""))
@@ -257,12 +263,31 @@ async def get_signal_candidates(
             _cache.update({"timestamp": time.monotonic(), "candidates": candidates, "diagnostics": diagnostics})
 
     filtered = []
+    rejected = []
     for candidate in candidates:
         liquidity = _num(candidate.get("liquidity_usd"))
         volume = _num(candidate.get("volume_24h_usd"))
         ratio = _num(candidate.get("buy_sell_ratio"))
         price = _num(candidate.get("price_usd"))
-        if liquidity < min_liquidity or volume < min_volume or ratio < min_ratio or price <= 0:
+        reasons = []
+        if liquidity < min_liquidity:
+            reasons.append("liquidity_below_minimum")
+        if volume < min_volume:
+            reasons.append("volume_24h_below_minimum")
+        if ratio < min_ratio:
+            reasons.append("buy_sell_ratio_below_minimum")
+        if price <= 0:
+            reasons.append("missing_or_zero_price")
+        if reasons:
+            rejected.append({
+                "symbol": candidate.get("symbol"),
+                "token_address": candidate.get("token_address"),
+                "liquidity_usd": liquidity,
+                "volume_24h_usd": volume,
+                "buy_sell_ratio": round(ratio, 4),
+                "price_usd": price,
+                "rejection_reasons": reasons,
+            })
             continue
         item = dict(candidate)
         item["score"] = _score(item)
@@ -283,6 +308,12 @@ async def get_signal_candidates(
             "liquidity_usd": item.get("liquidity_usd"), "volume_24h_usd": item.get("volume_24h_usd"),
             "buy_sell_ratio": item.get("buy_sell_ratio"), "score": item.get("score"), "provider": item.get("provider"),
         } for item in signals[:20]],
+        "rejected_preview": rejected[:10],
+        "rejection_counts": {
+            reason: sum(1 for item in rejected if reason in item["rejection_reasons"])
+            for reason in ("liquidity_below_minimum", "volume_24h_below_minimum",
+                           "buy_sell_ratio_below_minimum", "missing_or_zero_price")
+        },
         "cached_for_seconds": CACHE_SECONDS,
         "mode": TRADING_MODE,
         "real_trading_enabled": REAL_TRADING_ENABLED,
