@@ -36,6 +36,8 @@ _last_request_at = 0.0
 _cooldown_until = 0.0
 _cooldown_reason: str | None = None
 _cache: dict[str, Any] = {"timestamp": 0.0, "candidates": [], "diagnostics": {}}
+_listing_cursor = 0  # Rotate through listing candidates between cached scans.
+
 _stats: dict[str, Any] = {
     "requests": 0,
     "last_http_status": None,
@@ -154,6 +156,7 @@ def _normalize_candidate(listing: dict, overview: dict) -> dict:
 
 
 async def _fetch_candidates() -> tuple[list[dict], dict]:
+    global _listing_cursor
     api_key = _api_key()
     if not api_key:
         message = "BIRDEYE_API_KEY is not configured"
@@ -197,12 +200,25 @@ async def _fetch_candidates() -> tuple[list[dict], dict]:
                 1 for item in addressed
                 if _num(_first(item, "liquidity", "liquidity_usd", default=0)) >= MIN_LIQUIDITY_USD
             )
-            eligible = addressed[:MAX_OVERVIEWS_PER_SCAN]
+
+            # Rotate the batch on each cache refresh so a fixed top-five group
+            # does not monopolize every scan. At 5 overviews per 15 minutes,
+            # all 20 listing entries can be checked over roughly one hour.
+            if addressed:
+                start = _listing_cursor % len(addressed)
+                rotated = addressed[start:] + addressed[:start]
+                eligible = rotated[:MAX_OVERVIEWS_PER_SCAN]
+                _listing_cursor = (start + len(eligible)) % len(addressed)
+            else:
+                eligible = []
 
             for listing in eligible:
                 address = str(_first(listing, "address", "token_address", default=""))
                 try:
-                    payload = await _get_json(client, BIRDEYE_OVERVIEW_URL, {"address": address})
+                    payload = await _get_json(
+                        client, BIRDEYE_OVERVIEW_URL,
+                        {"address": address, "frames": "24h"},
+                    )
                     data = payload.get("data", {})
                     if not isinstance(data, dict):
                         raise RuntimeError("token overview response has no data object")
@@ -228,6 +244,9 @@ async def _fetch_candidates() -> tuple[list[dict], dict]:
         },
         "source_errors": errors[-20:],
         "last_error": errors[-1] if errors else None,
+        "overview_batch_size": len(eligible) if "eligible" in locals() else 0,
+        "listing_rotation_next_index": _listing_cursor,
+        "overview_frames_requested": "24h",
         "note": "Discovery and market metrics use Birdeye only. No DexScreener, CoinGecko, or GeckoTerminal calls. Paper mode only.",
         "mode": TRADING_MODE,
         "real_trading_enabled": REAL_TRADING_ENABLED,
@@ -286,6 +305,12 @@ async def get_signal_candidates(
                 "volume_24h_usd": volume,
                 "buy_sell_ratio": round(ratio, 4),
                 "price_usd": price,
+                "metric_presence": {
+                    "liquidity": liquidity > 0,
+                    "volume_24h": volume > 0,
+                    "buy_sell_counts": _num(candidate.get("buys_24h")) > 0 or _num(candidate.get("sells_24h")) > 0,
+                    "price": price > 0,
+                },
                 "rejection_reasons": reasons,
             })
             continue
