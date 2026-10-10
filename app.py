@@ -14,6 +14,7 @@ from paper_engine import (
     record_paper_trade,
     get_price_diagnostics,
     get_token_price_usd,
+    load_paper_state,
 )
 from auto_paper_bot import bot_status, start_bot, stop_bot
 
@@ -25,19 +26,26 @@ BIRDEYE_TEST_TOKEN = "So11111111111111111111111111111111111111112"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    bot_started = False
     try:
+        # Load persisted positions and trade history before the bot can run.
+        load_paper_state()
+        logger.info("Paper state load completed before bot startup.")
         await start_bot()
+        bot_started = True
         logger.info("Paper bot startup requested; real trading disabled.")
     except Exception:
-        logger.exception("Paper bot failed to start during application startup.")
+        # Do not start a fresh paper session if the saved database state could not be read.
+        logger.exception("Paper state could not be loaded or paper bot failed to start.")
     try:
         yield
     finally:
-        try:
-            await stop_bot()
-            logger.info("Paper bot stopped during application shutdown.")
-        except Exception:
-            logger.exception("Error while stopping paper bot.")
+        if bot_started:
+            try:
+                await stop_bot()
+                logger.info("Paper bot stopped during application shutdown.")
+            except Exception:
+                logger.exception("Error while stopping paper bot.")
 
 
 app = FastAPI(title="Memecoin Spy Pro", version="1.3.2", lifespan=lifespan)
@@ -66,9 +74,7 @@ def health():
 
 @app.get("/paper-bot/birdeye-test")
 async def birdeye_price_test(
-    token_address: str = Query(
-        BIRDEYE_TEST_TOKEN, min_length=32, max_length=64
-    )
+    token_address: str = Query(BIRDEYE_TEST_TOKEN, min_length=32, max_length=64)
 ):
     """One on-demand diagnostic request; does not change bot settings or trade."""
     api_key = os.getenv("BIRDEYE_API_KEY", "").strip()
@@ -84,25 +90,13 @@ async def birdeye_price_test(
     try:
         async with httpx.AsyncClient(
             timeout=12.0,
-            headers={
-                "Accept": "application/json",
-                "X-API-KEY": api_key,
-                "x-chain": "solana",
-            },
+            headers={"Accept": "application/json", "X-API-KEY": api_key, "x-chain": "solana"},
         ) as client:
-            response = await client.get(
-                BIRDEYE_PRICE_URL, params={"address": token_address}
-            )
+            response = await client.get(BIRDEYE_PRICE_URL, params={"address": token_address})
     except httpx.TimeoutException:
-        return {
-            "provider": "birdeye", "result": "timeout",
-            "token_address": token_address,
-        }
+        return {"provider": "birdeye", "result": "timeout", "token_address": token_address}
     except httpx.HTTPError as exc:
-        return {
-            "provider": "birdeye", "result": "network_error",
-            "token_address": token_address, "error_type": type(exc).__name__,
-        }
+        return {"provider": "birdeye", "result": "network_error", "token_address": token_address, "error_type": type(exc).__name__}
 
     if response.status_code != 200:
         messages = {
@@ -118,10 +112,7 @@ async def birdeye_price_test(
     try:
         payload = response.json()
     except ValueError:
-        return {
-            "provider": "birdeye", "result": "invalid_json",
-            "http_status": response.status_code, "token_address": token_address,
-        }
+        return {"provider": "birdeye", "result": "invalid_json", "http_status": response.status_code, "token_address": token_address}
 
     data = payload.get("data") if isinstance(payload, dict) else None
     try:
@@ -135,9 +126,8 @@ async def birdeye_price_test(
             "response_success": payload.get("success") if isinstance(payload, dict) else None,
         }
     return {
-        "provider": "birdeye", "result": "success",
-        "http_status": response.status_code, "token_address": token_address,
-        "price_usd": price,
+        "provider": "birdeye", "result": "success", "http_status": response.status_code,
+        "token_address": token_address, "price_usd": price,
         "message": "Birdeye returned a usable price; this was a diagnostic request only.",
     }
 
@@ -150,11 +140,7 @@ async def birdeye_listing_test():
         raise HTTPException(status_code=503, detail="BIRDEYE_API_KEY is not configured.")
 
     url = "https://public-api.birdeye.so/defi/v2/tokens/new_listing"
-    headers = {
-        "accept": "application/json",
-        "X-API-KEY": api_key,
-        "x-chain": "solana",
-    }
+    headers = {"accept": "application/json", "X-API-KEY": api_key, "x-chain": "solana"}
     params = {"limit": 10, "meme_platform_enabled": "true"}
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=8.0)) as client:
@@ -162,13 +148,9 @@ async def birdeye_listing_test():
         status_code = response.status_code
         if status_code != 200:
             return {
-                "provider": "birdeye",
-                "result": "error",
-                "endpoint": url,
-                "http_status": status_code,
-                "response_preview": response.text[:500],
-                "mode": "paper",
-                "real_trading_enabled": False,
+                "provider": "birdeye", "result": "error", "endpoint": url,
+                "http_status": status_code, "response_preview": response.text[:500],
+                "mode": "paper", "real_trading_enabled": False,
                 "message": "Discovery diagnostic only; no trade or position was created.",
             }
         payload = response.json()
@@ -186,61 +168,38 @@ async def birdeye_listing_test():
             preview.append({
                 key: item.get(key)
                 for key in (
-                    "address", "token_address", "symbol", "name", "decimals",
-                    "price", "priceUsd", "liquidity", "liquidity_usd",
-                    "volume24h", "volume_24h_usd", "market_cap", "marketCap",
-                    "listedAt", "listTime", "blockUnixTime",
+                    "address", "token_address", "symbol", "name", "decimals", "price", "priceUsd",
+                    "liquidity", "liquidity_usd", "volume24h", "volume_24h_usd", "market_cap",
+                    "marketCap", "listedAt", "listTime", "blockUnixTime",
                 )
                 if item.get(key) is not None
             })
         return {
             "provider": "birdeye",
             "result": "success" if payload.get("success", True) and items else ("empty" if payload.get("success", True) else "api_error"),
-            "endpoint": url,
-            "http_status": status_code,
+            "endpoint": url, "http_status": status_code,
             "api_success": payload.get("success") if isinstance(payload, dict) else None,
             "data_keys": list(data.keys())[:30] if isinstance(data, dict) else None,
-            "items_found": len(items),
-            "sample_tokens": preview,
-            "mode": "paper",
-            "real_trading_enabled": False,
+            "items_found": len(items), "sample_tokens": preview,
+            "mode": "paper", "real_trading_enabled": False,
             "message": "Discovery diagnostic only; no trade or position was created.",
         }
     except httpx.HTTPError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Birdeye listing request failed: {type(exc).__name__}",
-        ) from exc
+        raise HTTPException(status_code=502, detail=f"Birdeye listing request failed: {type(exc).__name__}") from exc
 
 
 @app.get("/paper-bot/birdeye-engine-test")
-async def birdeye_engine_test(
-    token_address: str = Query(BIRDEYE_TEST_TOKEN, min_length=32, max_length=64)
-):
-    """
-    Calls the same get_token_price_usd function used by the paper engine.
-    This is one explicit diagnostic; it does not open a position or place an order.
-    """
+async def birdeye_engine_test(token_address: str = Query(BIRDEYE_TEST_TOKEN, min_length=32, max_length=64)):
+    """Calls the paper engine price function; never opens a position or places an order."""
     try:
         price = await get_token_price_usd(token_address)
     except Exception as exc:
         logger.exception("Birdeye engine diagnostic failed.")
-        return {
-            "provider": "birdeye",
-            "result": "engine_error",
-            "error_type": type(exc).__name__,
-            "diagnostics": get_price_diagnostics(),
-        }
-
+        return {"provider": "birdeye", "result": "engine_error", "error_type": type(exc).__name__, "diagnostics": get_price_diagnostics()}
     return {
-        "provider": "birdeye",
-        "result": "success" if price is not None and price > 0 else "no_usable_price",
-        "token_address": token_address,
-        "price_usd": price,
-        "diagnostics": get_price_diagnostics(),
-        "message": (
-            "Called the paper engine price function; no trade or position was created."
-        ),
+        "provider": "birdeye", "result": "success" if price is not None and price > 0 else "no_usable_price",
+        "token_address": token_address, "price_usd": price, "diagnostics": get_price_diagnostics(),
+        "message": "Called the paper engine price function; no trade or position was created.",
     }
 
 
@@ -266,15 +225,9 @@ async def signals(
         )
     except httpx.HTTPStatusError as exc:
         status = 503 if exc.response.status_code == 429 else 502
-        raise HTTPException(
-            status_code=status,
-            detail="Market data provider is temporarily unavailable.",
-        ) from exc
+        raise HTTPException(status_code=status, detail="Market data provider is temporarily unavailable.") from exc
     except httpx.HTTPError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Could not reach market data provider: {type(exc).__name__}",
-        ) from exc
+        raise HTTPException(status_code=502, detail=f"Could not reach market data provider: {type(exc).__name__}") from exc
 
 
 @app.get("/wallet/{wallet_address}")
@@ -284,10 +237,7 @@ async def wallet(wallet_address: str, limit: int = Query(20, ge=1, le=100)):
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except httpx.HTTPError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail="Could not reach the Solana RPC provider.",
-        ) from exc
+        raise HTTPException(status_code=502, detail="Could not reach the Solana RPC provider.") from exc
 
 
 @app.get("/paper/status")
@@ -319,10 +269,7 @@ async def stop_paper_bot():
 def add_paper_trade(payload: dict):
     required = {"token_address", "side", "amount_usd", "price_usd"}
     if not required.issubset(payload):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Required fields: {sorted(required)}",
-        )
+        raise HTTPException(status_code=400, detail=f"Required fields: {sorted(required)}")
     try:
         return record_paper_trade(
             token_address=str(payload["token_address"]),
