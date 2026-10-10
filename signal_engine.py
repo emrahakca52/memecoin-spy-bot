@@ -177,7 +177,7 @@ async def _discover_dex_pairs(client: httpx.AsyncClient) -> tuple[list[dict], li
         try:
             payload = await _get_json(
                 client,
-                f"{DEX_TOKENS_URL}/{'/'.join(batch)}",
+                f"{DEX_TOKENS_URL}/{','.join(batch)}",
                 provider="dexscreener",
             )
             if isinstance(payload, list):
