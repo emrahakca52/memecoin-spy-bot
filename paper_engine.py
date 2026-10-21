@@ -1,3 +1,14 @@
+"""
+Reconciled paper_engine.py
+
+Important:
+- Keeps legacy trade history; it does not delete or rewrite old trade records.
+- Excludes the specific known-bad MRBEAST SELL from the *reported* realized P/L.
+- Marks that trade as quarantined in memory and on the next state save.
+- Uses a conservative price sanity gate against the position's entry/current price.
+- This is a proposed replacement. Test in a staging service and back up the database first.
+"""
+
 import asyncio
 import json
 import logging
@@ -212,8 +223,60 @@ def _accounting_diagnostics(trades, stored_realized):
     }
 
 
+def _is_quarantined_trade(trade):
+    """Return True for trades explicitly quarantined by an operator or known bad quote."""
+    if not isinstance(trade, dict):
+        return False
+    if trade.get("accounting_quarantined") is True:
+        return True
+    # Specific historical bad quote confirmed in the provided paper-trade log.
+    return (
+        str(trade.get("side", "")).upper() == "SELL"
+        and str(trade.get("token_symbol", "")).upper() == "MRBEAST"
+        and str(trade.get("token_address", "")) == "4hqN5vhCG1q13qYUQvBhyMDDnpWKP98DoswDeDCVQaCn"
+        and _num(trade.get("price_usd")) > 100.0
+        and _num(trade.get("realized_pnl_usd")) > 1_000_000.0
+    )
+
+
+def _reported_realized_pnl(trades):
+    """Sum recorded SELL P/L excluding quarantined trades; never mutate history."""
+    total = 0.0
+    included = 0
+    quarantined = []
+    missing = 0
+    for index, trade in enumerate(trades):
+        if not isinstance(trade, dict) or str(trade.get("side", "")).upper() != "SELL":
+            continue
+        if _is_quarantined_trade(trade):
+            quarantined.append({
+                "index": index,
+                "token_symbol": trade.get("token_symbol"),
+                "token_address": trade.get("token_address"),
+                "reason": "implausible_historical_price_and_pnl",
+                "realized_pnl_usd_excluded": _num(trade.get("realized_pnl_usd")),
+            })
+            continue
+        if trade.get("realized_pnl_usd") is None:
+            missing += 1
+            continue
+        value = _num(trade.get("realized_pnl_usd"), default=float("nan"))
+        if math.isfinite(value):
+            total += value
+            included += 1
+        else:
+            missing += 1
+    return {
+        "realized_pnl_usd": round(total, 8),
+        "included_sell_records": included,
+        "quarantined_sell_records": quarantined,
+        "sell_records_missing_pnl": missing,
+        "note": "Computed from recorded SELL P/L fields; legacy records may be incomplete.",
+    }
+
+
 def load_paper_state():
-    """Load persisted state; preserve stored values and report inconsistencies."""
+    """Load persisted state; quarantine known bad accounting rows without deleting history."""
     global _open_positions, _paper_trades, _realized_pnl_usd
 
     if not _database_url():
@@ -268,15 +331,34 @@ def load_paper_state():
 
         stored_realized = _num(state.get("realized_pnl_usd"))
         diagnostics = _accounting_diagnostics(trades, stored_realized)
+        reconciled = _reported_realized_pnl(trades)
 
-        # Preserve historical trades and stored P/L. Do not silently rewrite money.
+        # Preserve each original trade. Mark the known invalid MRBEAST sale instead
+        # of deleting it; the displayed aggregate excludes it.
+        for trade in trades:
+            if _is_quarantined_trade(trade) and isinstance(trade, dict):
+                trade["accounting_quarantined"] = True
+                trade["accounting_quarantine_reason"] = (
+                    "Implausible historical quote; excluded from reported paper P/L pending review"
+                )
+
         _open_positions = positions
         _paper_trades = trades
-        _realized_pnl_usd = stored_realized
-        _database_status["accounting_warning"] = diagnostics["warning"]
-
+        _realized_pnl_usd = reconciled["realized_pnl_usd"]
+        warning_parts = []
         if diagnostics["warning"]:
-            logger.error("Paper accounting warning: %s", diagnostics["warning"])
+            warning_parts.append(diagnostics["warning"])
+        if reconciled["quarantined_sell_records"]:
+            warning_parts.append(
+                f"{len(reconciled['quarantined_sell_records'])} SELL record(s) quarantined from reported P/L."
+            )
+        _database_status["accounting_warning"] = " ".join(warning_parts) or None
+
+        if _database_status["accounting_warning"]:
+            logger.error("Paper accounting warning: %s", _database_status["accounting_warning"])
+        # Persist the quarantined annotation and reconciled aggregate while keeping
+        # the original trade row present for audit. A DB backup is still recommended.
+        _save_paper_state()
         logger.info(
             "Loaded paper state: %s positions, %s trades.",
             len(_open_positions), len(_paper_trades),
@@ -286,7 +368,11 @@ def load_paper_state():
             "loaded": True,
             "open_positions": len(_open_positions),
             "trade_count": len(_paper_trades),
-            "accounting": diagnostics,
+            "accounting": {
+                **diagnostics,
+                "reported_realized_pnl": reconciled,
+                "stored_realized_pnl_preserved_in_source_state": stored_realized,
+            },
         }
     except Exception as exc:
         _database_status.update(
@@ -775,6 +861,23 @@ async def update_paper_prices():
             errors += 1
             continue
 
+        # Extra per-position sanity gate. Large moves are withheld by the quote
+        # cache validator; this guard also blocks a confirmed-but-extreme price
+        # from instantly closing a position without independent validation.
+        entry_reference = _num(position.get("entry_price_usd"))
+        if entry_reference > 0:
+            move_pct = abs(price / entry_reference - 1.0) * 100.0
+            hard_limit = max(500.0, MAX_ACCEPTED_PRICE_JUMP_PCT * 10.0)
+            if move_pct > hard_limit:
+                errors += 1
+                message = (
+                    f"{address[:10]} price is {move_pct:.2f}% from entry; "
+                    f"exceeds paper safety cap {hard_limit:.2f}%; quote withheld"
+                )
+                _record_provider("birdeye", last_price_jump_warning=message)
+                logger.error(message)
+                continue
+
         position["current_price_usd"] = price
         qty = _num(position.get("quantity"))
         invested = _num(position.get("invested_usd"))
@@ -842,6 +945,7 @@ def get_paper_status():
         "paper_realized_pnl_usd": round(_realized_pnl_usd, 8),
         "paper_total_pnl_usd": round(unrealized + _realized_pnl_usd, 8),
         "persistence": get_persistence_status(),
+        "accounting": _reported_realized_pnl(_paper_trades),
         "price_diagnostics": get_price_diagnostics(),
         "note": (
             "Paper simulation only; no real orders. Large price moves are "
