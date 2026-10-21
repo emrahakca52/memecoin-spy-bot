@@ -49,6 +49,16 @@ PRICE_JUMP_PENDING_MAX_AGE_SECONDS = max(
 TAKE_PROFIT_PCT = 10.0
 STOP_LOSS_PCT = -5.0
 
+# If a quote implies a loss far beyond the configured stop, do not auto-close
+# from that quote alone. This is a safety brake for bad price feeds, not a
+# guarantee that the quote is false. Review/verify the position manually.
+MAX_STOP_LOSS_OVERSHOOT_PCT = max(
+    10.0, float(os.getenv("MAX_STOP_LOSS_OVERSHOOT_PCT", "35"))
+)
+MAX_TAKE_PROFIT_OVERSHOOT_PCT = max(
+    20.0, float(os.getenv("MAX_TAKE_PROFIT_OVERSHOOT_PCT", "100"))
+)
+
 _price_cache = {}
 _price_last_request = {}
 _pending_price_jumps = {}
@@ -891,18 +901,56 @@ async def update_paper_prices():
             continue
 
         change = (price / entry - 1) * 100
+
+        # Fail-safe auto-close guard:
+        # - normal TP/SL signals can close as before;
+        # - extreme prices are not allowed to trigger an automatic sale solely
+        #   because a single provider repeatedly reports an implausible quote.
+        # The position remains open and is flagged for review. This can delay a
+        # genuine crash exit, so it is deliberately visible in diagnostics.
         if change >= TAKE_PROFIT_PCT:
+            overshoot = change - TAKE_PROFIT_PCT
+            if overshoot > MAX_TAKE_PROFIT_OVERSHOOT_PCT:
+                errors += 1
+                message = (
+                    f"{position.get('token_symbol', address[:8])} quote implies "
+                    f"+{change:.2f}% from entry; auto take-profit withheld "
+                    f"(overshoot {overshoot:.2f}% exceeds "
+                    f"{MAX_TAKE_PROFIT_OVERSHOOT_PCT:.2f}%)"
+                )
+                position["price_safety_warning"] = message
+                _record_provider("birdeye", last_price_jump_warning=message)
+                logger.error(message)
+                continue
+            position.pop("price_safety_warning", None)
             closed += int(
                 _close_position(
                     address, position, price, "take_profit_10pct", change
                 )
             )
         elif change <= STOP_LOSS_PCT:
+            overshoot = STOP_LOSS_PCT - change
+            if overshoot > MAX_STOP_LOSS_OVERSHOOT_PCT:
+                errors += 1
+                message = (
+                    f"{position.get('token_symbol', address[:8])} quote implies "
+                    f"{change:.2f}% from entry; auto stop-loss withheld "
+                    f"(overshoot {overshoot:.2f}% exceeds "
+                    f"{MAX_STOP_LOSS_OVERSHOOT_PCT:.2f}%). Verify price; "
+                    "position remains open."
+                )
+                position["price_safety_warning"] = message
+                _record_provider("birdeye", last_price_jump_warning=message)
+                logger.error(message)
+                continue
+            position.pop("price_safety_warning", None)
             closed += int(
                 _close_position(
                     address, position, price, "stop_loss_5pct", change
                 )
             )
+        else:
+            position.pop("price_safety_warning", None)
 
     _save_paper_state()
     if not _open_positions:
@@ -949,9 +997,10 @@ def get_paper_status():
         "price_diagnostics": get_price_diagnostics(),
         "note": (
             "Paper simulation only; no real orders. Large price moves are "
-            "withheld until a nearby quote corroborates them. Same-provider "
-            "confirmation is not independent verification and can delay a "
-            "genuine stop-loss."
+            "withheld until a nearby quote corroborates them. Extreme TP/SL "
+            "overshoots are not auto-closed and require price review; this can "
+            "delay a genuine exit. Same-provider confirmation is not independent "
+            "verification."
         ),
     }
 
