@@ -20,9 +20,6 @@ BIRDEYE_LIST_URL = f"{BIRDEYE_BASE}/defi/v3/token/list"
 MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "10000"))
 MIN_VOLUME_24H_USD = float(os.getenv("MIN_VOLUME_24H_USD", "20000"))
 MIN_BUYS_SELLS_RATIO = float(os.getenv("MIN_BUYS_SELLS_RATIO", "1.0"))
-MIN_TRADES_24H = max(0, int(os.getenv("MIN_TRADES_24H", "20")))
-MAX_ABS_PRICE_CHANGE_24H_PCT = max(0.0, float(os.getenv("MAX_ABS_PRICE_CHANGE_24H_PCT", "300")))
-MAX_DRAWDOWN_24H_PCT = max(0.0, float(os.getenv("MAX_DRAWDOWN_24H_PCT", "30")))
 CACHE_SECONDS = max(60, int(os.getenv("SIGNAL_CACHE_SECONDS", "150")))
 REQUEST_TIMEOUT_SECONDS = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "15"))
 LISTING_LIMIT = max(1, min(100, int(os.getenv("BIRDEYE_LISTING_LIMIT", "100"))))
@@ -153,7 +150,6 @@ def _normalize(item: dict) -> dict:
         "unique_wallets_24h": int(_num(item.get("unique_wallet_24h"))),
         "trade_count_24h": int(_num(item.get("trade_24h_count"))),
         "price_change_24h_pct": _num(item.get("price_change_24h_percent")),
-        "price_change_24h_present": item.get("price_change_24h_percent") is not None,
     }
 
 
@@ -262,42 +258,24 @@ async def get_signal_candidates(
         volume = _num(candidate.get("volume_24h_usd"))
         ratio = _num(candidate.get("buy_sell_ratio"))
         price = _num(candidate.get("price_usd"))
-        buys = int(_num(candidate.get("buys_24h")))
-        sells = int(_num(candidate.get("sells_24h")))
-        trade_count = int(_num(candidate.get("trade_count_24h")))
-        change = _num(candidate.get("price_change_24h_pct"))
-        change_present = bool(candidate.get("price_change_24h_present", False))
         reasons = []
-        if not candidate.get("token_address"):
-            reasons.append("missing_token_address")
         if liquidity < min_liquidity:
             reasons.append("liquidity_below_minimum")
         if volume < min_volume or not candidate.get("volume_24h_present", True):
             reasons.append("volume_24h_below_minimum")
-        if (not candidate.get("buy_sell_counts_present", True)
-                or buys <= 0 or sells <= 0 or ratio < min_ratio):
-            reasons.append("buy_sell_activity_insufficient")
+        if ratio < min_ratio or not candidate.get("buy_sell_counts_present", True):
+            reasons.append("buy_sell_ratio_below_minimum")
         if price <= 0:
             reasons.append("missing_or_zero_price")
-        if trade_count < MIN_TRADES_24H:
-            reasons.append("trade_count_24h_below_minimum")
-        if change_present and abs(change) > MAX_ABS_PRICE_CHANGE_24H_PCT:
-            reasons.append("extreme_price_change_24h")
-        if change_present and change < -MAX_DRAWDOWN_24H_PCT:
-            reasons.append("sharp_decline_24h")
         if reasons:
             rejected.append({
                 "symbol": candidate.get("symbol"), "token_address": candidate.get("token_address"),
                 "liquidity_usd": liquidity, "volume_24h_usd": volume,
                 "buy_sell_ratio": round(ratio, 4), "price_usd": price,
-                "trade_count_24h": trade_count,
-                "price_change_24h_pct": change if change_present else None,
                 "metric_presence": {"liquidity": liquidity > 0,
                                     "volume_24h": bool(candidate.get("volume_24h_present", volume > 0)),
                                     "buy_sell_counts": bool(candidate.get("buy_sell_counts_present", False)),
-                                    "price": price > 0,
-                                    "trade_count_24h": candidate.get("trade_count_24h") is not None,
-                                    "price_change_24h": change_present},
+                                    "price": price > 0},
                 "rejection_reasons": reasons,
             })
             continue
@@ -312,11 +290,7 @@ async def get_signal_candidates(
         "checked": len(candidates), "candidate_count": len(filtered),
         "filters": {"min_liquidity_usd": min_liquidity,
                     "min_volume_24h_usd": min_volume,
-                    "min_buys_sells_ratio": min_ratio,
-                    "min_trades_24h": MIN_TRADES_24H,
-                    "max_absolute_price_change_24h_pct": MAX_ABS_PRICE_CHANGE_24H_PCT,
-                    "max_drawdown_24h_pct": MAX_DRAWDOWN_24H_PCT,
-                    "require_nonzero_buys_and_sells": True},
+                    "min_buys_sells_ratio": min_ratio},
         "candidate_preview": [{"symbol": item.get("symbol"),
                                 "token_address": item.get("token_address"),
                                 "liquidity_usd": item.get("liquidity_usd"),
@@ -324,16 +298,10 @@ async def get_signal_candidates(
                                 "buy_sell_ratio": item.get("buy_sell_ratio"),
                                 "score": item.get("score"), "provider": item.get("provider")}
                                for item in signals[:20]],
-        "rejected_preview": rejected[:15],
-        "additional_filters": {"min_trades_24h": MIN_TRADES_24H,
-                               "max_absolute_price_change_24h_pct": MAX_ABS_PRICE_CHANGE_24H_PCT,
-                               "max_drawdown_24h_pct": MAX_DRAWDOWN_24H_PCT,
-                               "require_nonzero_buys_and_sells": True},
+        "rejected_preview": rejected[:10],
         "rejection_counts": {reason: sum(1 for item in rejected if reason in item["rejection_reasons"])
-                             for reason in ("missing_token_address", "liquidity_below_minimum",
-                                            "volume_24h_below_minimum", "buy_sell_activity_insufficient",
-                                            "missing_or_zero_price", "trade_count_24h_below_minimum",
-                                            "extreme_price_change_24h", "sharp_decline_24h")},
+                             for reason in ("liquidity_below_minimum", "volume_24h_below_minimum",
+                                            "buy_sell_ratio_below_minimum", "missing_or_zero_price")},
         "cached_for_seconds": int(_cache.get("cache_for_seconds", CACHE_SECONDS)),
         "mode": TRADING_MODE, "real_trading_enabled": REAL_TRADING_ENABLED,
         "provider_diagnostics": get_signal_engine_status(),

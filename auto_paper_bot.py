@@ -3,6 +3,8 @@ import os
 from datetime import datetime, timezone
 
 from signal_engine import get_signal_candidates
+from check import evaluate_candidate
+from config import MAX_GROK_CHECKS_PER_SCAN, GROK_CONFIDENCE_THRESHOLD
 from paper_engine import (
     get_token_prices_usd,
     open_paper_position,
@@ -16,6 +18,9 @@ MAX_OPEN_POSITIONS = 5
 MIN_LIQUIDITY_USD = 10000
 MIN_VOLUME_24H_USD = 20000
 MIN_BUYS_SELLS_RATIO = 1.0
+MIN_TRADES_24H = 20
+MAX_ABSOLUTE_PRICE_CHANGE_24H_PCT = 300.0
+MAX_NEGATIVE_PRICE_CHANGE_24H_PCT = 30.0
 MAX_ENTRY_PRICE_DEVIATION_PCT = 10.0
 
 _task = None
@@ -25,10 +30,12 @@ _last_error = None
 _last_price_update = None
 _last_scan = None
 _last_skipped = []
+_last_copyfomo_checks = []
+COPYFOMO_GATE_ENABLED = os.getenv("COPYFOMO_GATE_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 
 async def _loop(stop_event):
-    global _last_run, _last_error, _last_price_update, _last_scan, _last_skipped
+    global _last_run, _last_error, _last_price_update, _last_scan, _last_skipped, _last_copyfomo_checks
 
     while not stop_event.is_set():
         try:
@@ -49,14 +56,39 @@ async def _loop(stop_event):
                 "candidate_count": data.get("candidate_count", len(signals)),
                 "note": data.get("note"),
                 "last_error": data.get("last_error"),
+                "filters": (data.get("diagnostics") or {}).get("filters", {}),
                 "rejection_counts": (data.get("diagnostics") or {}).get("rejection_counts", {}),
-                "signal_filters": (data.get("diagnostics") or {}).get("filters", {}),
-                "additional_filters": (data.get("diagnostics") or {}).get("additional_filters", {}),
             }
+
+            # Optional Copyfomo gate: RugCheck first, then Grok. Fail-closed when enabled.
+            _last_copyfomo_checks = []
+            eligible_signals = signals
+            if COPYFOMO_GATE_ENABLED:
+                ordered = sorted(signals, key=lambda x: float(x.get("score") or 0), reverse=True)
+                checked = []
+                eligible_signals = []
+                for token in ordered[:MAX_GROK_CHECKS_PER_SCAN]:
+                    gate = await evaluate_candidate(token)
+                    checked.append({"symbol": token.get("symbol"), "token_address": token.get("token_address"), **gate})
+                    if gate.get("passed"):
+                        eligible_signals.append(token)
+                    else:
+                        _last_skipped.append({"symbol": token.get("symbol"), "reason": "copyfomo_gate_rejected", "stage": gate.get("stage"), "details": gate.get("rejection_reasons", [])})
+                _last_copyfomo_checks = checked
+                _last_scan["copyfomo_gate"] = {
+                    "enabled": True,
+                    "checked": len(checked),
+                    "approved": len(eligible_signals),
+                    "max_checks_per_scan": MAX_GROK_CHECKS_PER_SCAN,
+                    "grok_confidence_threshold": GROK_CONFIDENCE_THRESHOLD,
+                    "note": "Only top-ranked candidates are checked per scan; other candidates are not approved this cycle."
+                }
+            else:
+                _last_scan["copyfomo_gate"] = {"enabled": False, "note": "Set COPYFOMO_GATE_ENABLED=true after configuring XAI_API_KEY to enable RugCheck + Grok gating."}
 
             # Fetch entry quotes in one batch instead of one request per token.
             valid_signals = []
-            for token in signals:
+            for token in eligible_signals:
                 address = token.get("token_address")
                 symbol = token.get("symbol") or token.get("token_symbol") or ""
                 signal_price = float(token.get("price_usd") or 0)
@@ -104,14 +136,13 @@ async def _loop(stop_event):
                         "liquidity_usd": token.get("liquidity_usd"),
                         "volume_24h_usd": token.get("volume_24h_usd"),
                         "buy_sell_ratio": token.get("buy_sell_ratio", token.get("buys_to_sells_ratio")),
-                        "trade_count_24h": token.get("trade_count_24h"),
-                        "unique_wallets_24h": token.get("unique_wallets_24h"),
-                        "price_change_24h_pct": token.get("price_change_24h_pct"),
                         "strategy": "experimental_candidate_filter_not_validated",
                         "signal_price_usd": signal_price,
                         "entry_price_deviation_pct": round(deviation, 4),
                         "take_profit_pct": 10,
                         "stop_loss_pct": -5,
+                        "copyfomo_gate_enabled": COPYFOMO_GATE_ENABLED,
+                        "copyfomo_strategy_profile": "grok_rugcheck_gate_paper_only" if COPYFOMO_GATE_ENABLED else "legacy_candidate_filter",
                     },
                 )
                 if result.get("skipped"):
@@ -173,16 +204,17 @@ def bot_status():
             "min_liquidity_usd": MIN_LIQUIDITY_USD,
             "min_volume_24h_usd": MIN_VOLUME_24H_USD,
             "min_buys_sells_ratio": MIN_BUYS_SELLS_RATIO,
-            "min_trades_24h": int(os.getenv("MIN_TRADES_24H", "20")),
-            "max_absolute_price_change_24h_pct": float(os.getenv("MAX_ABS_PRICE_CHANGE_24H_PCT", "300")),
-            "max_drawdown_24h_pct": float(os.getenv("MAX_DRAWDOWN_24H_PCT", "30")),
-            "require_nonzero_buys_and_sells": True,
+            "min_trades_24h": MIN_TRADES_24H,
+            "max_absolute_price_change_24h_pct": MAX_ABSOLUTE_PRICE_CHANGE_24H_PCT,
+            "max_negative_price_change_24h_pct": MAX_NEGATIVE_PRICE_CHANGE_24H_PCT,
         },
         "last_run_utc": _last_run,
         "last_error": _last_error,
         "last_price_update": _last_price_update,
         "last_scan": _last_scan,
         "last_skipped": _last_skipped[-10:],
+        "copyfomo_gate_enabled": COPYFOMO_GATE_ENABLED,
+        "copyfomo_checks": _last_copyfomo_checks[-MAX_GROK_CHECKS_PER_SCAN:],
         "price_diagnostics": get_price_diagnostics(),
         "warning": (
             "Experimental paper simulation only. No real orders are sent. "
