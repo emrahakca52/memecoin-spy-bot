@@ -1,4 +1,5 @@
 import asyncio
+import os
 from datetime import datetime, timezone
 
 from signal_engine import get_signal_candidates
@@ -100,6 +101,11 @@ async def _loop(stop_event):
                         "liquidity_usd": token.get("liquidity_usd"),
                         "volume_24h_usd": token.get("volume_24h_usd"),
                         "buy_sell_ratio": token.get("buy_sell_ratio", token.get("buys_to_sells_ratio")),
+                        "buys_24h": token.get("buys_24h"),
+                        "sells_24h": token.get("sells_24h"),
+                        "trade_count_24h": token.get("trade_count_24h"),
+                        "unique_wallets_24h": token.get("unique_wallets_24h"),
+                        "price_change_24h_pct": token.get("price_change_24h_pct"),
                         "strategy": "experimental_candidate_filter_not_validated",
                         "signal_price_usd": signal_price,
                         "entry_price_deviation_pct": round(deviation, 4),
@@ -166,6 +172,9 @@ def bot_status():
             "min_liquidity_usd": MIN_LIQUIDITY_USD,
             "min_volume_24h_usd": MIN_VOLUME_24H_USD,
             "min_buys_sells_ratio": MIN_BUYS_SELLS_RATIO,
+            "min_trades_24h": max(0, int(os.getenv("MIN_TRADES_24H", "20"))),
+            "max_absolute_price_change_24h_pct": max(0.0, float(os.getenv("MAX_PRICE_CHANGE_24H_PCT", "300"))),
+            "require_nonzero_buys_and_sells": True,
         },
         "last_run_utc": _last_run,
         "last_error": _last_error,
