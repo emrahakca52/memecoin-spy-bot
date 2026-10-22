@@ -49,6 +49,9 @@ async def _loop(stop_event):
                 "candidate_count": data.get("candidate_count", len(signals)),
                 "note": data.get("note"),
                 "last_error": data.get("last_error"),
+                "rejection_counts": (data.get("diagnostics") or {}).get("rejection_counts", {}),
+                "signal_filters": (data.get("diagnostics") or {}).get("filters", {}),
+                "additional_filters": (data.get("diagnostics") or {}).get("additional_filters", {}),
             }
 
             # Fetch entry quotes in one batch instead of one request per token.
@@ -101,8 +104,6 @@ async def _loop(stop_event):
                         "liquidity_usd": token.get("liquidity_usd"),
                         "volume_24h_usd": token.get("volume_24h_usd"),
                         "buy_sell_ratio": token.get("buy_sell_ratio", token.get("buys_to_sells_ratio")),
-                        "buys_24h": token.get("buys_24h"),
-                        "sells_24h": token.get("sells_24h"),
                         "trade_count_24h": token.get("trade_count_24h"),
                         "unique_wallets_24h": token.get("unique_wallets_24h"),
                         "price_change_24h_pct": token.get("price_change_24h_pct"),
@@ -172,8 +173,9 @@ def bot_status():
             "min_liquidity_usd": MIN_LIQUIDITY_USD,
             "min_volume_24h_usd": MIN_VOLUME_24H_USD,
             "min_buys_sells_ratio": MIN_BUYS_SELLS_RATIO,
-            "min_trades_24h": max(0, int(os.getenv("MIN_TRADES_24H", "20"))),
-            "max_absolute_price_change_24h_pct": max(0.0, float(os.getenv("MAX_PRICE_CHANGE_24H_PCT", "300"))),
+            "min_trades_24h": int(os.getenv("MIN_TRADES_24H", "20")),
+            "max_absolute_price_change_24h_pct": float(os.getenv("MAX_ABS_PRICE_CHANGE_24H_PCT", "300")),
+            "max_drawdown_24h_pct": float(os.getenv("MAX_DRAWDOWN_24H_PCT", "30")),
             "require_nonzero_buys_and_sells": True,
         },
         "last_run_utc": _last_run,
