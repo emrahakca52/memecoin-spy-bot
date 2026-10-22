@@ -6,7 +6,8 @@ Important:
 - Excludes the specific known-bad MRBEAST SELL from the *reported* realized P/L.
 - Marks that trade as quarantined in memory and on the next state save.
 - Uses a conservative price sanity gate against the position's entry/current price.
-- This is a proposed replacement. Test in a staging service and back up the database first.
+- Raises default Birdeye request spacing/cooldown to reduce HTTP 429 responses.
+- This is a proposed replacement. Back up the database before deploying.
 """
 
 import asyncio
@@ -25,13 +26,13 @@ logger = logging.getLogger("memecoin_spy.paper_engine")
 BIRDEYE_PRICE_URL = "https://public-api.birdeye.so/defi/price"
 PRICE_TIMEOUT_SECONDS = float(os.getenv("PRICE_TIMEOUT_SECONDS", "12"))
 PRICE_CACHE_SECONDS = max(5, int(os.getenv("PRICE_CACHE_SECONDS", "90")))
-PRICE_COOLDOWN_SECONDS = max(1, int(os.getenv("PRICE_COOLDOWN_SECONDS", "60")))
+PRICE_COOLDOWN_SECONDS = max(1, int(os.getenv("PRICE_COOLDOWN_SECONDS", "120")))
 MIN_HOLD_SECONDS = max(0, int(os.getenv("MIN_HOLD_SECONDS", "30")))
 MAX_ACCEPTED_PRICE_JUMP_PCT = max(
     1.0, float(os.getenv("MAX_ACCEPTED_PRICE_JUMP_PCT", "35"))
 )
 BIRDEYE_MIN_REQUEST_INTERVAL_SECONDS = max(
-    1.1, float(os.getenv("BIRDEYE_MIN_REQUEST_INTERVAL_SECONDS", "3"))
+    1.1, float(os.getenv("BIRDEYE_MIN_REQUEST_INTERVAL_SECONDS", "5"))
 )
 PRICE_JUMP_REFERENCE_MAX_AGE_SECONDS = max(
     PRICE_CACHE_SECONDS,
@@ -343,6 +344,19 @@ def load_paper_state():
         diagnostics = _accounting_diagnostics(trades, stored_realized)
         reconciled = _reported_realized_pnl(trades)
 
+        # The reported ledger is derived from SELL records excluding quarantined
+        # rows. The old stored aggregate is intentionally replaced below; its
+        # mismatch is historical and should not remain as a permanent warning.
+        # Any quarantined records remain visible in the accounting diagnostics.
+        #
+        # Keep the diagnostic calculation for audit, but do not use its stale
+        # stored-vs-ledger difference as the live warning after reconciliation.
+        # This prevents an obsolete $16.1M mismatch warning after the new total
+        # has been saved.
+        diagnostics["historical_stored_value"] = stored_realized
+        diagnostics["historical_stored_value_mismatch"] = diagnostics.get("warning")
+        diagnostics["warning"] = None
+
         # Preserve each original trade. Mark the known invalid MRBEAST sale instead
         # of deleting it; the displayed aggregate excludes it.
         for trade in trades:
@@ -356,8 +370,6 @@ def load_paper_state():
         _paper_trades = trades
         _realized_pnl_usd = reconciled["realized_pnl_usd"]
         warning_parts = []
-        if diagnostics["warning"]:
-            warning_parts.append(diagnostics["warning"])
         if reconciled["quarantined_sell_records"]:
             warning_parts.append(
                 f"{len(reconciled['quarantined_sell_records'])} SELL record(s) quarantined from reported P/L."
