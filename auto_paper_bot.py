@@ -1,8 +1,13 @@
 import asyncio
+import logging
 import os
 from datetime import datetime, timezone
 
-from signal_engine import get_signal_candidates
+from signal_engine import (
+    get_signal_candidates,
+    MAX_PRICE_CHANGE_24H_PCT,
+    MIN_TRADES_24H,
+)
 from check import evaluate_candidate
 from config import MAX_GROK_CHECKS_PER_SCAN, GROK_CONFIDENCE_THRESHOLD
 from paper_engine import (
@@ -12,15 +17,25 @@ from paper_engine import (
     get_price_diagnostics,
 )
 
-POLL_SECONDS = 180
+logger = logging.getLogger(__name__)
+
+# Paper-only settings. This module never submits real orders.
+POLL_SECONDS = max(30, int(os.getenv("PAPER_BOT_POLL_SECONDS", "180")))
 PAPER_BUY_USD = 10.0
 MAX_OPEN_POSITIONS = 5
-MIN_LIQUIDITY_USD = 10000
-MIN_VOLUME_24H_USD = 20000
-MIN_BUYS_SELLS_RATIO = 1.0
-MIN_TRADES_24H = 20
-MAX_ABSOLUTE_PRICE_CHANGE_24H_PCT = 300.0
-MAX_NEGATIVE_PRICE_CHANGE_24H_PCT = 30.0
+MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "10000"))
+MIN_VOLUME_24H_USD = float(os.getenv("MIN_VOLUME_24H_USD", "20000"))
+MIN_BUYS_SELLS_RATIO = float(os.getenv("MIN_BUYS_SELLS_RATIO", "1.0"))
+
+# Keep status aligned with the actual signal_engine filters.
+MAX_ABSOLUTE_PRICE_CHANGE_24H_PCT = MAX_PRICE_CHANGE_24H_PCT
+
+# Retained for status/API compatibility only. signal_engine currently applies
+# the absolute threshold above, not a separate negative-only threshold.
+MAX_NEGATIVE_PRICE_CHANGE_24H_PCT = max(
+    0.0, float(os.getenv("MAX_NEGATIVE_PRICE_CHANGE_24H_PCT", "30"))
+)
+
 MAX_ENTRY_PRICE_DEVIATION_PCT = 10.0
 
 _task = None
@@ -31,11 +46,20 @@ _last_price_update = None
 _last_scan = None
 _last_skipped = []
 _last_copyfomo_checks = []
-COPYFOMO_GATE_ENABLED = os.getenv("COPYFOMO_GATE_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+COPYFOMO_GATE_ENABLED = (
+    os.getenv("COPYFOMO_GATE_ENABLED", "false").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 async def _loop(stop_event):
-    global _last_run, _last_error, _last_price_update, _last_scan, _last_skipped, _last_copyfomo_checks
+    global _last_run, _last_error, _last_price_update
+    global _last_scan, _last_skipped, _last_copyfomo_checks
 
     while not stop_event.is_set():
         try:
@@ -50,30 +74,47 @@ async def _loop(stop_event):
                 limit=20,
             )
             signals = data.get("signals", []) or []
+            diagnostics = data.get("diagnostics") or {}
             _last_scan = {
                 "provider": data.get("provider"),
                 "checked": data.get("checked", 0),
                 "candidate_count": data.get("candidate_count", len(signals)),
                 "note": data.get("note"),
                 "last_error": data.get("last_error"),
-                "filters": (data.get("diagnostics") or {}).get("filters", {}),
-                "rejection_counts": (data.get("diagnostics") or {}).get("rejection_counts", {}),
+                "filters": diagnostics.get("filters", {}),
+                "additional_filters": diagnostics.get("additional_filters", {}),
+                "rejection_counts": diagnostics.get("rejection_counts", {}),
             }
 
-            # Optional Copyfomo gate: RugCheck first, then Grok. Fail-closed when enabled.
+            # Optional CopyFomo gate: RugCheck first, then Grok.
             _last_copyfomo_checks = []
             eligible_signals = signals
             if COPYFOMO_GATE_ENABLED:
-                ordered = sorted(signals, key=lambda x: float(x.get("score") or 0), reverse=True)
+                ordered = sorted(
+                    signals,
+                    key=lambda item: float(item.get("score") or 0),
+                    reverse=True,
+                )
                 checked = []
                 eligible_signals = []
                 for token in ordered[:MAX_GROK_CHECKS_PER_SCAN]:
+                    if stop_event.is_set():
+                        break
                     gate = await evaluate_candidate(token)
-                    checked.append({"symbol": token.get("symbol"), "token_address": token.get("token_address"), **gate})
+                    checked.append({
+                        "symbol": token.get("symbol"),
+                        "token_address": token.get("token_address"),
+                        **gate,
+                    })
                     if gate.get("passed"):
                         eligible_signals.append(token)
                     else:
-                        _last_skipped.append({"symbol": token.get("symbol"), "reason": "copyfomo_gate_rejected", "stage": gate.get("stage"), "details": gate.get("rejection_reasons", [])})
+                        _last_skipped.append({
+                            "symbol": token.get("symbol"),
+                            "reason": "copyfomo_gate_rejected",
+                            "stage": gate.get("stage"),
+                            "details": gate.get("rejection_reasons", []),
+                        })
                 _last_copyfomo_checks = checked
                 _last_scan["copyfomo_gate"] = {
                     "enabled": True,
@@ -81,17 +122,29 @@ async def _loop(stop_event):
                     "approved": len(eligible_signals),
                     "max_checks_per_scan": MAX_GROK_CHECKS_PER_SCAN,
                     "grok_confidence_threshold": GROK_CONFIDENCE_THRESHOLD,
-                    "note": "Only top-ranked candidates are checked per scan; other candidates are not approved this cycle."
+                    "note": (
+                        "Only top-ranked candidates are checked per scan; "
+                        "other candidates are not approved this cycle."
+                    ),
                 }
             else:
-                _last_scan["copyfomo_gate"] = {"enabled": False, "note": "Set COPYFOMO_GATE_ENABLED=true after configuring XAI_API_KEY to enable RugCheck + Grok gating."}
+                _last_scan["copyfomo_gate"] = {
+                    "enabled": False,
+                    "note": (
+                        "Set COPYFOMO_GATE_ENABLED=true after configuring "
+                        "XAI_API_KEY to enable RugCheck + Grok gating."
+                    ),
+                }
 
-            # Fetch entry quotes in one batch instead of one request per token.
             valid_signals = []
             for token in eligible_signals:
                 address = token.get("token_address")
                 symbol = token.get("symbol") or token.get("token_symbol") or ""
-                signal_price = float(token.get("price_usd") or 0)
+                try:
+                    signal_price = float(token.get("price_usd") or 0)
+                except (TypeError, ValueError, OverflowError):
+                    signal_price = 0.0
+
                 if not address or signal_price <= 0:
                     _last_skipped.append({
                         "symbol": symbol,
@@ -100,9 +153,11 @@ async def _loop(stop_event):
                     continue
                 valid_signals.append((token, address, symbol, signal_price))
 
-            prices = await get_token_prices_usd(
-                [address for _, address, _, _ in valid_signals]
-            )
+            prices = {}
+            if valid_signals and not stop_event.is_set():
+                prices = await get_token_prices_usd(
+                    [address for _, address, _, _ in valid_signals]
+                )
 
             for token, address, symbol, signal_price in valid_signals:
                 if stop_event.is_set():
@@ -135,14 +190,20 @@ async def _loop(stop_event):
                         "pair_address": token.get("pool_address") or token.get("pair_address"),
                         "liquidity_usd": token.get("liquidity_usd"),
                         "volume_24h_usd": token.get("volume_24h_usd"),
-                        "buy_sell_ratio": token.get("buy_sell_ratio", token.get("buys_to_sells_ratio")),
+                        "buy_sell_ratio": token.get(
+                            "buy_sell_ratio", token.get("buys_to_sells_ratio")
+                        ),
                         "strategy": "experimental_candidate_filter_not_validated",
                         "signal_price_usd": signal_price,
                         "entry_price_deviation_pct": round(deviation, 4),
                         "take_profit_pct": 10,
                         "stop_loss_pct": -5,
                         "copyfomo_gate_enabled": COPYFOMO_GATE_ENABLED,
-                        "copyfomo_strategy_profile": "grok_rugcheck_gate_paper_only" if COPYFOMO_GATE_ENABLED else "legacy_candidate_filter",
+                        "copyfomo_strategy_profile": (
+                            "grok_rugcheck_gate_paper_only"
+                            if COPYFOMO_GATE_ENABLED
+                            else "legacy_candidate_filter"
+                        ),
                     },
                 )
                 if result.get("skipped"):
@@ -151,10 +212,14 @@ async def _loop(stop_event):
                         "reason": result.get("reason"),
                     })
 
-            _last_run = datetime.now(timezone.utc).isoformat()
-
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             _last_error = f"{type(exc).__name__}: {str(exc)[:200]}"
+            logger.exception("Paper bot scan cycle failed: %s", _last_error)
+        finally:
+            # Timestamp is recorded even when a cycle raises an exception.
+            _last_run = _utc_now()
 
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=POLL_SECONDS)
@@ -167,7 +232,7 @@ async def start_bot():
     if _task is not None and not _task.done():
         return bot_status()
     _stop_event = asyncio.Event()
-    _task = asyncio.create_task(_loop(_stop_event))
+    _task = asyncio.create_task(_loop(_stop_event), name="paper-bot-loop")
     return bot_status()
 
 
@@ -208,6 +273,16 @@ def bot_status():
             "max_absolute_price_change_24h_pct": MAX_ABSOLUTE_PRICE_CHANGE_24H_PCT,
             "max_negative_price_change_24h_pct": MAX_NEGATIVE_PRICE_CHANGE_24H_PCT,
         },
+        "filter_notes": {
+            "price_change_filter_source": "signal_engine.py",
+            "max_absolute_price_change_24h_pct_is_effective": True,
+            "max_negative_price_change_24h_pct_is_separate_effective_filter": False,
+            "note": (
+                "signal_engine applies the absolute price-change threshold. "
+                "The separate negative threshold is shown for compatibility "
+                "but is not independently applied."
+            ),
+        },
         "last_run_utc": _last_run,
         "last_error": _last_error,
         "last_price_update": _last_price_update,
@@ -218,7 +293,8 @@ def bot_status():
         "price_diagnostics": get_price_diagnostics(),
         "warning": (
             "Experimental paper simulation only. No real orders are sent. "
-            "Entry quotes are checked against a second provider call; large price jumps are rejected. "
-            "Take-profit +10% and stop-loss -5% are unvalidated simulation rules."
+            "Entry quotes are checked against a second provider call; large price "
+            "jumps are rejected. Take-profit +10% and stop-loss -5% are "
+            "unvalidated simulation rules."
         ),
     }
