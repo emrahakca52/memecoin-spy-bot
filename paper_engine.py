@@ -883,9 +883,11 @@ async def update_paper_prices():
             errors += 1
             continue
 
-        # Validate the quote BEFORE changing the marked value/P&L. A quote that
-        # implies an extreme stop-loss or take-profit is recorded as suspect,
-        # but the previous trusted mark and P&L remain intact pending review.
+        # Validate the quote before changing the mark. Large price jumps are
+        # screened by get_token_prices_usd(); if a quote passes that gate but
+        # implies an extreme TP/SL overshoot, update the paper mark/P&L for
+        # visibility while keeping the position OPEN. The separate auto-close
+        # guard below still blocks an extreme exit pending verification.
         entry = _num(position.get("entry_price_usd"))
         opened = _num(position.get("opened_at"))
         if entry <= 0:
@@ -902,41 +904,46 @@ async def update_paper_prices():
         if change <= STOP_LOSS_PCT:
             overshoot = STOP_LOSS_PCT - change
             if overshoot > MAX_STOP_LOSS_OVERSHOOT_PCT:
-                errors += 1
                 message = (
                     f"{position.get('token_symbol', address[:8])} quote implies "
-                    f"{change:.2f}% from entry; suspect stop-loss quote withheld; "
-                    "previous marked value and P/L retained pending verification"
+                    f"{change:.2f}% from entry; extreme quote is reflected in "
+                    "paper mark/P&L, but automatic stop-loss is withheld pending verification"
                 )
                 position["last_suspect_price_usd"] = price
                 position["last_suspect_price_utc"] = _utc_now()
                 position["price_safety_warning"] = message
+                position["price_mark_status"] = "unverified_extreme_quote"
                 _record_provider("birdeye", last_price_jump_warning=message)
                 logger.error(message)
-                continue
+                # Intentionally do not continue: update the marked price/P&L
+                # below, but leave the position open in the auto-close guard.
 
         if change >= TAKE_PROFIT_PCT:
             overshoot = change - TAKE_PROFIT_PCT
             if overshoot > MAX_TAKE_PROFIT_OVERSHOOT_PCT:
-                errors += 1
                 message = (
                     f"{position.get('token_symbol', address[:8])} quote implies "
-                    f"+{change:.2f}% from entry; suspect take-profit quote withheld; "
-                    "previous marked value and P/L retained pending verification"
+                    f"+{change:.2f}% from entry; extreme quote is reflected in "
+                    "paper mark/P&L, but automatic take-profit is withheld pending verification"
                 )
                 position["last_suspect_price_usd"] = price
                 position["last_suspect_price_utc"] = _utc_now()
                 position["price_safety_warning"] = message
+                position["price_mark_status"] = "unverified_extreme_quote"
                 _record_provider("birdeye", last_price_jump_warning=message)
                 logger.error(message)
-                continue
+                # Intentionally do not continue: mark the position for display,
+                # but the auto-close guard below keeps it open.
 
-        # Only accepted quotes may update the current mark and unrealized P/L.
+        # Accepted quotes update the paper mark and unrealized P/L. Extreme
+        # quotes retain an explicit warning and are not automatically closed.
         position["current_price_usd"] = price
         qty = _num(position.get("quantity"))
         invested = _num(position.get("invested_usd"))
         position["unrealized_pnl_usd"] = round(qty * price - invested, 8)
         position["last_price_update_utc"] = _utc_now()
+        if position.get("price_mark_status") != "unverified_extreme_quote":
+            position.pop("price_mark_status", None)
         updated += 1
 
         if opened and time.time() - opened < MIN_HOLD_SECONDS:
@@ -1047,11 +1054,10 @@ def get_paper_status():
         "accounting": _reported_realized_pnl(_paper_trades),
         "price_diagnostics": get_price_diagnostics(),
         "note": (
-            "Paper simulation only; no real orders. Extreme price quotes are "
-            "recorded as suspect without changing the last trusted mark or P/L. "
-            "Extreme TP/SL overshoots remain open pending verification; this can "
-            "delay a genuine exit. Same-provider confirmation is not independent "
-            "verification. Realized P/L is calculated from recorded SELL rows, "
+            "Paper simulation only; no real orders. Quotes that pass the price-jump "
+            "gate update the displayed paper mark/P&L; extreme TP/SL overshoots are "
+            "flagged and remain open pending verification. Same-provider confirmation "
+            "is not independent verification. Realized P/L is calculated from recorded SELL rows, "
             "excluding quarantined rows without deleting history."
         ),
     }
