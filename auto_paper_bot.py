@@ -30,8 +30,8 @@ MIN_BUYS_SELLS_RATIO = float(os.getenv("MIN_BUYS_SELLS_RATIO", "1.0"))
 # Keep status aligned with the actual signal_engine filters.
 MAX_ABSOLUTE_PRICE_CHANGE_24H_PCT = MAX_PRICE_CHANGE_24H_PCT
 
-# Retained for status/API compatibility only. signal_engine currently applies
-# the absolute threshold above, not a separate negative-only threshold.
+# This is an effective independent threshold in signal_engine.py; keep the
+# status diagnostics aligned with that implementation.
 MAX_NEGATIVE_PRICE_CHANGE_24H_PCT = max(
     0.0, float(os.getenv("MAX_NEGATIVE_PRICE_CHANGE_24H_PCT", "30"))
 )
@@ -63,6 +63,9 @@ async def _loop(stop_event):
 
     while not stop_event.is_set():
         try:
+            # Publish a heartbeat before network calls, so status does not stay
+            # null merely because a provider request is slow or stalled.
+            _last_run = _utc_now()
             _last_error = None
             _last_skipped = []
             _last_price_update = await update_paper_prices()
@@ -218,7 +221,7 @@ async def _loop(stop_event):
             _last_error = f"{type(exc).__name__}: {str(exc)[:200]}"
             logger.exception("Paper bot scan cycle failed: %s", _last_error)
         finally:
-            # Timestamp is recorded even when a cycle raises an exception.
+            # Timestamp records the latest completed/failed cycle.
             _last_run = _utc_now()
 
         try:
@@ -284,6 +287,7 @@ def bot_status():
             ),
         },
         "last_run_utc": _last_run,
+        "last_run_utc_semantics": "Most recent paper scan cycle heartbeat/completion UTC",
         "last_error": _last_error,
         "last_price_update": _last_price_update,
         "last_scan": _last_scan,
