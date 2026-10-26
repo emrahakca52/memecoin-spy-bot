@@ -26,29 +26,18 @@ BIRDEYE_TEST_TOKEN = "So11111111111111111111111111111111111111112"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    bot_started = False
+    # Load persisted paper state, but never start the scanner automatically.
+    # The operator must explicitly call POST /paper-bot/start after checking status.
     try:
-        # Load persisted positions and trade history before the bot can run.
-        load_paper_state()
-        logger.info("Paper state load completed before bot startup.")
-        await start_bot()
-        bot_started = True
-        logger.info("Paper bot startup requested; real trading disabled.")
+        result = load_paper_state()
+        logger.info("Paper state load result: %s", result)
     except Exception:
-        # Do not start a fresh paper session if the saved database state could not be read.
-        logger.exception("Paper state could not be loaded or paper bot failed to start.")
-    try:
-        yield
-    finally:
-        if bot_started:
-            try:
-                await stop_bot()
-                logger.info("Paper bot stopped during application shutdown.")
-            except Exception:
-                logger.exception("Error while stopping paper bot.")
+        logger.exception("Paper state could not be loaded; bot remains stopped.")
+    yield
+    # No bot shutdown action is needed because startup intentionally leaves it stopped.
 
 
-app = FastAPI(title="Memecoin Spy Pro", version="1.3.2", lifespan=lifespan)
+app = FastAPI(title="Memecoin Spy Pro", version="1.4.0", lifespan=lifespan)
 
 
 @app.get("/")
