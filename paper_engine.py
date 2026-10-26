@@ -1,16 +1,15 @@
 """
-Memecoin Spy Pro — paper_engine.py
-Hardened paper-only simulation engine.
+Reconciled paper_engine.py
 
 Important:
-- Keeps historical trade records.
-- Excludes the known impossible MRBEAST SELL from reported realized P/L.
-- Prevents duplicate open positions for the same token address.
-- Validates unusually large quote jumps and flags extreme exits for review.
-- Keeps the last accepted mark when an extreme exit quote is rejected.
-- Uses PostgreSQL persistence when DATABASE_URL is configured.
-- No real orders are sent.
+- Keeps legacy trade history; it does not delete or rewrite old trade records.
+- Excludes the specific known-bad MRBEAST SELL from the *reported* realized P/L.
+- Marks that trade as quarantined in memory and on the next state save.
+- Uses a conservative price sanity gate against the position's entry/current price.
+- Raises default Birdeye request spacing/cooldown to reduce HTTP 429 responses.
+- This is a proposed replacement. Back up the database before deploying.
 """
+
 import asyncio
 import json
 import logging
@@ -46,12 +45,20 @@ PRICE_JUMP_PENDING_MAX_AGE_SECONDS = max(
     30, int(os.getenv("PRICE_JUMP_PENDING_MAX_AGE_SECONDS", "600"))
 )
 
+# These remain the existing paper-strategy thresholds. They are not validated
+# live-trading parameters.
 TAKE_PROFIT_PCT = 10.0
 STOP_LOSS_PCT = -5.0
-# Conservative paper-only guardrails. Environment values cannot relax these caps.
-# Excessive quotes are flagged and do not automatically close the position.
-MAX_STOP_LOSS_OVERSHOOT_PCT = min(10.0, max(2.0, float(os.getenv("MAX_STOP_LOSS_OVERSHOOT_PCT", "5"))))
-MAX_TAKE_PROFIT_OVERSHOOT_PCT = min(50.0, max(10.0, float(os.getenv("MAX_TAKE_PROFIT_OVERSHOOT_PCT", "25"))))
+
+# If a quote implies a loss far beyond the configured stop, do not auto-close
+# from that quote alone. This is a safety brake for bad price feeds, not a
+# guarantee that the quote is false. Review/verify the position manually.
+MAX_STOP_LOSS_OVERSHOOT_PCT = max(
+    10.0, float(os.getenv("MAX_STOP_LOSS_OVERSHOOT_PCT", "35"))
+)
+MAX_TAKE_PROFIT_OVERSHOOT_PCT = max(
+    20.0, float(os.getenv("MAX_TAKE_PROFIT_OVERSHOOT_PCT", "100"))
+)
 
 _price_cache = {}
 _price_last_request = {}
@@ -99,6 +106,7 @@ def _database_url():
 
 
 def get_persistence_status():
+    # Return a copy so callers cannot mutate internal status.
     return dict(_database_status)
 
 
@@ -115,14 +123,17 @@ def _connect_database():
 
 
 def _ensure_state_table(conn):
-    conn.execute("""CREATE TABLE IF NOT EXISTS memecoin_paper_state (
-        id SMALLINT PRIMARY KEY CHECK (id = 1),
-        state JSONB NOT NULL,
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )""")
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS memecoin_paper_state (
+            id SMALLINT PRIMARY KEY CHECK (id = 1),
+            state JSONB NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )"""
+    )
 
 
 def _state_snapshot():
+    # JSON serialization below rejects NaN/Infinity.
     return {
         "open_positions": _open_positions,
         "paper_trades": _paper_trades,
@@ -133,7 +144,7 @@ def _state_snapshot():
 
 
 def _save_paper_state():
-    """Persist state; never expose DATABASE_URL."""
+    """Persist the current paper state. Never expose DATABASE_URL."""
     if not _database_url():
         _database_status.update(
             configured=False,
@@ -155,7 +166,6 @@ def _save_paper_state():
                    SET state = EXCLUDED.state, updated_at = NOW()""",
                 (snapshot,),
             )
-
         _database_status.update(
             configured=True,
             connected=True,
@@ -163,7 +173,6 @@ def _save_paper_state():
             last_saved_utc=_utc_now(),
         )
         return True
-
     except Exception as exc:
         _database_status.update(
             configured=True,
@@ -177,44 +186,47 @@ def _save_paper_state():
 def _num(value, default=0.0):
     try:
         result = float(value or 0)
-        return result if math.isfinite(result) else default
+        if math.isfinite(result):
+            return result
+        return default
     except (TypeError, ValueError, OverflowError):
         return default
 
 
 def _accounting_diagnostics(trades, stored_realized):
-    sells = [
-        t for t in trades
-        if isinstance(t, dict)
-        and str(t.get("side", "")).upper() == "SELL"
-    ]
+    """Compare stored P/L to SELL records only; do not auto-correct it.
 
-    values = [
+    Legacy SELL records may not contain complete quantity/cost-basis details.
+    Therefore this is a warning check, not a ledger reconstruction.
+    """
+    sell_records = [
+        t for t in trades
+        if isinstance(t, dict) and str(t.get("side", "")).upper() == "SELL"
+    ]
+    known_values = [
         _num(t.get("realized_pnl_usd"), default=float("nan"))
-        for t in sells
+        for t in sell_records
         if t.get("realized_pnl_usd") is not None
     ]
-    values = [v for v in values if math.isfinite(v)]
-    sell_sum = sum(values)
-    missing = len(sells) - len(values)
+    known_values = [v for v in known_values if math.isfinite(v)]
+    sell_sum = sum(known_values)
+    missing_count = len(sell_records) - len(known_values)
     difference = stored_realized - sell_sum
     warning = None
-
-    if missing:
+    if missing_count:
         warning = (
-            f"{missing} SELL record(s) have no realized_pnl_usd; "
+            f"{missing_count} SELL record(s) have no realized_pnl_usd; "
             "full ledger reconciliation is not possible."
         )
     elif abs(difference) > 0.02:
         warning = (
-            "Stored realized P/L differs from recorded SELL P/L by "
-            f"{difference:.8f} USD. Stored value was preserved."
+            f"Stored realized P/L differs from recorded SELL P/L by "
+            f"{difference:.8f} USD. Stored value was preserved; no automatic correction."
         )
-
     return {
-        "sell_record_count": len(sells),
-        "sell_records_with_pnl": len(values),
-        "sell_records_missing_pnl": missing,
+        "sell_record_count": len(sell_records),
+        "sell_records_with_pnl": len(known_values),
+        "sell_records_missing_pnl": missing_count,
         "sum_recorded_sell_pnl_usd": round(sell_sum, 8),
         "stored_realized_pnl_usd": round(stored_realized, 8),
         "difference_usd": round(difference, 8),
@@ -223,74 +235,59 @@ def _accounting_diagnostics(trades, stored_realized):
 
 
 def _is_quarantined_trade(trade):
+    """Return True for trades explicitly quarantined by an operator or known bad quote."""
     if not isinstance(trade, dict):
         return False
     if trade.get("accounting_quarantined") is True:
         return True
-
+    # Specific historical bad quote confirmed in the provided paper-trade log.
     return (
         str(trade.get("side", "")).upper() == "SELL"
         and str(trade.get("token_symbol", "")).upper() == "MRBEAST"
-        and str(trade.get("token_address", ""))
-        == "4hqN5vhCG1q13qYUQvBhyMDDnpWKP98DoswDeDCVQaCn"
+        and str(trade.get("token_address", "")) == "4hqN5vhCG1q13qYUQvBhyMDDnpWKP98DoswDeDCVQaCn"
         and _num(trade.get("price_usd")) > 100.0
         and _num(trade.get("realized_pnl_usd")) > 1_000_000.0
     )
 
 
 def _reported_realized_pnl(trades):
+    """Sum recorded SELL P/L excluding quarantined trades; never mutate history."""
     total = 0.0
     included = 0
-    missing = 0
     quarantined = []
-
+    missing = 0
     for index, trade in enumerate(trades):
-        if (
-            not isinstance(trade, dict)
-            or str(trade.get("side", "")).upper() != "SELL"
-        ):
+        if not isinstance(trade, dict) or str(trade.get("side", "")).upper() != "SELL":
             continue
-
         if _is_quarantined_trade(trade):
             quarantined.append({
                 "index": index,
                 "token_symbol": trade.get("token_symbol"),
                 "token_address": trade.get("token_address"),
                 "reason": "implausible_historical_price_and_pnl",
-                "realized_pnl_usd_excluded": _num(
-                    trade.get("realized_pnl_usd")
-                ),
+                "realized_pnl_usd_excluded": _num(trade.get("realized_pnl_usd")),
             })
             continue
-
         if trade.get("realized_pnl_usd") is None:
             missing += 1
             continue
-
-        value = _num(
-            trade.get("realized_pnl_usd"),
-            default=float("nan"),
-        )
+        value = _num(trade.get("realized_pnl_usd"), default=float("nan"))
         if math.isfinite(value):
             total += value
             included += 1
         else:
             missing += 1
-
     return {
         "realized_pnl_usd": round(total, 8),
         "included_sell_records": included,
         "quarantined_sell_records": quarantined,
         "sell_records_missing_pnl": missing,
-        "note": (
-            "Computed from recorded SELL P/L fields; "
-            "legacy records may be incomplete."
-        ),
+        "note": "Computed from recorded SELL P/L fields; legacy records may be incomplete.",
     }
 
 
 def load_paper_state():
-    """Load persisted state; quarantine known bad accounting rows."""
+    """Load persisted state; quarantine known bad accounting rows without deleting history."""
     global _open_positions, _paper_trades, _realized_pnl_usd
 
     if not _database_url():
@@ -318,7 +315,6 @@ def load_paper_state():
             last_error=None,
             last_loaded_utc=_utc_now(),
         )
-
         if not row:
             return {
                 "ok": True,
@@ -332,56 +328,63 @@ def load_paper_state():
 
         positions = state.get("open_positions", {})
         trades = state.get("paper_trades", [])
-
         if not isinstance(positions, dict) or not isinstance(trades, list):
             raise ValueError("Saved positions or trades have an invalid format")
 
+        # Validate basic position structure before replacing current memory state.
         for address, position in positions.items():
             if not isinstance(position, dict):
                 raise ValueError(f"Invalid position record for {str(address)[:12]}")
-            if (
-                _num(position.get("quantity")) < 0
-                or _num(position.get("invested_usd")) < 0
-            ):
-                raise ValueError(f"Invalid quantity/cost for {str(address)[:12]}")
+            if _num(position.get("quantity")) < 0:
+                raise ValueError(f"Negative position quantity for {str(address)[:12]}")
+            if _num(position.get("invested_usd")) < 0:
+                raise ValueError(f"Negative position cost for {str(address)[:12]}")
 
         stored_realized = _num(state.get("realized_pnl_usd"))
         diagnostics = _accounting_diagnostics(trades, stored_realized)
         reconciled = _reported_realized_pnl(trades)
 
+        # The reported ledger is derived from SELL records excluding quarantined
+        # rows. The old stored aggregate is intentionally replaced below; its
+        # mismatch is historical and should not remain as a permanent warning.
+        # Any quarantined records remain visible in the accounting diagnostics.
+        #
+        # Keep the diagnostic calculation for audit, but do not use its stale
+        # stored-vs-ledger difference as the live warning after reconciliation.
+        # This prevents an obsolete $16.1M mismatch warning after the new total
+        # has been saved.
         diagnostics["historical_stored_value"] = stored_realized
         diagnostics["historical_stored_value_mismatch"] = diagnostics.get("warning")
         diagnostics["warning"] = None
 
+        # Preserve each original trade. Mark the known invalid MRBEAST sale instead
+        # of deleting it; the displayed aggregate excludes it.
         for trade in trades:
-            if isinstance(trade, dict) and _is_quarantined_trade(trade):
+            if _is_quarantined_trade(trade) and isinstance(trade, dict):
                 trade["accounting_quarantined"] = True
                 trade["accounting_quarantine_reason"] = (
-                    "Implausible historical quote; excluded from reported "
-                    "paper P/L pending review"
+                    "Implausible historical quote; excluded from reported paper P/L pending review"
                 )
 
-        _open_positions, _paper_trades = positions, trades
+        _open_positions = positions
+        _paper_trades = trades
         _realized_pnl_usd = reconciled["realized_pnl_usd"]
-
         warning_parts = []
         if reconciled["quarantined_sell_records"]:
             warning_parts.append(
-                f"{len(reconciled['quarantined_sell_records'])} "
-                "SELL record(s) quarantined from reported P/L."
+                f"{len(reconciled['quarantined_sell_records'])} SELL record(s) quarantined from reported P/L."
             )
+        _database_status["accounting_warning"] = " ".join(warning_parts) or None
 
-        _database_status["accounting_warning"] = (
-            " ".join(warning_parts) or None
-        )
+        if _database_status["accounting_warning"]:
+            logger.error("Paper accounting warning: %s", _database_status["accounting_warning"])
+        # Persist the quarantined annotation and reconciled aggregate while keeping
+        # the original trade row present for audit. A DB backup is still recommended.
         _save_paper_state()
-
         logger.info(
             "Loaded paper state: %s positions, %s trades.",
-            len(_open_positions),
-            len(_paper_trades),
+            len(_open_positions), len(_paper_trades),
         )
-
         return {
             "ok": True,
             "loaded": True,
@@ -393,7 +396,6 @@ def load_paper_state():
                 "stored_realized_pnl_preserved_in_source_state": stored_realized,
             },
         }
-
     except Exception as exc:
         _database_status.update(
             configured=True,
@@ -409,18 +411,15 @@ def _record_provider(provider, **updates):
 
 
 def get_price_diagnostics():
-    now = time.monotonic()
     result = {}
-
+    now = time.monotonic()
     for provider, details in _price_diagnostics.items():
         item = dict(details)
         item["cooldown_seconds_remaining"] = max(
-            0,
-            int(_provider_cooldown_until.get(provider, 0.0) - now),
+            0, int(_provider_cooldown_until.get(provider, 0.0) - now)
         )
         item["cooldown_reason"] = _provider_cooldown_reason.get(provider)
         result[provider] = item
-
     return result
 
 
@@ -438,39 +437,30 @@ def _set_provider_cooldown(provider, seconds, reason):
 
 async def _respect_birdeye_rate_limit():
     global _birdeye_last_request_at
-
     wait = BIRDEYE_MIN_REQUEST_INTERVAL_SECONDS - (
         time.monotonic() - _birdeye_last_request_at
     )
     if wait > 0:
         await asyncio.sleep(wait)
-
     _birdeye_last_request_at = time.monotonic()
 
 
 async def _fetch_birdeye_price(client, address):
     api_key = os.getenv("BIRDEYE_API_KEY", "").strip()
-
     if not api_key:
         _record_provider(
-            "birdeye",
-            last_error="BIRDEYE_API_KEY is not configured",
+            "birdeye", last_error="BIRDEYE_API_KEY is not configured"
         )
         return None
-
     if _provider_is_cooling():
         remain = max(
             1,
-            int(
-                _provider_cooldown_until.get("birdeye", 0)
-                - time.monotonic()
-            ),
+            int(_provider_cooldown_until.get("birdeye", 0) - time.monotonic()),
         )
         _record_provider("birdeye", last_error=f"provider cooldown ({remain}s)")
         return None
 
     await _respect_birdeye_rate_limit()
-
     _record_provider(
         "birdeye",
         requests=int(_price_diagnostics["birdeye"].get("requests", 0)) + 1,
@@ -480,7 +470,6 @@ async def _fetch_birdeye_price(client, address):
         last_error=None,
         last_prices_found=0,
     )
-
     try:
         response = await client.get(
             BIRDEYE_PRICE_URL,
@@ -491,7 +480,6 @@ async def _fetch_birdeye_price(client, address):
                 "x-chain": "solana",
             },
         )
-
         _record_provider("birdeye", last_http_status=response.status_code)
 
         if response.status_code == 429:
@@ -500,25 +488,17 @@ async def _fetch_birdeye_price(client, address):
                 cooldown = min(900, max(60, int(float(retry_after))))
             except (TypeError, ValueError, OverflowError):
                 cooldown = 300
-
             _set_provider_cooldown(
-                "birdeye",
-                cooldown,
-                f"HTTP 429; cooldown {cooldown}s",
+                "birdeye", cooldown, f"HTTP 429; cooldown {cooldown}s"
             )
             _record_provider(
-                "birdeye",
-                last_error=f"HTTP 429; cooldown {cooldown}s",
+                "birdeye", last_error=f"HTTP 429; cooldown {cooldown}s"
             )
             return None
-
         if response.status_code in (401, 403):
             _record_provider(
                 "birdeye",
-                last_error=(
-                    f"HTTP {response.status_code}; "
-                    "check API key and package access"
-                ),
+                last_error=f"HTTP {response.status_code}; check API key and package access",
             )
             return None
 
@@ -526,19 +506,13 @@ async def _fetch_birdeye_price(client, address):
         payload = response.json()
         data = payload.get("data") if isinstance(payload, dict) else None
         price = _num(data.get("value")) if isinstance(data, dict) else 0.0
-
         if price <= 0:
             _record_provider(
                 "birdeye",
                 last_error="HTTP 200 but no usable positive data.value price",
             )
             return None
-
-        _record_provider(
-            "birdeye",
-            last_prices_found=1,
-            last_error=None,
-        )
+        _record_provider("birdeye", last_prices_found=1, last_error=None)
         return price
 
     except httpx.HTTPStatusError as exc:
@@ -551,30 +525,31 @@ async def _fetch_birdeye_price(client, address):
         _record_provider("birdeye", last_error="request timed out")
     except httpx.HTTPError as exc:
         _record_provider(
-            "birdeye",
-            last_error=f"network error: {type(exc).__name__}",
+            "birdeye", last_error=f"network error: {type(exc).__name__}"
         )
     except (ValueError, AttributeError, TypeError) as exc:
         _record_provider(
-            "birdeye",
-            last_error=f"invalid response: {type(exc).__name__}",
+            "birdeye", last_error=f"invalid response: {type(exc).__name__}"
         )
-
     return None
 
 
 async def _fetch_prices_batch(client, token_addresses):
     results = {}
-
     for address in token_addresses:
         results[address] = await _fetch_birdeye_price(client, address)
         if _provider_is_cooling():
             break
-
     return results
 
 
 def _validate_price_jump(address, price, now, reference_price=None):
+    """Withhold a large move until a second nearby quote corroborates it.
+
+    If there is no recent cached quote, the open position's entry price can
+    serve as a conservative reference. A confirmed same-provider quote is not
+    proof of truth; it only reduces one-off bad-quote risk.
+    """
     previous = _price_cache.get(address)
     old_price = _num(previous.get("price")) if previous else 0.0
     age = (
@@ -584,23 +559,19 @@ def _validate_price_jump(address, price, now, reference_price=None):
 
     if old_price <= 0 or age > PRICE_JUMP_REFERENCE_MAX_AGE_SECONDS:
         old_price = _num(reference_price)
+        age = 0.0 if old_price > 0 else float("inf")
 
     if old_price <= 0:
         _pending_price_jumps.pop(address, None)
         return True
 
     jump = abs(price / old_price - 1.0) * 100.0
-
     if jump <= MAX_ACCEPTED_PRICE_JUMP_PCT:
         _pending_price_jumps.pop(address, None)
         return True
 
     pending = _pending_price_jumps.get(address)
-
-    if (
-        pending
-        and now - _num(pending.get("at")) <= PRICE_JUMP_PENDING_MAX_AGE_SECONDS
-    ):
+    if pending and now - _num(pending.get("at")) <= PRICE_JUMP_PENDING_MAX_AGE_SECONDS:
         pending_price = _num(pending.get("price"))
         if (
             pending_price > 0
@@ -609,8 +580,8 @@ def _validate_price_jump(address, price, now, reference_price=None):
         ):
             _pending_price_jumps.pop(address, None)
             message = (
-                f"{address[:10]} large move corroborated by "
-                f"consecutive quotes ({jump:.2f}%)"
+                f"{address[:10]} large move corroborated by consecutive quotes "
+                f"({jump:.2f}%)"
             )
             _record_provider("birdeye", last_price_jump_warning=message)
             logger.warning(message)
@@ -618,8 +589,8 @@ def _validate_price_jump(address, price, now, reference_price=None):
 
     _pending_price_jumps[address] = {"price": price, "at": now}
     message = (
-        f"{address[:10]} quote moved {jump:.2f}%; "
-        "awaiting confirming quote; ignored this cycle"
+        f"{address[:10]} quote moved {jump:.2f}%; awaiting confirming quote; "
+        "ignored this cycle"
     )
     _record_provider("birdeye", last_price_jump_warning=message)
     logger.warning(message)
@@ -627,7 +598,7 @@ def _validate_price_jump(address, price, now, reference_price=None):
 
 
 async def get_token_prices_usd(token_addresses, reference_prices=None):
-    """Return cached/fetched prices, withholding unconfirmed large jumps."""
+    """Return prices; withhold unconfirmed large jumps from the current cycle."""
     addresses = list(dict.fromkeys(str(a) for a in token_addresses if a))
     if not addresses:
         return {}
@@ -635,7 +606,6 @@ async def get_token_prices_usd(token_addresses, reference_prices=None):
     reference_prices = reference_prices or {}
     now = time.monotonic()
     prices, missing = {}, []
-
     for address in addresses:
         cached = _price_cache.get(address)
         if cached and now - cached["at"] < PRICE_CACHE_SECONDS:
@@ -650,15 +620,11 @@ async def get_token_prices_usd(token_addresses, reference_prices=None):
     async with _price_lock:
         now = time.monotonic()
         still_missing = []
-
         for address in missing:
             cached = _price_cache.get(address)
             if cached and now - cached["at"] < PRICE_CACHE_SECONDS:
                 prices[address] = cached["price"]
-            elif (
-                now - _price_last_request.get(address, 0.0)
-                >= PRICE_COOLDOWN_SECONDS
-            ):
+            elif now - _price_last_request.get(address, 0.0) >= PRICE_COOLDOWN_SECONDS:
                 still_missing.append(address)
 
         if not still_missing:
@@ -667,10 +633,7 @@ async def get_token_prices_usd(token_addresses, reference_prices=None):
         try:
             async with httpx.AsyncClient(
                 timeout=PRICE_TIMEOUT_SECONDS,
-                headers={
-                    "Accept": "application/json",
-                    "User-Agent": "MemecoinSpyBot/2.3",
-                },
+                headers={"Accept": "application/json", "User-Agent": "MemecoinSpyBot/2.3"},
             ) as client:
                 fetched = await _fetch_prices_batch(client, still_missing)
         except (httpx.HTTPError, ValueError, RuntimeError):
@@ -679,62 +642,41 @@ async def get_token_prices_usd(token_addresses, reference_prices=None):
         for address in still_missing:
             if address in fetched:
                 _price_last_request[address] = time.monotonic()
-
             price = _num(fetched.get(address))
             if price <= 0:
                 continue
 
             accepted_at = time.monotonic()
-
             if not _validate_price_jump(
-                address,
-                price,
-                accepted_at,
-                reference_prices.get(address),
+                address, price, accepted_at, reference_prices.get(address)
             ):
                 prices[address] = None
                 continue
 
-            _price_cache[address] = {
-                "at": accepted_at,
-                "price": price,
-            }
+            _price_cache[address] = {"at": accepted_at, "price": price}
             prices[address] = price
-
     return prices
 
 
 async def get_token_price_usd(token_address):
     if not token_address:
         return None
-    return (
-        await get_token_prices_usd([token_address])
-    ).get(token_address)
+    return (await get_token_prices_usd([token_address])).get(token_address)
 
 
 def record_paper_trade(
-    token_address,
-    side,
-    amount_usd,
-    price_usd,
-    token_symbol="",
-    source="manual",
-    reason=None,
+    token_address, side, amount_usd, price_usd,
+    token_symbol="", source="manual", reason=None
 ):
-    """Record a paper trade; prevent adding a second BUY to an open position."""
+    """Record a paper trade using USD notional and token quantity consistently."""
     global _realized_pnl_usd
 
     side = str(side).upper()
     amount_usd, price_usd = _num(amount_usd), _num(price_usd)
-
     if side not in ("BUY", "SELL"):
         raise ValueError("side must be BUY or SELL")
-
     if not token_address or amount_usd <= 0 or price_usd <= 0:
-        raise ValueError(
-            "token_address, amount_usd and price_usd must be valid"
-        )
-
+        raise ValueError("token_address, amount_usd and price_usd must be valid")
     if not math.isfinite(amount_usd) or not math.isfinite(price_usd):
         raise ValueError("amount_usd and price_usd must be finite")
 
@@ -751,38 +693,54 @@ def record_paper_trade(
     }
 
     if side == "BUY":
-        if token_address in _open_positions:
-            raise ValueError("position already open for this token")
-
         quantity = amount_usd / price_usd
         if not math.isfinite(quantity) or quantity <= 0:
             raise ValueError("calculated buy quantity is invalid")
 
+        position = _open_positions.get(token_address)
         _paper_trades.append(trade)
-        _open_positions[token_address] = {
-            "token_address": token_address,
-            "token_symbol": trade["token_symbol"],
-            "entry_price_usd": price_usd,
-            "current_price_usd": price_usd,
-            "invested_usd": amount_usd,
-            "quantity": quantity,
-            "unrealized_pnl_usd": 0.0,
-            "opened_at": time.time(),
-        }
-
+        if position is None:
+            _open_positions[token_address] = {
+                "token_address": token_address,
+                "token_symbol": trade["token_symbol"],
+                "entry_price_usd": price_usd,
+                "current_price_usd": price_usd,
+                "invested_usd": amount_usd,
+                "quantity": quantity,
+                "unrealized_pnl_usd": 0.0,
+                "opened_at": time.time(),
+            }
+        else:
+            old_qty = _num(position.get("quantity"))
+            old_invested = _num(position.get("invested_usd"))
+            if old_qty <= 0 or old_invested < 0:
+                _paper_trades.pop()
+                raise ValueError("existing position has invalid quantity/cost")
+            total_qty = old_qty + quantity
+            if total_qty <= 0 or not math.isfinite(total_qty):
+                _paper_trades.pop()
+                raise ValueError("combined position quantity is invalid")
+            position["entry_price_usd"] = (
+                _num(position.get("entry_price_usd")) * old_qty
+                + price_usd * quantity
+            ) / total_qty
+            position["quantity"] = total_qty
+            position["invested_usd"] = old_invested + amount_usd
+            position["current_price_usd"] = price_usd
+            position["unrealized_pnl_usd"] = (
+                total_qty * price_usd - old_invested - amount_usd
+            )
     else:
         position = _open_positions.get(token_address)
         if not position:
-            raise ValueError(
-                "cannot sell: no open paper position for this token"
-            )
+            raise ValueError("cannot sell: no open paper position for this token")
 
         qty = _num(position.get("quantity"))
         invested = _num(position.get("invested_usd"))
-
         if qty <= 0 or invested < 0:
             raise ValueError("existing position has invalid quantity/cost")
 
+        # amount_usd is the requested sale notional; cap at the full position.
         sell_qty = min(qty, amount_usd / price_usd)
         if sell_qty <= 0 or not math.isfinite(sell_qty):
             raise ValueError("calculated sell quantity is invalid")
@@ -797,7 +755,6 @@ def record_paper_trade(
         trade["quantity_sold"] = sell_qty
         trade["cost_basis_usd"] = round(cost, 8)
         trade["realized_pnl_usd"] = round(realized, 8)
-
         _paper_trades.append(trade)
         _realized_pnl_usd += realized
 
@@ -816,80 +773,48 @@ def record_paper_trade(
 
 
 def open_paper_position(
-    token_address,
-    token_symbol="",
-    amount_usd=10.0,
-    price_usd=None,
-    source="auto",
-    max_open_positions=None,
-    metadata=None,
+    token_address, token_symbol="", amount_usd=10.0, price_usd=None,
+    source="auto", max_open_positions=None, metadata=None
 ):
     if not token_address:
         raise ValueError("token_address is required")
-
-    if (
-        price_usd is None
-        or _num(price_usd) <= 0
-        or _num(amount_usd) <= 0
-    ):
-        raise ValueError("positive price_usd and amount_usd are required")
-
+    if price_usd is None or _num(price_usd) <= 0:
+        raise ValueError("price_usd is required and must be positive")
+    if _num(amount_usd) <= 0:
+        raise ValueError("amount_usd must be positive")
     if token_address in _open_positions:
         return {
-            "ok": True,
-            "mode": "paper",
-            "skipped": True,
+            "ok": True, "mode": "paper", "skipped": True,
             "reason": "position_already_open",
         }
-
-    if (
-        max_open_positions is not None
-        and len(_open_positions) >= int(max_open_positions)
-    ):
+    if max_open_positions is not None and len(_open_positions) >= int(max_open_positions):
         return {
-            "ok": True,
-            "mode": "paper",
-            "skipped": True,
+            "ok": True, "mode": "paper", "skipped": True,
             "reason": "max_open_positions_reached",
         }
 
     result = record_paper_trade(
-        token_address,
-        "BUY",
-        amount_usd,
-        price_usd,
-        token_symbol,
-        source,
+        token_address, "BUY", amount_usd, price_usd, token_symbol, source
     )
-
     position = _open_positions.get(token_address)
     if position is not None and metadata:
         position["metadata"] = dict(metadata)
         _save_paper_state()
-
     return result
 
 
-def _close_position(
-    address,
-    position,
-    price,
-    reason,
-    observed_change_pct=None,
-):
+def _close_position(address, position, price, reason, observed_change_pct=None):
     global _realized_pnl_usd
 
     qty = _num(position.get("quantity"))
     invested = _num(position.get("invested_usd"))
     entry = _num(position.get("entry_price_usd"))
-
     if qty <= 0 or invested < 0 or price <= 0 or entry <= 0:
         logger.error("Refusing to close invalid paper position for %s", address)
         return False
 
     value = qty * price
     pnl = value - invested
-
     if not math.isfinite(value) or not math.isfinite(pnl):
         logger.error("Refusing to close non-finite paper position for %s", address)
         return False
@@ -902,7 +827,6 @@ def _close_position(
         else None
     )
     change = (price / entry - 1) * 100
-
     trade = {
         "token_address": address,
         "token_symbol": position.get("token_symbol", address[:8]),
@@ -918,8 +842,7 @@ def _close_position(
         "stop_loss_threshold_pct": STOP_LOSS_PCT,
         "take_profit_threshold_pct": TAKE_PROFIT_PCT,
         "observed_change_pct": round(
-            change if observed_change_pct is None else observed_change_pct,
-            4,
+            change if observed_change_pct is None else observed_change_pct, 4
         ),
         "quantity_sold": qty,
         "cost_basis_usd": round(invested, 8),
@@ -935,157 +858,145 @@ def _close_position(
 
 
 async def update_paper_prices():
-    """Update safe marks and close only on accepted, non-extreme quotes."""
     updated = closed = errors = 0
     addresses = list(_open_positions)
-
     if not addresses:
         return {
-            "updated": 0,
-            "closed": 0,
-            "price_errors": 0,
+            "updated": 0, "closed": 0, "price_errors": 0,
             "note": "No open positions",
         }
 
-    references = {
+    # Entry prices provide a reference when the in-memory quote cache is empty.
+    reference_prices = {
         address: _num(position.get("current_price_usd"))
         or _num(position.get("entry_price_usd"))
         for address, position in _open_positions.items()
     }
-
-    prices = await get_token_prices_usd(addresses, references)
+    prices = await get_token_prices_usd(addresses, reference_prices)
 
     for address in addresses:
         position = _open_positions.get(address)
         if not position:
             continue
-
         price = prices.get(address)
-        if price is None or not math.isfinite(price) or price <= 0:
+        if price is None or price <= 0:
             errors += 1
             continue
 
+        # Validate the quote BEFORE changing the marked value/P&L. A quote that
+        # implies an extreme stop-loss or take-profit is recorded as suspect,
+        # but the previous trusted mark and P&L remain intact pending review.
         entry = _num(position.get("entry_price_usd"))
-        qty = _num(position.get("quantity"))
-        invested = _num(position.get("invested_usd"))
-
-        if entry <= 0 or qty <= 0 or invested < 0:
-            errors += 1
-            message = (
-                f"{position.get('token_symbol', address[:8])}: "
-                "invalid position values; automatic close skipped"
-            )
-            position["price_safety_warning"] = message
-            _record_provider("birdeye", last_price_jump_warning=message)
-            logger.error(message)
-            continue
-
-        change = (price / entry - 1.0) * 100.0
         opened = _num(position.get("opened_at"))
-
-        if opened and time.time() - opened < MIN_HOLD_SECONDS:
-            position["current_price_usd"] = price
-            position["unrealized_pnl_usd"] = round(
-                qty * price - invested, 8
-            )
-            position["last_price_update_utc"] = _utc_now()
-            updated += 1
+        if entry <= 0:
+            errors += 1
+            position["price_safety_warning"] = "Invalid entry price; quote withheld"
             continue
+
+        change = (price / entry - 1) * 100
+        if opened and time.time() - opened < MIN_HOLD_SECONDS:
+            # During the minimum hold window, still validate the raw move below
+            # before allowing the quote to update the mark.
+            pass
 
         if change <= STOP_LOSS_PCT:
             overshoot = STOP_LOSS_PCT - change
-
             if overshoot > MAX_STOP_LOSS_OVERSHOOT_PCT:
                 errors += 1
                 message = (
-                    f"{position.get('token_symbol', address[:8])} quote "
-                    f"implies {change:.2f}% from entry; extreme stop-loss "
-                    "quote requires review; previous marked value retained"
+                    f"{position.get('token_symbol', address[:8])} quote implies "
+                    f"{change:.2f}% from entry; suspect stop-loss quote withheld; "
+                    "previous marked value and P/L retained pending verification"
                 )
-                position["price_safety_warning"] = message
                 position["last_suspect_price_usd"] = price
                 position["last_suspect_price_utc"] = _utc_now()
-                _record_provider(
-                    "birdeye",
-                    last_price_jump_warning=message,
-                )
+                position["price_safety_warning"] = message
+                _record_provider("birdeye", last_price_jump_warning=message)
                 logger.error(message)
                 continue
-
-            position["current_price_usd"] = price
-            position["unrealized_pnl_usd"] = round(
-                qty * price - invested, 8
-            )
-            position["last_price_update_utc"] = _utc_now()
-            updated += 1
-            position.pop("price_safety_warning", None)
-            closed += int(
-                _close_position(
-                    address,
-                    position,
-                    price,
-                    "stop_loss_5pct",
-                    change,
-                )
-            )
-            continue
 
         if change >= TAKE_PROFIT_PCT:
             overshoot = change - TAKE_PROFIT_PCT
-
             if overshoot > MAX_TAKE_PROFIT_OVERSHOOT_PCT:
                 errors += 1
                 message = (
-                    f"{position.get('token_symbol', address[:8])} quote "
-                    f"implies +{change:.2f}% from entry; extreme take-profit "
-                    "quote requires review; previous marked value retained"
+                    f"{position.get('token_symbol', address[:8])} quote implies "
+                    f"+{change:.2f}% from entry; suspect take-profit quote withheld; "
+                    "previous marked value and P/L retained pending verification"
                 )
-                position["price_safety_warning"] = message
                 position["last_suspect_price_usd"] = price
                 position["last_suspect_price_utc"] = _utc_now()
-                _record_provider(
-                    "birdeye",
-                    last_price_jump_warning=message,
-                )
+                position["price_safety_warning"] = message
+                _record_provider("birdeye", last_price_jump_warning=message)
                 logger.error(message)
                 continue
 
-            position["current_price_usd"] = price
-            position["unrealized_pnl_usd"] = round(
-                qty * price - invested, 8
-            )
-            position["last_price_update_utc"] = _utc_now()
-            updated += 1
+        # Only accepted quotes may update the current mark and unrealized P/L.
+        position["current_price_usd"] = price
+        qty = _num(position.get("quantity"))
+        invested = _num(position.get("invested_usd"))
+        position["unrealized_pnl_usd"] = round(qty * price - invested, 8)
+        position["last_price_update_utc"] = _utc_now()
+        updated += 1
+
+        if opened and time.time() - opened < MIN_HOLD_SECONDS:
+            continue
+
+        # Fail-safe auto-close guard:
+        # - normal TP/SL signals can close as before;
+        # - extreme prices are not allowed to trigger an automatic sale solely
+        #   because a single provider repeatedly reports an implausible quote.
+        # The position remains open and is flagged for review. This can delay a
+        # genuine crash exit, so it is deliberately visible in diagnostics.
+        if change >= TAKE_PROFIT_PCT:
+            overshoot = change - TAKE_PROFIT_PCT
+            if overshoot > MAX_TAKE_PROFIT_OVERSHOOT_PCT:
+                errors += 1
+                message = (
+                    f"{position.get('token_symbol', address[:8])} quote implies "
+                    f"+{change:.2f}% from entry; auto take-profit withheld "
+                    f"(overshoot {overshoot:.2f}% exceeds "
+                    f"{MAX_TAKE_PROFIT_OVERSHOOT_PCT:.2f}%)"
+                )
+                position["price_safety_warning"] = message
+                _record_provider("birdeye", last_price_jump_warning=message)
+                logger.error(message)
+                continue
             position.pop("price_safety_warning", None)
             closed += int(
                 _close_position(
-                    address,
-                    position,
-                    price,
-                    "take_profit_10pct",
-                    change,
+                    address, position, price, "take_profit_10pct", change
                 )
             )
-            continue
-
-        position["current_price_usd"] = price
-        position["unrealized_pnl_usd"] = round(
-            qty * price - invested, 8
-        )
-        position["last_price_update_utc"] = _utc_now()
-        position.pop("price_safety_warning", None)
-        updated += 1
+        elif change <= STOP_LOSS_PCT:
+            overshoot = STOP_LOSS_PCT - change
+            if overshoot > MAX_STOP_LOSS_OVERSHOOT_PCT:
+                errors += 1
+                message = (
+                    f"{position.get('token_symbol', address[:8])} quote implies "
+                    f"{change:.2f}% from entry; auto stop-loss withheld "
+                    f"(overshoot {overshoot:.2f}% exceeds "
+                    f"{MAX_STOP_LOSS_OVERSHOOT_PCT:.2f}%). Verify price; "
+                    "position remains open."
+                )
+                position["price_safety_warning"] = message
+                _record_provider("birdeye", last_price_jump_warning=message)
+                logger.error(message)
+                continue
+            position.pop("price_safety_warning", None)
+            closed += int(
+                _close_position(
+                    address, position, price, "stop_loss_5pct", change
+                )
+            )
+        else:
+            position.pop("price_safety_warning", None)
 
     _save_paper_state()
-
     if not _open_positions:
         note = "No open positions"
     elif updated:
-        note = (
-            "Some prices updated; some unavailable or flagged"
-            if errors
-            else "Paper prices updated"
-        )
+        note = "Some prices updated; some unavailable" if errors else "Paper prices updated"
     elif _provider_is_cooling():
         note = "Birdeye rate-limited; waiting before retry"
     else:
@@ -1106,9 +1017,18 @@ def get_paper_status():
         _num(p.get("quantity")) * _num(p.get("current_price_usd"))
         for p in positions
     )
+    # Derive unrealized P/L from the same marks used for portfolio value so the
+    # totals cannot drift from stale per-position cached P/L fields.
     unrealized = sum(
-        _num(p.get("unrealized_pnl_usd")) for p in positions
+        _num(p.get("quantity")) * _num(p.get("current_price_usd"))
+        - _num(p.get("invested_usd"))
+        for p in positions
     )
+    for p in positions:
+        p["unrealized_pnl_usd"] = round(
+            _num(p.get("quantity")) * _num(p.get("current_price_usd"))
+            - _num(p.get("invested_usd")), 8
+        )
 
     return {
         "mode": "paper",
@@ -1127,8 +1047,12 @@ def get_paper_status():
         "accounting": _reported_realized_pnl(_paper_trades),
         "price_diagnostics": get_price_diagnostics(),
         "note": (
-            "Paper only. Same-provider repeated quotes are not independent "
-            "verification; extreme TP/SL overshoots remain open for review."
+            "Paper simulation only; no real orders. Extreme price quotes are "
+            "recorded as suspect without changing the last trusted mark or P/L. "
+            "Extreme TP/SL overshoots remain open pending verification; this can "
+            "delay a genuine exit. Same-provider confirmation is not independent "
+            "verification. Realized P/L is calculated from recorded SELL rows, "
+            "excluding quarantined rows without deleting history."
         ),
     }
 
