@@ -22,6 +22,7 @@ MIN_VOLUME_24H_USD = float(os.getenv("MIN_VOLUME_24H_USD", "20000"))
 MIN_BUYS_SELLS_RATIO = float(os.getenv("MIN_BUYS_SELLS_RATIO", "1.0"))
 MIN_TRADES_24H = max(0, int(os.getenv("MIN_TRADES_24H", "20")))
 MAX_PRICE_CHANGE_24H_PCT = max(0.0, float(os.getenv("MAX_PRICE_CHANGE_24H_PCT", "100")))
+MAX_NEGATIVE_PRICE_CHANGE_24H_PCT = max(0.0, float(os.getenv("MAX_NEGATIVE_PRICE_CHANGE_24H_PCT", "30")))
 CACHE_SECONDS = max(60, int(os.getenv("SIGNAL_CACHE_SECONDS", "150")))
 REQUEST_TIMEOUT_SECONDS = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "15"))
 LISTING_LIMIT = max(1, min(100, int(os.getenv("BIRDEYE_LISTING_LIMIT", "100"))))
@@ -279,6 +280,8 @@ async def get_signal_candidates(
             reasons.append("missing_price_change_24h")
         elif abs(change_24h) > MAX_PRICE_CHANGE_24H_PCT:
             reasons.append("extreme_price_change_24h")
+        elif change_24h < -MAX_NEGATIVE_PRICE_CHANGE_24H_PCT:
+            reasons.append("negative_price_change_24h_exceeded")
         if not candidate.get("token_address"):
             reasons.append("missing_token_address")
         if price <= 0:
@@ -310,6 +313,7 @@ async def get_signal_candidates(
                     "min_volume_24h_usd": min_volume,
                     "min_buys_sells_ratio": min_ratio,
                     "max_absolute_price_change_24h_pct": MAX_PRICE_CHANGE_24H_PCT,
+                    "max_negative_price_change_24h_pct": MAX_NEGATIVE_PRICE_CHANGE_24H_PCT,
                     "require_price_change_24h": True},
         "candidate_preview": [{"symbol": item.get("symbol"),
                                 "token_address": item.get("token_address"),
@@ -322,11 +326,13 @@ async def get_signal_candidates(
         "rejection_counts": {reason: sum(1 for item in rejected if reason in item["rejection_reasons"])
                              for reason in ("liquidity_below_minimum", "volume_24h_below_minimum",
                                             "buy_sell_activity_insufficient", "trade_count_24h_below_minimum",
-                                            "extreme_price_change_24h", "missing_price_change_24h",
-                                            "missing_token_address", "missing_or_zero_price")},
+                                            "extreme_price_change_24h", "negative_price_change_24h_exceeded",
+                                            "missing_price_change_24h", "missing_token_address",
+                                            "missing_or_zero_price")},
         "additional_filters": {
             "min_trades_24h": MIN_TRADES_24H,
             "max_absolute_price_change_24h_pct": MAX_PRICE_CHANGE_24H_PCT,
+            "max_negative_price_change_24h_pct": MAX_NEGATIVE_PRICE_CHANGE_24H_PCT,
             "require_price_change_24h": True,
             "require_nonzero_buys_and_sells": True,
         },
