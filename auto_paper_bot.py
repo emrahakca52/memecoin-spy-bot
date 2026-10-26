@@ -276,7 +276,7 @@ def bot_status():
         "filter_notes": {
             "price_change_filter_source": "signal_engine.py",
             "max_absolute_price_change_24h_pct_is_effective": True,
-            "max_negative_price_change_24h_pct_is_separate_effective_filter": False,
+            "max_negative_price_change_24h_pct_is_separate_effective_filter": True,
             "note": (
                 "signal_engine applies the absolute price-change threshold. "
                 "The separate negative threshold is shown for compatibility "
