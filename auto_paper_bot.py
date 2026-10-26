@@ -278,9 +278,9 @@ def bot_status():
             "max_absolute_price_change_24h_pct_is_effective": True,
             "max_negative_price_change_24h_pct_is_separate_effective_filter": True,
             "note": (
-                "signal_engine applies the absolute price-change threshold. "
-                "The separate negative threshold is shown for compatibility "
-                "but is not independently applied."
+                "signal_engine.py enforces both the absolute 24h price-change "
+                "limit and the separate maximum-negative-change limit. "
+                "Tokens below the negative threshold are rejected."
             ),
         },
         "last_run_utc": _last_run,
