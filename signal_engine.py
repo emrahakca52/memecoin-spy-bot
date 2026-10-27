@@ -28,6 +28,7 @@ _jupiter_lock = asyncio.Lock()
 _last_jupiter_request = 0.0
 _cache = {"timestamp": 0.0, "candidates": [], "diagnostics": {}}
 _last_dexscreener_discovery = {}
+_last_geckoterminal_discovery = {}
 
 
 def _num(value: Any, default: float = 0.0) -> float:
@@ -214,6 +215,75 @@ async def _discover_dexscreener(client: httpx.AsyncClient) -> list[dict]:
     return candidates
 
 
+async def _discover_geckoterminal(client: httpx.AsyncClient) -> list[dict]:
+    """Fallback discovery from GeckoTerminal when DexScreener is rate-limited."""
+    global _last_geckoterminal_discovery
+    results = []
+    diagnostics = {"feeds": [], "candidate_count": 0}
+    seen = set()
+    for endpoint in ("trending_pools", "new_pools"):
+        url = f"https://api.geckoterminal.com/api/v2/networks/solana/{endpoint}"
+        feed = {"feed": endpoint, "pool_count": 0, "error": None}
+        try:
+            response = await client.get(
+                url,
+                params={"include": "base_token"},
+                headers={"Accept": "application/json;version=20230203"},
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except Exception as exc:
+            feed["error"] = f"{type(exc).__name__}: {str(exc)[:160]}"
+            diagnostics["feeds"].append(feed)
+            continue
+        pools = payload.get("data", []) if isinstance(payload, dict) else []
+        included = payload.get("included", []) if isinstance(payload, dict) else []
+        token_by_id = {
+            item.get("id"): item.get("attributes", {})
+            for item in included
+            if isinstance(item, dict) and item.get("type") == "token"
+        }
+        feed["pool_count"] = len(pools) if isinstance(pools, list) else 0
+        for pool in pools if isinstance(pools, list) else []:
+            if not isinstance(pool, dict):
+                continue
+            attrs = pool.get("attributes") or {}
+            rel = pool.get("relationships") or {}
+            base_rel = (rel.get("base_token") or {}).get("data") or {}
+            token_id = base_rel.get("id") or ""
+            address = token_id.split("solana_", 1)[-1] if token_id.startswith("solana_") else ""
+            if not address or address in seen:
+                continue
+            seen.add(address)
+            token_attrs = token_by_id.get(token_id, {})
+            txns = (attrs.get("transactions") or {}).get("h24") or {}
+            volume = attrs.get("volume_usd") or {}
+            changes = attrs.get("price_change_percentage") or {}
+            buys = int(_num(txns.get("buys")))
+            sells = int(_num(txns.get("sells")))
+            results.append({
+                "token_address": address,
+                "symbol": token_attrs.get("symbol") or (attrs.get("name", "").split(" / ")[0] if attrs.get("name") else "UNKNOWN"),
+                "name": token_attrs.get("name") or attrs.get("name") or "",
+                "price_usd": _num(attrs.get("base_token_price_usd")),
+                "liquidity_usd": _num(attrs.get("reserve_in_usd")),
+                "volume_24h_usd": _num(volume.get("h24")),
+                "buys_24h": buys,
+                "sells_24h": sells,
+                "buy_sell_ratio": buys / sells if sells > 0 else 0.0,
+                "trade_count_24h": buys + sells,
+                "price_change_24h_pct": _num(changes.get("h24")),
+                "price_change_24h_present": _has_finite_number(changes.get("h24")),
+                "market_cap_usd": _num(attrs.get("market_cap_usd") or attrs.get("fdv_usd")),
+                "provider": "GeckoTerminal",
+                "url": f"https://www.geckoterminal.com/solana/pools/{attrs.get('address', '')}",
+            })
+        diagnostics["feeds"].append(feed)
+    diagnostics["candidate_count"] = len(results)
+    _last_geckoterminal_discovery = diagnostics
+    return results
+
+
 async def get_signal_candidates(
     min_liquidity_usd: float | None = None,
     min_volume_24h_usd: float | None = None,
@@ -254,12 +324,22 @@ async def get_signal_candidates(
                     except Exception as fallback_exc:
                         fallback_error = f"{type(fallback_exc).__name__}: {fallback_exc}"
                         candidates = []
+                    if not candidates:
+                        try:
+                            candidates = await _discover_geckoterminal(client)
+                            if candidates:
+                                provider = "GeckoTerminal fallback"
+                        except Exception as gecko_exc:
+                            _last_geckoterminal_discovery = {
+                                "error": f"{type(gecko_exc).__name__}: {str(gecko_exc)[:160]}"
+                            }
             diagnostics = {
                 "provider": provider,
                 "jupiter_error": jupiter_error,
                 "fallback_error": fallback_error,
                 "candidate_count": len(candidates),
                 "fallback_discovery": dict(_last_dexscreener_discovery),
+                "geckoterminal_discovery": dict(_last_geckoterminal_discovery),
                 "mode": TRADING_MODE,
             }
             _cache.update({"timestamp": now, "candidates": candidates, "diagnostics": diagnostics})
