@@ -94,6 +94,7 @@ async def _loop(stop_event):
                 "provider": data.get("provider"),
                 "checked": data.get("checked", 0),
                 "candidate_count": len(signals),
+                "filter_diagnostics": data.get("filter_diagnostics", {}),
             }
             logger.info("Signals found: %s", len(signals))
 
@@ -193,6 +194,16 @@ async def stop_bot():
     return bot_status()
 
 def bot_status():
+    copyfomo_summary = []
+    for item in _last_copyfomo_checks[-8:]:
+        gate = item.get("gate") if isinstance(item.get("gate"), dict) else item
+        copyfomo_summary.append({
+            "symbol": item.get("symbol"),
+            "passed": gate.get("passed"),
+            "stage": gate.get("stage"),
+            "decision": gate.get("decision"),
+            "rejection_reasons": gate.get("rejection_reasons", []),
+        })
     return {
         "mode": "paper",
         "running": _task is not None and not _task.done(),
@@ -204,6 +215,9 @@ def bot_status():
         "stop_loss_pct": STOP_LOSS_PCT,
         "last_run_utc": _last_run,
         "last_error": _last_error,
+        "last_scan": _last_scan,
+        "last_price_update": _last_price_update,
+        "last_copyfomo_checks": copyfomo_summary,
         "last_skipped": _last_skipped[-8:],
         "copyfomo_gate_enabled": COPYFOMO_GATE_ENABLED,
         "warning": "Paper only.",
