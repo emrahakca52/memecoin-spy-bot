@@ -1,3 +1,4 @@
+# CONFIG VERSION 2
 import os
 
 MODE = "paper"
