@@ -89,7 +89,7 @@ class ExtremeQuoteExitGuardTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(paper_engine._paper_trades, [])
 
-    async def test_independent_price_corroboration_marks_extreme_quote_but_does_not_sell(self):
+    async def test_independently_verified_crash_triggers_paper_stop_loss(self):
         with (
             patch.object(
                 paper_engine, "get_token_prices_usd",
@@ -103,14 +103,14 @@ class ExtremeQuoteExitGuardTests(unittest.IsolatedAsyncioTestCase):
         ):
             result = await paper_engine.update_paper_prices()
 
-        self.assertEqual(result["closed"], 0)
-        self.assertEqual(result["updated"], 1)
-        position = paper_engine._open_positions["token-address"]
-        self.assertEqual(position["price_mark_status"], "independently_verified_extreme_quote")
-        self.assertEqual(position["price_verification_provider"], "DexScreener")
-        self.assertAlmostEqual(position["current_price_usd"], 0.00102)
-        self.assertAlmostEqual(position["unrealized_pnl_usd"], -9.898)
-        self.assertEqual(paper_engine._paper_trades, [])
+        self.assertEqual(result["closed"], 1)
+        self.assertNotIn("token-address", paper_engine._open_positions)
+        self.assertEqual(len(paper_engine._paper_trades), 1)
+        trade = paper_engine._paper_trades[0]
+        self.assertEqual(trade["side"], "SELL")
+        self.assertEqual(trade["reason"], "stop_loss_5pct")
+        self.assertAlmostEqual(trade["price_usd"], 0.00102)
+        self.assertAlmostEqual(trade["realized_pnl_usd"], -9.898)
 
     async def test_normal_stop_loss_can_still_close_position(self):
         with (
