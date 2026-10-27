@@ -11,7 +11,7 @@ import httpx
 
 TRADING_MODE = "paper"
 REAL_TRADING_ENABLED = False
-JUPITER_BASE_URL = os.getenv("JUPITER_BASE_URL", "https://lite-api.jup.ag").rstrip("/")
+JUPITER_BASE_URL = os.getenv("JUPITER_BASE_URL", "https://api.jup.ag").rstrip("/")
 JUPITER_API_KEY = os.getenv("JUPITER_API_KEY", "").strip()
 JUPITER_MIN_INTERVAL_SECONDS = float(os.getenv("JUPITER_MIN_INTERVAL_SECONDS", "2.1"))
 
