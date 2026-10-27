@@ -119,7 +119,6 @@ async def _get_json(client: httpx.AsyncClient, url: str, params: dict[str, Any])
         # waste more quota, so pause discovery for six hours and serve cached
         # results (if any) until a later retry.
         if "compute units usage limit exceeded" in detail.lower():
-            global _cooldown_until, _cooldown_reason
             delay = max(21600, COOLDOWN_DEFAULT_SECONDS)
             _cooldown_until = time.monotonic() + delay
             _cooldown_reason = f"Birdeye CU limit exceeded; retry after cooldown ({delay}s)"
