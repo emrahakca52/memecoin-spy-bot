@@ -344,15 +344,9 @@ def load_paper_state():
         diagnostics = _accounting_diagnostics(trades, stored_realized)
         reconciled = _reported_realized_pnl(trades)
 
-        # The reported ledger is derived from SELL records excluding quarantined
-        # rows. The old stored aggregate is intentionally replaced below; its
-        # mismatch is historical and should not remain as a permanent warning.
-        # Any quarantined records remain visible in the accounting diagnostics.
-        #
-        # Keep the diagnostic calculation for audit, but do not use its stale
-        # stored-vs-ledger difference as the live warning after reconciliation.
-        # This prevents an obsolete $16.1M mismatch warning after the new total
-        # has been saved.
+        # Keep the historical stored-vs-ledger comparison for audit. A complete
+        # ledger can safely rebuild the aggregate; an incomplete legacy ledger
+        # must not overwrite the stored lifetime total with a partial sum.
         diagnostics["historical_stored_value"] = stored_realized
         diagnostics["historical_stored_value_mismatch"] = diagnostics.get("warning")
         diagnostics["warning"] = None
