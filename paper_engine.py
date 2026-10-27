@@ -529,7 +529,7 @@ def get_paper_status():
     quarantined_sell_costs = sum(1 for t in sell_rows if t.get("accounting_quarantined") and "estimated_transaction_cost_usd" not in t)
     open_missing_entry_costs = sum(
         1 for p in _open_positions.values()
-        if not _has_finite_number(p.get("estimated_entry_cost_usd"))
+        if p.get("estimated_entry_cost_usd") is None or isinstance(p.get("estimated_entry_cost_usd"), bool) or not math.isfinite(_num(p.get("estimated_entry_cost_usd"), float("nan")))
     )
     legacy_cost_missing = sell_missing_costs > 0 or open_missing_entry_costs > 0
     partial_net = sum(
