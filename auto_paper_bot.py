@@ -30,8 +30,8 @@ MIN_BUYS_SELLS_RATIO = float(os.getenv("MIN_BUYS_SELLS_RATIO", "1.0"))
 # Keep status aligned with the actual signal_engine filters.
 MAX_ABSOLUTE_PRICE_CHANGE_24H_PCT = MAX_PRICE_CHANGE_24H_PCT
 
-# This is an effective independent threshold in signal_engine.py; keep the
-# status diagnostics aligned with that implementation.
+# Retained for status/API compatibility only. signal_engine currently applies
+# the absolute threshold above, not a separate negative-only threshold.
 MAX_NEGATIVE_PRICE_CHANGE_24H_PCT = max(
     0.0, float(os.getenv("MAX_NEGATIVE_PRICE_CHANGE_24H_PCT", "30"))
 )
@@ -63,9 +63,6 @@ async def _loop(stop_event):
 
     while not stop_event.is_set():
         try:
-            # Publish a heartbeat before network calls, so status does not stay
-            # null merely because a provider request is slow or stalled.
-            _last_run = _utc_now()
             _last_error = None
             _last_skipped = []
             _last_price_update = await update_paper_prices()
@@ -158,8 +155,16 @@ async def _loop(stop_event):
 
             prices = {}
             if valid_signals and not stop_event.is_set():
+                # Compare the live quote against the discovery/signal quote.
+                # This is especially important on first entry, when no cached
+                # accepted price exists yet. A repeated Birdeye quote cannot
+                # override a large disagreement with this reference.
                 prices = await get_token_prices_usd(
-                    [address for _, address, _, _ in valid_signals]
+                    [address for _, address, _, _ in valid_signals],
+                    reference_prices={
+                        address: signal_price
+                        for _, address, _, signal_price in valid_signals
+                    },
                 )
 
             for token, address, symbol, signal_price in valid_signals:
@@ -221,7 +226,7 @@ async def _loop(stop_event):
             _last_error = f"{type(exc).__name__}: {str(exc)[:200]}"
             logger.exception("Paper bot scan cycle failed: %s", _last_error)
         finally:
-            # Timestamp records the latest completed/failed cycle.
+            # Timestamp is recorded even when a cycle raises an exception.
             _last_run = _utc_now()
 
         try:
@@ -281,13 +286,12 @@ def bot_status():
             "max_absolute_price_change_24h_pct_is_effective": True,
             "max_negative_price_change_24h_pct_is_separate_effective_filter": True,
             "note": (
-                "signal_engine.py enforces both the absolute 24h price-change "
-                "limit and the separate maximum-negative-change limit. "
-                "Tokens below the negative threshold are rejected."
+                "signal_engine applies the absolute price-change threshold. "
+                "The separate negative threshold is shown for compatibility "
+                "but is not independently applied."
             ),
         },
         "last_run_utc": _last_run,
-        "last_run_utc_semantics": "Most recent paper scan cycle heartbeat/completion UTC",
         "last_error": _last_error,
         "last_price_update": _last_price_update,
         "last_scan": _last_scan,
