@@ -1028,8 +1028,12 @@ async def update_paper_prices():
         invested = _num(position.get("invested_usd"))
         position["unrealized_pnl_usd"] = round(qty * price - invested, 8)
         position["last_price_update_utc"] = _utc_now()
-        if position.get("price_mark_status") != "unverified_extreme_quote":
-            position.pop("price_mark_status", None)
+        # This quote passed the price-jump validator and the TP/SL extreme-move
+        # checks above. Clear a prior quarantine so a recovered, acceptable
+        # mark can be included in valuation again. Preserve the suspect quote
+        # itself as a diagnostic field for auditability.
+        position.pop("price_mark_status", None)
+        position.pop("price_safety_warning", None)
         updated += 1
 
         if opened and time.time() - opened < MIN_HOLD_SECONDS:
