@@ -833,6 +833,44 @@ def _close_position(address, position, price, reason, observed_change_pct=None):
         logger.error("Refusing to close invalid paper position for %s", address)
         return False
 
+    # Defense in depth: enforce the same extreme-quote limits at the final
+    # close boundary, even if a future caller bypasses update_paper_prices().
+    # A suspicious quote must not realize a paper loss/profit solely because a
+    # caller invokes this helper directly. Keep the position open for review.
+    change = (price / entry - 1) * 100
+    if reason == "stop_loss_5pct":
+        overshoot = STOP_LOSS_PCT - change
+        if overshoot > MAX_STOP_LOSS_OVERSHOOT_PCT:
+            message = (
+                f"{position.get('token_symbol', address[:8])} close refused: "
+                f"stop-loss quote implies {change:.2f}% from entry "
+                f"(overshoot {overshoot:.2f}% exceeds "
+                f"{MAX_STOP_LOSS_OVERSHOOT_PCT:.2f}%)"
+            )
+            position["last_suspect_price_usd"] = price
+            position["last_suspect_price_utc"] = _utc_now()
+            position["price_safety_warning"] = message
+            position["price_mark_status"] = "unverified_extreme_quote"
+            _record_provider("birdeye", last_price_jump_warning=message)
+            logger.error(message)
+            return False
+    elif reason == "take_profit_10pct":
+        overshoot = change - TAKE_PROFIT_PCT
+        if overshoot > MAX_TAKE_PROFIT_OVERSHOOT_PCT:
+            message = (
+                f"{position.get('token_symbol', address[:8])} close refused: "
+                f"take-profit quote implies {change:.2f}% from entry "
+                f"(overshoot {overshoot:.2f}% exceeds "
+                f"{MAX_TAKE_PROFIT_OVERSHOOT_PCT:.2f}%)"
+            )
+            position["last_suspect_price_usd"] = price
+            position["last_suspect_price_utc"] = _utc_now()
+            position["price_safety_warning"] = message
+            position["price_mark_status"] = "unverified_extreme_quote"
+            _record_provider("birdeye", last_price_jump_warning=message)
+            logger.error(message)
+            return False
+
     value = qty * price
     pnl = value - invested
     if not math.isfinite(value) or not math.isfinite(pnl):
