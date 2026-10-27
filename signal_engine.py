@@ -219,7 +219,7 @@ async def _fetch_candidates() -> tuple[list[dict], dict]:
         "last_error": errors[-1] if errors else None,
         "overview_batch_size": total_items,
         "endpoint": BIRDEYE_LIST_URL,
-        "sort_by": "volume_24h_usd",
+        "sort_by": "liquidity",
         "sort_type": "desc",
         "server_side_min_liquidity_usd": MIN_LIQUIDITY_USD,
         "server_side_min_volume_24h_usd": MIN_VOLUME_24H_USD,
