@@ -1161,6 +1161,33 @@ async def update_paper_prices():
     }
 
 
+def _price_mark_age_seconds(position, now=None):
+    """Return age of the last successful price mark, or None if unavailable."""
+    raw = position.get("last_price_update_utc")
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return max(0.0, (time.time() if now is None else now) - parsed.timestamp())
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _stale_price_threshold_seconds():
+    """A mark older than three normal polling cycles is not a current valuation."""
+    try:
+        poll_seconds = max(30, int(os.getenv("PAPER_BOT_POLL_SECONDS", "180")))
+    except (TypeError, ValueError):
+        poll_seconds = 180
+    try:
+        configured = int(os.getenv("PAPER_PRICE_STALE_SECONDS", str(max(300, poll_seconds * 3))))
+    except (TypeError, ValueError):
+        configured = max(300, poll_seconds * 3)
+    return max(60, configured)
+
+
 def get_paper_status():
     # Do not present an unverified extreme quote as a live mark or P/L.
     # Keep the original position/trade data intact; expose the suspect quote
@@ -1171,11 +1198,19 @@ def get_paper_status():
     verified_unrealized = 0.0
     unverified_count = 0
     unverified_invested = 0.0
+    stale_count = 0
+    stale_invested = 0.0
+    stale_threshold = _stale_price_threshold_seconds()
 
     for stored in _open_positions.values():
         position = dict(stored)
         cost = _num(position.get("invested_usd"))
         invested += cost
+        mark_age = _price_mark_age_seconds(position)
+        position["price_mark_age_seconds"] = (
+            round(mark_age, 1) if mark_age is not None else None
+        )
+        position["price_mark_stale_after_seconds"] = stale_threshold
         if position.get("price_mark_status") == "unverified_extreme_quote":
             unverified_count += 1
             unverified_invested += cost
@@ -1185,6 +1220,24 @@ def get_paper_status():
                 "price_safety_warning",
                 "Current quote is unverified; mark and P/L withheld.",
             )
+        elif position.get("price_mark_status") == "independently_verified_extreme_quote":
+            # Preserve the separately corroborated crash mark and its warning.
+            price = _num(position.get("current_price_usd"))
+            qty = _num(position.get("quantity"))
+            marked_value = qty * price
+            pnl = marked_value - cost
+            verified_value += marked_value
+            verified_unrealized += pnl
+        elif mark_age is None or mark_age > stale_threshold:
+            stale_count += 1
+            stale_invested += cost
+            position["price_mark_status"] = "stale_price_mark"
+            position["price_safety_warning"] = (
+                "Last successful price mark is missing or older than the configured "
+                "freshness window; excluded from current portfolio valuation until refreshed."
+            )
+            position["current_price_usd"] = None
+            position["unrealized_pnl_usd"] = None
         else:
             price = _num(position.get("current_price_usd"))
             qty = _num(position.get("quantity"))
@@ -1198,6 +1251,7 @@ def get_paper_status():
     accounting = _reported_realized_pnl(_paper_trades)
     accounting_incomplete = bool(
         unverified_count
+        or stale_count
         or accounting["quarantined_sell_records"]
         or accounting["sell_records_missing_pnl"]
     )
@@ -1217,6 +1271,9 @@ def get_paper_status():
         "paper_total_pnl_usd": round(verified_unrealized + _realized_pnl_usd, 8),
         "unverified_position_count": unverified_count,
         "unverified_position_invested_usd": round(unverified_invested, 8),
+        "stale_price_position_count": stale_count,
+        "stale_price_position_invested_usd": round(stale_invested, 8),
+        "price_mark_stale_after_seconds": stale_threshold,
         "paper_total_pnl_incomplete": accounting_incomplete,
         "persistence": get_persistence_status(),
         "accounting": accounting,
