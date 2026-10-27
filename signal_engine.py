@@ -11,7 +11,7 @@ import httpx
 
 TRADING_MODE = "paper"
 REAL_TRADING_ENABLED = False
-JUPITER_BASE_URL = os.getenv("JUPITER_BASE_URL", "https://api.jup.ag").rstrip("/")
+JUPITER_BASE_URL = os.getenv("JUPITER_BASE_URL", "https://lite-api.jup.ag").rstrip("/")
 JUPITER_API_KEY = os.getenv("JUPITER_API_KEY", "").strip()
 JUPITER_MIN_INTERVAL_SECONDS = float(os.getenv("JUPITER_MIN_INTERVAL_SECONDS", "2.1"))
 
@@ -102,7 +102,7 @@ def _jupiter_candidates(tokens: Any) -> list[dict]:
             "sells_24h": sells,
             "buy_sell_ratio": buys / sells if sells > 0 else 0.0,
             "trade_count_24h": int(_first_num(stats.get("numTraders"), stats.get("tradeCount"), buys + sells)),
-            "price_change_24h_pct": _num(price_change_raw),
+            "price_change_24h_pct": _num(price_change_raw) * (100.0 if abs(_num(price_change_raw)) <= 1.0 else 1.0),
             "price_change_24h_present": change_present,
             "market_cap_usd": _first_num(token.get("mcap"), token.get("marketCap")),
             "provider": "Jupiter",
