@@ -193,7 +193,7 @@ def record_paper_trade(token_address, side, amount_usd, price_usd, token_symbol=
             pos["invested_usd"] += amount_usd
             pos["highest_price"] = max(pos.get("highest_price", price_usd), price_usd)
         _paper_trades.append(trade)
-        asyncio.create_task(send_telegram(f"🟢 <b>BUY</b>\n{token_symbol}\n${amount_usd:.2f} @ {price_usd}"))
+        _schedule_telegram(send_telegram(f"🟢 <b>BUY</b>\n{token_symbol}\n${amount_usd:.2f} @ {price_usd}"))
     else:
         pos = _open_positions.get(token_address)
         if not pos:
@@ -213,7 +213,7 @@ def record_paper_trade(token_address, side, amount_usd, price_usd, token_symbol=
         else:
             pos["quantity"] = remaining
             pos["invested_usd"] = invested - cost
-        asyncio.create_task(send_telegram(f"🔴 <b>SELL</b>\n{token_symbol}\nP/L: {realized:.2f}$"))
+        _schedule_telegram(send_telegram(f"🔴 <b>SELL</b>\n{token_symbol}\nP/L: {realized:.2f}$"))
 
     _save_paper_state()
     return {"ok": True, "trade": trade}
@@ -252,7 +252,7 @@ def _close_position(address, position, price, reason, change_pct):
     _realized_pnl_usd += pnl
     _open_positions.pop(address, None)
     _save_paper_state()
-    asyncio.create_task(send_telegram(
+    _schedule_telegram(send_telegram(
         f"🔴 <b>SELL</b> ({reason})\n{position.get('token_symbol')}\n"
         f"P/L: {pnl:.2f}$ ({change_pct:.1f}%)"
     ))
@@ -335,6 +335,12 @@ PAPER_SLIPPAGE_PCT_PER_SIDE = float(os.getenv("PAPER_SLIPPAGE_PCT_PER_SIDE", "0"
 STALE_PRICE_THRESHOLD_SECONDS = max(60, int(os.getenv("STALE_PRICE_THRESHOLD_SECONDS", "900")))
 _ORIGINAL_RECORD_PAPER_TRADE = record_paper_trade
 
+def _schedule_telegram(coroutine):
+    try:
+        asyncio.get_running_loop().create_task(coroutine)
+    except RuntimeError:
+        coroutine.close()
+
 def _stale_price_threshold_seconds():
     return STALE_PRICE_THRESHOLD_SECONDS
 
@@ -409,7 +415,7 @@ def load_paper_state():
             _database_status.pop("accounting_warning", None)
         else:
             _realized_pnl_usd = _num(state.get("realized_pnl_usd"))
-            _database_status["accounting_warning"] = "Ledger lacks realized_pnl_usd on one or more SELL records; preserved stored lifetime PnL."
+            _database_status["accounting_warning"] = "Ledger lack realized_pnl_usd on one or more SELL records; preserved stored lifetime PnL."
         if accounting["quarantined_sell_records"]:
             _database_status["accounting_warning"] = "One or more historical SELL records were quarantined from reported PnL; history was preserved."
         _save_paper_state()
@@ -419,6 +425,8 @@ def load_paper_state():
         return {"ok": False, "loaded": False}
 
 def record_paper_trade(token_address, side, amount_usd, price_usd, token_symbol="", source="manual", reason=None):
+    pos_before = _open_positions.get(token_address)
+    entry_cost = _num((pos_before or {}).get("estimated_entry_cost_usd"))
     result = _ORIGINAL_RECORD_PAPER_TRADE(token_address, side, amount_usd, price_usd, token_symbol, source, reason)
     trade = result.get("trade", {})
     fee_pct = max(0.0, _num(PAPER_FEE_PCT_PER_SIDE))
@@ -431,9 +439,6 @@ def record_paper_trade(token_address, side, amount_usd, price_usd, token_symbol=
     elif str(side).upper() == "SELL":
         proceeds = _num(amount_usd)
         exit_cost = proceeds * cost_pct
-        entry_cost = 0.0
-        if token_address in _open_positions:
-            entry_cost = _num(_open_positions[token_address].get("estimated_entry_cost_usd"))
         trade["estimated_exit_cost_usd"] = round(exit_cost, 6)
         trade["estimated_transaction_cost_usd"] = round(exit_cost + entry_cost, 6)
         trade["net_realized_pnl_usd"] = round(_num(trade.get("realized_pnl_usd")) - exit_cost - entry_cost, 6)
