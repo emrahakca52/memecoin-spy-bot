@@ -72,6 +72,9 @@ async def _loop(stop_event):
     global _last_scan, _last_skipped, _last_copyfomo_checks
 
     while not stop_event.is_set():
+        # Publish the cycle start immediately so status never remains null
+        # while the first scan or a slow provider request is in progress.
+        _last_run = _utc_now()
         try:
             _last_error = None
             _last_skipped = []
