@@ -333,6 +333,8 @@ _database_status = {}
 PAPER_FEE_PCT_PER_SIDE = float(os.getenv("PAPER_FEE_PCT_PER_SIDE", "0"))
 PAPER_SLIPPAGE_PCT_PER_SIDE = float(os.getenv("PAPER_SLIPPAGE_PCT_PER_SIDE", "0"))
 STALE_PRICE_THRESHOLD_SECONDS = max(60, int(os.getenv("STALE_PRICE_THRESHOLD_SECONDS", "900")))
+MAX_STOP_LOSS_OVERSHOOT_PCT = min(10.0, max(5.0, _num(os.getenv("MAX_STOP_LOSS_OVERSHOOT_PCT", 8.0), 8.0)))
+MAX_TAKE_PROFIT_OVERSHOOT_PCT = min(50.0, max(10.0, _num(os.getenv("MAX_TAKE_PROFIT_OVERSHOOT_PCT", 25.0), 25.0)))
 _ORIGINAL_RECORD_PAPER_TRADE = record_paper_trade
 
 def _schedule_telegram(coroutine):
@@ -343,6 +345,19 @@ def _schedule_telegram(coroutine):
 
 def _stale_price_threshold_seconds():
     return STALE_PRICE_THRESHOLD_SECONDS
+
+def _price_mark_age_seconds(position):
+    stamp = (position or {}).get("last_price_update_utc")
+    if stamp:
+        try:
+            parsed = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return max(0.0, (datetime.now(timezone.utc) - parsed).total_seconds())
+        except (TypeError, ValueError):
+            return float("inf")
+    opened = _num((position or {}).get("opened_at"))
+    return max(0.0, time.time() - opened) if opened > 0 else float("inf")
 
 async def _fetch_dexscreener_price(token_address):
     try:
@@ -489,24 +504,13 @@ async def update_paper_prices():
     return {"updated": len(addresses), "closed": closed}
 
 def get_paper_status():
-    now = datetime.now(timezone.utc)
     invested = current = unrealized = 0.0
     stale_count = stale_invested = 0
     rows = []
     for address, pos in _open_positions.items():
         row = dict(pos)
         mark = _num(pos.get("current_price_usd"))
-        stamp = pos.get("last_price_update_utc")
-        stale = False
-        if stamp:
-            try:
-                parsed = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
-                if parsed.tzinfo is None: parsed = parsed.replace(tzinfo=timezone.utc)
-                stale = (now - parsed).total_seconds() > _stale_price_threshold_seconds()
-            except (TypeError, ValueError):
-                stale = True
-        elif _num(pos.get("opened_at")) and time.time() - _num(pos.get("opened_at")) > _stale_price_threshold_seconds():
-            stale = True
+        stale = _price_mark_age_seconds(pos) > _stale_price_threshold_seconds()
         amount = _num(pos.get("invested_usd"))
         invested += amount
         if stale:
@@ -518,25 +522,36 @@ def get_paper_status():
             current += _num(pos.get("quantity")) * mark
             unrealized += _num(pos.get("quantity")) * mark - amount
         rows.append(row)
+
     accounting = _reported_realized_pnl(_paper_trades)
-    legacy_cost_missing = any(
-        isinstance(t, dict) and str(t.get("side","")).upper() == "SELL"
-        and ("estimated_exit_cost_usd" not in t or "estimated_transaction_cost_usd" not in t)
-        for t in _paper_trades
+    sell_rows = [t for t in _paper_trades if isinstance(t, dict) and str(t.get("side", "")).upper() == "SELL"]
+    sell_missing_costs = sum(1 for t in sell_rows if "estimated_transaction_cost_usd" not in t)
+    quarantined_sell_costs = sum(1 for t in sell_rows if t.get("accounting_quarantined") and "estimated_transaction_cost_usd" not in t)
+    open_missing_entry_costs = sum(
+        1 for p in _open_positions.values()
+        if not _has_finite_number(p.get("estimated_entry_cost_usd"))
     )
-    partial_net = sum(_num(t.get("net_realized_pnl_usd", t.get("realized_pnl_usd"))) for t in _paper_trades if isinstance(t, dict) and str(t.get("side","")).upper()=="SELL" and not t.get("accounting_quarantined"))
+    legacy_cost_missing = sell_missing_costs > 0 or open_missing_entry_costs > 0
+    partial_net = sum(
+        _num(t.get("net_realized_pnl_usd", _num(t.get("realized_pnl_usd")) - _num(t.get("estimated_transaction_cost_usd"))))
+        for t in sell_rows if not t.get("accounting_quarantined")
+    )
     total_incomplete = stale_count > 0 or bool(accounting["quarantined_sell_records"])
     status = {
-        "mode":"paper", "real_trading_enabled":False, "open_positions":rows,
-        "open_position_count":len(rows), "paper_invested_usd":round(invested,2),
-        "paper_current_value_usd":round(current,2), "paper_unrealized_pnl_usd":round(unrealized,2),
-        "paper_realized_pnl_usd":round(accounting["realized_pnl_usd"],2),
-        "paper_total_pnl_usd":None if total_incomplete else round(unrealized+accounting["realized_pnl_usd"],2),
-        "paper_total_pnl_incomplete":total_incomplete,
-        "stale_price_position_count":stale_count,"stale_price_position_invested_usd":round(stale_invested,2),
-        "accounting":accounting,"provider":"jupiter+dexscreener",
-        "paper_estimated_net_pnl_incomplete":legacy_cost_missing,
-        "paper_estimated_net_total_pnl_usd":None if legacy_cost_missing else round(partial_net+unrealized,2),
-        "paper_estimated_net_total_pnl_partial_usd":round(partial_net+unrealized,2),
+        "mode": "paper", "real_trading_enabled": False, "open_positions": rows,
+        "open_position_count": len(rows), "paper_invested_usd": round(invested, 2),
+        "paper_current_value_usd": round(current, 2), "paper_unrealized_pnl_usd": round(unrealized, 2),
+        "paper_realized_pnl_usd": round(accounting["realized_pnl_usd"], 2),
+        "paper_total_pnl_usd": None if total_incomplete else round(unrealized + accounting["realized_pnl_usd"], 2),
+        "paper_total_pnl_incomplete": total_incomplete,
+        "stale_price_position_count": stale_count,
+        "stale_price_position_invested_usd": round(stale_invested, 2),
+        "accounting": accounting, "provider": "jupiter+dexscreener",
+        "paper_sell_records_missing_costs": sell_missing_costs,
+        "paper_quarantined_sell_cost_records": quarantined_sell_costs,
+        "paper_open_positions_missing_entry_costs": open_missing_entry_costs,
+        "paper_estimated_net_pnl_incomplete": legacy_cost_missing,
+        "paper_estimated_net_total_pnl_usd": None if legacy_cost_missing else round(partial_net + unrealized, 2),
+        "paper_estimated_net_total_pnl_partial_usd": round(partial_net + unrealized, 2),
     }
     return status
