@@ -1,44 +1,36 @@
-# Memecoin Spy Pro — clean paper-only deployment bundle
+# Memecoin Spy Pro — paper-trading bot
 
-This package is based on the project ZIP supplied by the owner. It preserves the existing Python modules and adds a safer startup behavior.
+## Safety and scope
 
-## Safety defaults
-- `TRADING_MODE` is paper.
-- `REAL_TRADING_ENABLED` is hard-coded `False` in the strategy engine.
-- The current `app.py` startup lifecycle loads saved paper state and then automatically starts the **paper-only scanner** on deployment. Check `/health` and `/paper/status` after deploy; use `POST /paper-bot/stop` to stop the paper scanner.
-- No wallet signing or real swap/order implementation is included.
+- This project runs a **paper-trading simulation**. It does not execute real swaps or sign wallet transactions.
+- The application reports `real_trading_enabled: false`; do not change this as part of testing.
+- On application startup, `app.py` loads saved paper state and starts the paper-only scanner. Use `POST /paper-bot/stop` to stop the scanner; `POST /paper-bot/start` starts it again.
+- Simulated P/L is not real investment performance and does not guarantee future results.
 
-## Render settings
+## Render configuration
+
 - Build command: `pip install -r requirements.txt`
 - Start command: `uvicorn app:app --host 0.0.0.0 --port $PORT`
-- Keep the existing `DATABASE_URL` and `BIRDEYE_API_KEY` environment variables. Do not delete or recreate the PostgreSQL database.
-- Other existing environment variables should be preserved unless intentionally changed.
+- Preserve the existing `DATABASE_URL`, `BIRDEYE_API_KEY`, and other configured environment variables.
+- **Do not delete, reset, or recreate the PostgreSQL database.** Existing paper state and trade history must be preserved.
 
-## Deploying from GitHub
-1. Download and unzip this bundle.
-2. Replace the repository's source files with the files in this folder. Upload the *contents* of the folder to the repository root, not the enclosing folder itself.
-3. Do not upload `__pycache__` or `.pyc` files.
-4. Commit the changes and let Render deploy.
-5. Check `/health`, `/paper/status`, and `/paper/trades` before starting anything.
+## Post-deployment verification
 
-## Important database note
-The engine uses the existing PostgreSQL `DATABASE_URL` and the `memecoin_paper_state` table. Do not delete the Render PostgreSQL database. The first startup attempts to load the saved state; if there is no saved state or the database URL is missing, verify configuration before taking further action.
+After deployment, inspect these read-only endpoints:
 
-## Safe verification
-- `GET /health` should show `mode: paper` and `real_trading_enabled: false`. With the current startup behavior, `bot.running` is expected to be `true` after a successful startup; if it is not, inspect logs and `/paper/status`.
-- `GET /paper/status` reports persistence and paper accounting status.
-- `GET /paper/trades` lists persisted simulated trades.
-- Only after those checks should you manually call `POST /paper-bot/start` if you want the paper scanner running.
+1. `GET /health` — should report paper mode and `real_trading_enabled: false`.
+2. `GET /paper/status` — check bot state, persistence, and accounting diagnostics.
+3. `GET /paper/trades` — confirm saved simulated trade history is present.
 
-## Limitations
-Python syntax and module-import checks are not the same as a live Render integration test. Provider access, API plan limits, and database connectivity must be verified on the deployed service. Paper P/L is simulated and not real investment performance.
+The application is expected to start the paper scanner automatically after successful startup. If health, persistence, or history checks fail, inspect deployment logs before attempting a restart or changing configuration. Do not manually start another process to work around an unresolved startup failure.
 
+## Accounting and price-safety behavior
 
-## Safety patch v2 (paper mode)
+- Historical trades are retained; suspicious records may be quarantined from reported P/L without deleting the original history.
+- If legacy SELL records lack realized P/L fields, the engine preserves stored lifetime P/L rather than replacing it with a partial ledger sum.
+- Extreme or uncorroborated price quotes may be withheld from marking a position or triggering an automatic paper exit. This protects accounting from obvious bad quotes but can leave a position open during a genuine rapid market move; review diagnostics rather than assuming the mark is current.
+- Price and P/L values are simulated and depend on provider data, API availability, and the configured strategy.
 
-- Keeps all existing PostgreSQL paper state and trade history; do not delete `DATABASE_URL` or the database.
-- Real trading remains disabled; this application is a paper simulation only.
-- Tightens automatic-exit quote guards: stop-loss overshoot is capped at 10 percentage points (default 10), and take-profit overshoot is capped at 50 percentage points (default 50). Configured values are also clamped to these maximums. Excessive quotes are flagged and the position remains open for review; this is safer for simulation integrity but can leave a position open during a genuine rapid market move.
-- This patch does not rewrite or delete historical trade records, including quarantined anomalous records.
+## Limits of verification
 
-Deploy changes through GitHub and let Render deploy. Do not upload the ZIP file itself and do not remove the Render PostgreSQL database or environment variables. Check `/health`, `/paper/status`, and `/paper/trades` after deployment. Note: the current application code automatically starts the paper scanner; this is separate from real trading, which remains disabled.
+Passing automated tests and Python syntax checks does not prove the deployed Render service can reach the database or market-data provider. Live service health, environment variables, API access, and persisted state must be verified on the deployed service. No production database reset is required for this verification.
