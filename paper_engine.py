@@ -1,13 +1,9 @@
-"""
-Reconciled paper_engine.py
+"""Paper-trading engine with persistence and conservative price validation.
 
-Important:
-- Keeps legacy trade history; it does not delete or rewrite old trade records.
-- Excludes the specific known-bad MRBEAST SELL from the *reported* realized P/L.
-- Marks that trade as quarantined in memory and on the next state save.
-- Uses a conservative price sanity gate against the position's entry/current price.
-- Raises default Birdeye request spacing/cooldown to reduce HTTP 429 responses.
-- This is a proposed replacement. Back up the database before deploying.
+Historical trade records are retained. The known implausible MRBEAST SELL is
+excluded from reported realized P/L without deleting its history. Price sanity
+checks can defer marks and automatic exits when a quote is not corroborated.
+Real-money trading is not implemented by this engine.
 """
 
 import asyncio
