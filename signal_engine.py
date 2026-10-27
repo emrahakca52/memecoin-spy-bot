@@ -197,9 +197,10 @@ async def _fetch_candidates() -> tuple[list[dict], dict]:
             if response.status_code == 429:
                 retry_after = response.headers.get("Retry-After")
                 try:
-                    delay = max(30, min(1800, int(float(retry_after)))) if retry_after else 300
+                    # DexScreener is repeatedly returning 429; cool down conservatively.
+                    delay = max(900, min(3600, int(float(retry_after)))) if retry_after else 1800
                 except (TypeError, ValueError, OverflowError):
-                    delay = 300
+                    delay = 1800
                 global _cooldown_until, _cooldown_reason
                 _cooldown_until = time.monotonic() + delay
                 _cooldown_reason = f"DexScreener HTTP 429; retry after {delay}s"
