@@ -143,6 +143,26 @@ class PaperExecutionCostTests(unittest.TestCase):
         paper_engine._paper_trades = self.trades
         paper_engine._realized_pnl_usd = self.realized
 
+    def test_net_total_is_not_reported_as_definitive_when_legacy_costs_are_missing(self):
+        paper_engine._open_positions = {}
+        paper_engine._paper_trades = [{
+            "side": "SELL",
+            "realized_pnl_usd": 1.0,
+            "amount_usd": 11.0,
+            "price_usd": 1.1,
+            "token_symbol": "LEGACY",
+        }]
+        paper_engine._realized_pnl_usd = 1.0
+        with (
+            patch.object(paper_engine, "_save_paper_state", return_value=True),
+            patch.object(paper_engine, "get_persistence_status", return_value={"connected": True}),
+            patch.object(paper_engine, "get_price_diagnostics", return_value={}),
+        ):
+            status = paper_engine.get_paper_status()
+        self.assertTrue(status["paper_estimated_net_pnl_incomplete"])
+        self.assertIsNone(status["paper_estimated_net_total_pnl_usd"])
+        self.assertEqual(status["paper_estimated_net_total_pnl_partial_usd"], 1.0)
+
     def test_new_buy_and_sell_record_estimated_costs_without_changing_gross_pnl(self):
         with (
             patch.object(paper_engine, "_save_paper_state", return_value=True),
