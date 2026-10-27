@@ -565,6 +565,22 @@ def _validate_price_jump(address, price, now, reference_price=None):
         _pending_price_jumps.pop(address, None)
         return True
 
+    # A supplied reference (signal price for entries, last accepted mark for
+    # open positions) is a hard safety boundary. Repeated quotes from the same
+    # provider must NOT override a large disagreement with that reference.
+    supplied_reference = _num(reference_price)
+    if supplied_reference > 0:
+        reference_jump = abs(price / supplied_reference - 1.0) * 100.0
+        if reference_jump > MAX_ACCEPTED_PRICE_JUMP_PCT:
+            _pending_price_jumps[address] = {"price": price, "at": now}
+            message = (
+                f"{address[:10]} quote differs {reference_jump:.2f}% from supplied "
+                "reference; withheld pending independent verification"
+            )
+            _record_provider("birdeye", last_price_jump_warning=message)
+            logger.error(message)
+            return False
+
     jump = abs(price / old_price - 1.0) * 100.0
     if jump <= MAX_ACCEPTED_PRICE_JUMP_PCT:
         _pending_price_jumps.pop(address, None)
