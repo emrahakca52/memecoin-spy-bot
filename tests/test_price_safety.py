@@ -129,6 +129,68 @@ class ExtremeQuoteExitGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(paper_engine._paper_trades[0]["realized_pnl_usd"], -0.8)
 
 
+class StalePriceMarkTests(unittest.TestCase):
+    def test_stale_mark_is_excluded_from_current_valuation(self):
+        original_positions = paper_engine._open_positions
+        original_trades = paper_engine._paper_trades
+        try:
+            paper_engine._open_positions = {
+                "stale-token": {
+                    "token_address": "stale-token",
+                    "token_symbol": "STALE",
+                    "entry_price_usd": 1.0,
+                    "current_price_usd": 1.2,
+                    "quantity": 10.0,
+                    "invested_usd": 10.0,
+                    "unrealized_pnl_usd": 2.0,
+                    "last_price_update_utc": "2020-01-01T00:00:00+00:00",
+                }
+            }
+            paper_engine._paper_trades = []
+            with patch.object(paper_engine, "_stale_price_threshold_seconds", return_value=300):
+                status = paper_engine.get_paper_status()
+
+            self.assertEqual(status["stale_price_position_count"], 1)
+            self.assertEqual(status["stale_price_position_invested_usd"], 10.0)
+            self.assertEqual(status["paper_current_value_usd"], 0.0)
+            self.assertEqual(status["paper_unrealized_pnl_usd"], 0.0)
+            self.assertTrue(status["paper_total_pnl_incomplete"])
+            self.assertEqual(status["open_positions"][0]["price_mark_status"], "stale_price_mark")
+            self.assertIsNone(status["open_positions"][0]["current_price_usd"])
+            # Reporting must not mutate the persisted/in-memory position.
+            self.assertEqual(paper_engine._open_positions["stale-token"]["current_price_usd"], 1.2)
+        finally:
+            paper_engine._open_positions = original_positions
+            paper_engine._paper_trades = original_trades
+
+    def test_recent_mark_remains_valued(self):
+        original_positions = paper_engine._open_positions
+        original_trades = paper_engine._paper_trades
+        try:
+            paper_engine._open_positions = {
+                "fresh-token": {
+                    "token_address": "fresh-token",
+                    "token_symbol": "FRESH",
+                    "entry_price_usd": 1.0,
+                    "current_price_usd": 1.2,
+                    "quantity": 10.0,
+                    "invested_usd": 10.0,
+                    "unrealized_pnl_usd": 2.0,
+                    "last_price_update_utc": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime()),
+                }
+            }
+            paper_engine._paper_trades = []
+            with patch.object(paper_engine, "_stale_price_threshold_seconds", return_value=300):
+                status = paper_engine.get_paper_status()
+
+            self.assertEqual(status["stale_price_position_count"], 0)
+            self.assertAlmostEqual(status["paper_current_value_usd"], 12.0)
+            self.assertAlmostEqual(status["paper_unrealized_pnl_usd"], 2.0)
+        finally:
+            paper_engine._open_positions = original_positions
+            paper_engine._paper_trades = original_trades
+
+
 class AccountingQuarantineRegressionTests(unittest.TestCase):
     def test_known_bad_mrbeast_sell_is_excluded_without_mutating_history(self):
         bad_trade = {
