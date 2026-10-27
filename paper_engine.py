@@ -1353,7 +1353,11 @@ def get_paper_status():
         "paper_unrealized_pnl_usd": round(verified_unrealized, 8),
         "paper_realized_pnl_usd": round(_realized_pnl_usd, 8),
         "paper_total_pnl_usd": round(verified_unrealized + _realized_pnl_usd, 8),
-        "paper_estimated_net_total_pnl_usd": round(estimated_net_total_pnl, 8),
+        # Do not publish a definitive net total when legacy/open-position costs are unknown.
+        "paper_estimated_net_total_pnl_usd": (
+            None if net_costs_incomplete else round(estimated_net_total_pnl, 8)
+        ),
+        "paper_estimated_net_total_pnl_partial_usd": round(estimated_net_total_pnl, 8),
         "paper_estimated_realized_transaction_costs_usd": round(estimated_realized_costs, 8),
         "paper_estimated_open_entry_costs_usd": round(open_position_estimated_costs, 8),
         "paper_estimated_open_exit_costs_usd": round(estimated_open_exit_costs, 8),
