@@ -88,6 +88,7 @@ _database_status = {
 }
 
 _price_diagnostics = {
+    "dexscreener": {"requests": 0, "last_attempt_utc": None, "last_endpoint": None, "last_http_status": None, "last_error": None, "last_prices_found": 0, "last_price_jump_warning": None, "cooldown_seconds_remaining": 0},
     "birdeye": {
         "requests": 0,
         "last_attempt_utc": None,
@@ -483,91 +484,49 @@ async def _respect_birdeye_rate_limit():
 
 
 async def _fetch_birdeye_price(client, address):
-    api_key = os.getenv("BIRDEYE_API_KEY", "").strip()
-    if not api_key:
-        _record_provider(
-            "birdeye", last_error="BIRDEYE_API_KEY is not configured"
-        )
+    """Fetch a token price from DexScreener; retained name for compatibility."""
+    if _provider_is_cooling("dexscreener"):
+        remain = max(1, int(_provider_cooldown_until.get("dexscreener", 0) - time.monotonic()))
+        _record_provider("dexscreener", last_error=f"provider cooldown ({remain}s)")
         return None
-    if _provider_is_cooling():
-        remain = max(
-            1,
-            int(_provider_cooldown_until.get("birdeye", 0) - time.monotonic()),
-        )
-        _record_provider("birdeye", last_error=f"provider cooldown ({remain}s)")
-        return None
-
-    await _respect_birdeye_rate_limit()
-    _record_provider(
-        "birdeye",
-        requests=int(_price_diagnostics["birdeye"].get("requests", 0)) + 1,
-        last_attempt_utc=_utc_now(),
-        last_endpoint=BIRDEYE_PRICE_URL,
-        last_http_status=None,
-        last_error=None,
-        last_prices_found=0,
-    )
+    url = f"https://api.dexscreener.com/tokens/v1/solana/{address}"
+    _record_provider("dexscreener",
+        requests=int(_price_diagnostics.setdefault("dexscreener", {}).get("requests", 0)) + 1,
+        last_attempt_utc=_utc_now(), last_endpoint=url, last_http_status=None,
+        last_error=None, last_prices_found=0)
     try:
-        response = await client.get(
-            BIRDEYE_PRICE_URL,
-            params={"address": address},
-            headers={
-                "Accept": "application/json",
-                "X-API-KEY": api_key,
-                "x-chain": "solana",
-            },
-        )
-        _record_provider("birdeye", last_http_status=response.status_code)
-
+        response = await client.get(url)
+        _record_provider("dexscreener", last_http_status=response.status_code)
         if response.status_code == 429:
-            retry_after = response.headers.get("Retry-After", "")
-            try:
-                cooldown = min(900, max(60, int(float(retry_after))))
-            except (TypeError, ValueError, OverflowError):
-                cooldown = 300
-            _set_provider_cooldown(
-                "birdeye", cooldown, f"HTTP 429; cooldown {cooldown}s"
-            )
-            _record_provider(
-                "birdeye", last_error=f"HTTP 429; cooldown {cooldown}s"
-            )
+            cooldown = 300
+            _set_provider_cooldown("dexscreener", cooldown, f"HTTP 429; cooldown {cooldown}s")
+            _record_provider("dexscreener", last_error=f"HTTP 429; cooldown {cooldown}s")
             return None
-        if response.status_code in (401, 403):
-            _record_provider(
-                "birdeye",
-                last_error=f"HTTP {response.status_code}; check API key and package access",
-            )
-            return None
-
         response.raise_for_status()
-        payload = response.json()
-        data = payload.get("data") if isinstance(payload, dict) else None
-        price = _num(data.get("value")) if isinstance(data, dict) else 0.0
-        if price <= 0:
-            _record_provider(
-                "birdeye",
-                last_error="HTTP 200 but no usable positive data.value price",
-            )
+        pairs = response.json()
+        if not isinstance(pairs, list):
+            _record_provider("dexscreener", last_error="invalid token-pairs response")
             return None
-        _record_provider("birdeye", last_prices_found=1, last_error=None)
+        solana_pairs = [pair for pair in pairs if isinstance(pair, dict) and pair.get("chainId") == "solana"]
+        if not solana_pairs:
+            _record_provider("dexscreener", last_error="no Solana pairs found for token")
+            return None
+        pair = max(solana_pairs, key=lambda item: _num((item.get("liquidity") or {}).get("usd")))
+        price = _num(pair.get("priceUsd"))
+        if price <= 0:
+            _record_provider("dexscreener", last_error="no usable positive priceUsd")
+            return None
+        _record_provider("dexscreener", last_prices_found=1, last_error=None)
         return price
-
     except httpx.HTTPStatusError as exc:
-        _record_provider(
-            "birdeye",
-            last_http_status=exc.response.status_code,
-            last_error=f"HTTP {exc.response.status_code}",
-        )
+        _record_provider("dexscreener", last_http_status=exc.response.status_code,
+                         last_error=f"HTTP {exc.response.status_code}")
     except httpx.TimeoutException:
-        _record_provider("birdeye", last_error="request timed out")
+        _record_provider("dexscreener", last_error="request timed out")
     except httpx.HTTPError as exc:
-        _record_provider(
-            "birdeye", last_error=f"network error: {type(exc).__name__}"
-        )
+        _record_provider("dexscreener", last_error=f"network error: {type(exc).__name__}")
     except (ValueError, AttributeError, TypeError) as exc:
-        _record_provider(
-            "birdeye", last_error=f"invalid response: {type(exc).__name__}"
-        )
+        _record_provider("dexscreener", last_error=f"invalid response: {type(exc).__name__}")
     return None
 
 
@@ -575,7 +534,7 @@ async def _fetch_prices_batch(client, token_addresses):
     results = {}
     for address in token_addresses:
         results[address] = await _fetch_birdeye_price(client, address)
-        if _provider_is_cooling():
+        if _provider_is_cooling("dexscreener"):
             break
     return results
 
