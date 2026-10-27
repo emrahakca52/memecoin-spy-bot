@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from signal_engine import (
     get_signal_candidates,
     MAX_PRICE_CHANGE_24H_PCT,
+    MAX_NEGATIVE_PRICE_CHANGE_24H_PCT as SIGNAL_MAX_NEGATIVE_PRICE_CHANGE_24H_PCT,
     MIN_TRADES_24H,
 )
 from check import evaluate_candidate
@@ -30,11 +31,8 @@ MIN_BUYS_SELLS_RATIO = float(os.getenv("MIN_BUYS_SELLS_RATIO", "1.0"))
 # Keep status aligned with the actual signal_engine filters.
 MAX_ABSOLUTE_PRICE_CHANGE_24H_PCT = MAX_PRICE_CHANGE_24H_PCT
 
-# Retained for status/API compatibility only. signal_engine currently applies
-# the absolute threshold above, not a separate negative-only threshold.
-MAX_NEGATIVE_PRICE_CHANGE_24H_PCT = max(
-    0.0, float(os.getenv("MAX_NEGATIVE_PRICE_CHANGE_24H_PCT", "30"))
-)
+# Reflect the actual negative-only threshold enforced by signal_engine.py.
+MAX_NEGATIVE_PRICE_CHANGE_24H_PCT = SIGNAL_MAX_NEGATIVE_PRICE_CHANGE_24H_PCT
 
 MAX_ENTRY_PRICE_DEVIATION_PCT = 10.0
 
@@ -286,9 +284,9 @@ def bot_status():
             "max_absolute_price_change_24h_pct_is_effective": True,
             "max_negative_price_change_24h_pct_is_separate_effective_filter": True,
             "note": (
-                "signal_engine applies the absolute price-change threshold. "
-                "The separate negative threshold is shown for compatibility "
-                "but is not independently applied."
+                "signal_engine.py enforces both the absolute 24h price-change "
+                "limit and the separate maximum-negative-change limit. "
+                "Tokens below the negative threshold are rejected."
             ),
         },
         "last_run_utc": _last_run,
