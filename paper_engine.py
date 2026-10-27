@@ -499,9 +499,14 @@ async def _fetch_birdeye_price(client, address):
         response = await client.get(url)
         _record_provider("dexscreener", last_http_status=response.status_code)
         if response.status_code == 429:
-            cooldown = 300
-            _set_provider_cooldown("dexscreener", cooldown, f"HTTP 429; cooldown {cooldown}s")
-            _record_provider("dexscreener", last_error=f"HTTP 429; cooldown {cooldown}s")
+            retry_after = response.headers.get("Retry-After")
+            try:
+                cooldown = max(300, min(3600, int(float(retry_after)))) if retry_after else 900
+            except (TypeError, ValueError, OverflowError):
+                cooldown = 900
+            reason = f"HTTP 429; cooldown {cooldown}s"
+            _set_provider_cooldown("dexscreener", cooldown, reason)
+            _record_provider("dexscreener", last_error=reason)
             return None
         response.raise_for_status()
         pairs = response.json()
@@ -560,9 +565,14 @@ async def _fetch_prices_batch(client, token_addresses):
             response = await client.get(url)
             _record_provider("dexscreener", last_http_status=response.status_code)
             if response.status_code == 429:
-                cooldown = 300
-                _set_provider_cooldown("dexscreener", cooldown, f"HTTP 429; cooldown {cooldown}s")
-                _record_provider("dexscreener", last_error=f"HTTP 429; cooldown {cooldown}s")
+                retry_after = response.headers.get("Retry-After")
+                try:
+                    cooldown = max(300, min(3600, int(float(retry_after)))) if retry_after else 900
+                except (TypeError, ValueError, OverflowError):
+                    cooldown = 900
+                reason = f"HTTP 429; cooldown {cooldown}s"
+                _set_provider_cooldown("dexscreener", cooldown, reason)
+                _record_provider("dexscreener", last_error=reason)
                 break
             response.raise_for_status()
             pairs = response.json()
