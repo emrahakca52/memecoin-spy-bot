@@ -183,7 +183,7 @@ async def get_signal_candidates(
                     candidates = await _discover_jupiter(client)
                     # If the endpoint returns no usable market statistics, use the fallback
                     # rather than silently treating missing fields as real zero-volume data.
-                    if not candidates or not any(c["volume_24h_usd"] > 0 for c in candidates):
+                    if not candidates or not any(c["volume_24h_usd"] > 0 and c["liquidity_usd"] > 0 and c.get("price_change_24h_present") for c in candidates):
                         raise ValueError("Jupiter recent-token response lacked usable 24h volume")
                 except Exception as exc:
                     jupiter_error = f"{type(exc).__name__}: {exc}"
