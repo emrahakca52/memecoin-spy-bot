@@ -34,6 +34,22 @@ class JupiterDiscoveryTests(unittest.TestCase):
         result = _jupiter_candidates([{"id": "mint-456", "symbol": "NOCHANGE"}])[0]
         self.assertFalse(result["price_change_24h_present"])
 
+    def test_percentage_field_under_one_is_not_multiplied(self):
+        result = _jupiter_candidates([{
+            "id": "mint-percent",
+            "stats24h": {"priceChangePercent": 0.5},
+        }])[0]
+        self.assertEqual(result["price_change_24h_pct"], 0.5)
+        self.assertTrue(result["price_change_24h_present"])
+
+    def test_token_price_change_field_is_already_percentage(self):
+        result = _jupiter_candidates([{
+            "id": "mint-token-change",
+            "priceChange24h": -0.4,
+        }])[0]
+        self.assertEqual(result["price_change_24h_pct"], -0.4)
+        self.assertTrue(result["price_change_24h_present"])
+
     def test_normalize_marks_non_finite_change_missing(self):
         result = _normalize({
             "address": "mint-789",
