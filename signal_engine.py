@@ -225,3 +225,33 @@ def get_signal_engine_status() -> dict:
         "last_candidate_count": len(_cache.get("candidates", [])),
         "diagnostics": _cache.get("diagnostics", {}),
     }
+
+
+
+def _has_finite_number(value: Any) -> bool:
+    """Return True only for finite numeric values (booleans are not metrics)."""
+    if isinstance(value, bool) or value is None:
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _normalize(token: dict[str, Any]) -> dict[str, Any]:
+    """Normalize provider token metrics without treating missing/NaN changes as valid."""
+    price_change = token.get("price_change_24h_percent", token.get("price_change_24h_pct"))
+    change_present = _has_finite_number(price_change)
+    return {
+        "token_address": token.get("address") or token.get("token_address") or token.get("mint"),
+        "symbol": token.get("symbol") or "UNKNOWN",
+        "name": token.get("name") or "",
+        "price_usd": _num(token.get("price", token.get("price_usd"))),
+        "liquidity_usd": _num(token.get("liquidity", token.get("liquidity_usd"))),
+        "volume_24h_usd": _num(token.get("volume_24h_usd", token.get("volume24h"))),
+        "buys_24h": int(_num(token.get("buy_24h", token.get("buys_24h")))),
+        "sells_24h": int(_num(token.get("sell_24h", token.get("sells_24h")))),
+        "trade_count_24h": int(_num(token.get("trade_24h_count", token.get("trade_count_24h")))),
+        "price_change_24h_pct": _num(price_change),
+        "price_change_24h_present": change_present,
+    }
