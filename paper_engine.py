@@ -231,19 +231,41 @@ def _accounting_diagnostics(trades, stored_realized):
 
 
 def _is_quarantined_trade(trade):
-    """Return True for trades explicitly quarantined by an operator or known bad quote."""
+    """Exclude explicitly quarantined or clearly implausible legacy auto-exits from P/L."""
     if not isinstance(trade, dict):
         return False
     if trade.get("accounting_quarantined") is True:
         return True
-    # Specific historical bad quote confirmed in the provided paper-trade log.
-    return (
-        str(trade.get("side", "")).upper() == "SELL"
-        and str(trade.get("token_symbol", "")).upper() == "MRBEAST"
+    if str(trade.get("side", "")).upper() != "SELL":
+        return False
+
+    # Specific historical bad quote confirmed in the paper-trade log.
+    if (
+        str(trade.get("token_symbol", "")).upper() == "MRBEAST"
         and str(trade.get("token_address", "")) == "4hqN5vhCG1q13qYUQvBhyMDDnpWKP98DoswDeDCVQaCn"
         and _num(trade.get("price_usd")) > 100.0
         and _num(trade.get("realized_pnl_usd")) > 1_000_000.0
-    )
+    ):
+        return True
+
+    # Older builds could close a -5% stop or +10% target on an extreme quote.
+    # Quarantine those historical auto-exits from aggregate P/L when the recorded
+    # move exceeds the current safety envelope. Keep the original trade untouched
+    # for audit; this is not a claim that the market move was impossible.
+    if str(trade.get("source", "")).lower() != "auto":
+        return False
+    reason = str(trade.get("reason", "")).lower()
+    observed = trade.get("observed_change_pct", trade.get("change_pct"))
+    if observed is None:
+        return False
+    change = _num(observed, default=float("nan"))
+    if not math.isfinite(change):
+        return False
+    if reason.startswith("stop_loss"):
+        return change < STOP_LOSS_PCT - MAX_STOP_LOSS_OVERSHOOT_PCT
+    if reason.startswith("take_profit"):
+        return change > TAKE_PROFIT_PCT + MAX_TAKE_PROFIT_OVERSHOOT_PCT
+    return False
 
 
 def _reported_realized_pnl(trades):
@@ -353,7 +375,7 @@ def load_paper_state():
             if _is_quarantined_trade(trade) and isinstance(trade, dict):
                 trade["accounting_quarantined"] = True
                 trade["accounting_quarantine_reason"] = (
-                    "Implausible historical quote; excluded from reported paper P/L pending review"
+                    "Implausible historical auto-exit quote; excluded from reported paper P/L pending review"
                 )
 
         _open_positions = positions
