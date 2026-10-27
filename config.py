@@ -5,42 +5,40 @@ REAL_TRADING_ENABLED = False
 
 # Risk
 PAPER_AMOUNT_USD = float(os.getenv("PAPER_AMOUNT_PER_POSITION_USD", "8"))
-MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "5"))
-MAX_DAILY_LOSS_USD = float(os.getenv("MAX_DAILY_LOSS_USD", "20"))
-MIN_HOLD_SECONDS = int(os.getenv("MIN_HOLD_SECONDS", "120"))
+MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "6"))
+MAX_DAILY_LOSS_USD = float(os.getenv("MAX_DAILY_LOSS_USD", "24"))
+MIN_HOLD_SECONDS = int(os.getenv("MIN_HOLD_SECONDS", "90"))
 
-# Strict Entry Filters
-MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "35000"))
-MIN_VOLUME_24H_USD = float(os.getenv("MIN_VOLUME_24H_USD", "180000"))
-MIN_BUYS_SELLS_RATIO = float(os.getenv("MIN_BUYS_SELLS_RATIO", "1.8"))
-MIN_TRADES_24H = int(os.getenv("MIN_TRADES_24H", "100"))
-MIN_VOLUME_SPIKE = float(os.getenv("MIN_VOLUME_SPIKE", "3.0"))
+# Balanced Filters (piyasa dinamiklerine göre)
+MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "12000"))
+MIN_VOLUME_24H_USD = float(os.getenv("MIN_VOLUME_24H_USD", "70000"))
+MIN_BUYS_SELLS_RATIO = float(os.getenv("MIN_BUYS_SELLS_RATIO", "1.35"))
+MIN_TRADES_24H = int(os.getenv("MIN_TRADES_24H", "50"))
 
 # Rug Protection
-MAX_RUGCHECK_SCORE = 20
-MAX_TOP10_HOLDER_PCT = 12.0
-MIN_LP_LOCKED_PCT = 98.0
+MAX_RUGCHECK_SCORE = 28
+MAX_TOP10_HOLDER_PCT = 18.0
+MIN_LP_LOCKED_PCT = 90.0
 REQUIRE_MINT_AUTHORITY_REVOKED = True
 REQUIRE_FREEZE_AUTHORITY_REVOKED = True
 REQUIRE_ZERO_INSIDER_NETWORKS = True
 
-# Smart Exit
-TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "90"))
-PARTIAL_TAKE_PROFIT_PCT = float(os.getenv("PARTIAL_TAKE_PROFIT_PCT", "35"))
-PARTIAL_SELL_FRACTION = 0.6
-STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "-22"))
-TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", "18"))
-FAST_DUMP_PCT = float(os.getenv("FAST_DUMP_PCT", "-15"))
+# Exit
+TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "70"))
+PARTIAL_TAKE_PROFIT_PCT = float(os.getenv("PARTIAL_TAKE_PROFIT_PCT", "30"))
+PARTIAL_SELL_FRACTION = 0.5
+STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "-25"))
+TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", "20"))
 
 # Jupiter
 JUPITER_QUOTE_URL = "https://quote-api.jup.ag/v6/quote"
-JUPITER_SLIPPAGE_BPS = int(os.getenv("JUPITER_SLIPPAGE_BPS", "30"))
+JUPITER_SLIPPAGE_BPS = int(os.getenv("JUPITER_SLIPPAGE_BPS", "40"))
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 
 # Grok
 GROK_API_BASE = os.getenv("XAI_API_BASE", "https://api.x.ai/v1").rstrip("/")
 GROK_MODEL = os.getenv("XAI_MODEL", "grok-3-mini")
 GROK_TIMEOUT_SECONDS = 20
-GROK_CONFIDENCE_THRESHOLD = 0.80
+GROK_CONFIDENCE_THRESHOLD = 0.75
 MAX_GROK_CHECKS_PER_SCAN = 2
 COPYFOMO_GATE_ENABLED = True
