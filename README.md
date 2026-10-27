@@ -38,7 +38,7 @@ Python syntax and module-import checks are not the same as a live Render integra
 
 - Keeps all existing PostgreSQL paper state and trade history; do not delete `DATABASE_URL` or the database.
 - Real trading remains disabled; this application is a paper simulation only.
-- Tightens automatic-exit quote guards: stop-loss overshoot is capped at 10 percentage points (default 5), and take-profit overshoot is capped at 50 percentage points (default 25). Excessive quotes are flagged and the position remains open for review; this is safer for simulation integrity but can leave a position open during a genuine rapid market move.
+- Tightens automatic-exit quote guards: stop-loss overshoot is capped at 10 percentage points (default 10), and take-profit overshoot is capped at 50 percentage points (default 50). Configured values are also clamped to these maximums. Excessive quotes are flagged and the position remains open for review; this is safer for simulation integrity but can leave a position open during a genuine rapid market move.
 - This patch does not rewrite or delete historical trade records, including quarantined anomalous records.
 
 Deploy by replacing the repository's source files with the contents of this ZIP. Do not upload the ZIP file itself and do not remove the Render PostgreSQL database or environment variables. Start the paper bot only after checking `/health`, `/paper/status`, and `/paper/trades`.
