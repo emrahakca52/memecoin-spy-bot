@@ -181,67 +181,114 @@ def _normalize(item: dict) -> dict:
 
 
 async def _fetch_candidates() -> tuple[list[dict], dict]:
-    api_key = _api_key()
-    if not api_key:
-        message = "BIRDEYE_API_KEY is not configured"
-        _stats["last_error"] = message
-        return [], {
-            "provider": "Birdeye", "source_counts": {"Birdeye_token_list_v3": 0},
-            "source_errors": [message], "last_error": message,
-            "note": "Birdeye V3 token list; paper mode only.",
-        }
-
-    if time.monotonic() < _cooldown_until:
-        remaining = max(1, int(_cooldown_until - time.monotonic()))
-        message = f"Birdeye cooldown active ({remaining}s): {_cooldown_reason or 'rate limit'}"
-        return [], {
-            "provider": "Birdeye", "source_counts": {"Birdeye_token_list_v3": 0},
-            "source_errors": [message], "last_error": message,
-            "cooldown_seconds_remaining": remaining, "note": "Cooldown active; no request sent.",
-        }
-
-    headers = {"accept": "application/json", "X-API-KEY": api_key, "x-chain": "solana"}
-    # Keep discovery requests to the documented required fields. Liquidity and
-    # volume thresholds are applied locally after the API response, which also
-    # avoids plan/parameter validation differences causing a total scan failure.
-    params = {
-        "sort_by": "liquidity",
-        "sort_type": "desc",
-        "offset": 0,
-        "limit": LISTING_LIMIT,
-    }
+    """Discover Solana tokens using DexScreener's public, keyless API."""
     errors: list[str] = []
     candidates: list[dict] = []
-    total_items = 0
-    has_next = False
+    profile_url = "https://api.dexscreener.com/token-profiles/latest/v1"
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(REQUEST_TIMEOUT_SECONDS, connect=8.0), headers=headers) as client:
-            payload = await _get_json(client, BIRDEYE_LIST_URL, params)
-            candidates = [_normalize(item) for item in _items(payload)]
-            total_items = len(candidates)
-            data = payload.get("data", {})
-            has_next = bool(data.get("hasNext", data.get("has_next", False))) if isinstance(data, dict) else False
+        async with httpx.AsyncClient(timeout=httpx.Timeout(REQUEST_TIMEOUT_SECONDS, connect=8.0),
+                                     headers={"Accept": "application/json", "User-Agent": "MemecoinSpyBot/2.3"}) as client:
+            # This endpoint is limited to 60 requests/minute; one request per scan.
+            response = await client.get(profile_url)
+            _stats["requests"] += 1
+            _stats["last_endpoint"] = profile_url
+            _stats["last_request_utc"] = datetime.now(timezone.utc).isoformat()
+            _stats["last_http_status"] = response.status_code
+            if response.status_code == 429:
+                delay = max(21600, COOLDOWN_DEFAULT_SECONDS)
+                global _cooldown_until, _cooldown_reason
+                _cooldown_until = time.monotonic() + delay
+                _cooldown_reason = f"DexScreener rate limit; retry after cooldown ({delay}s)"
+                raise RuntimeError(_cooldown_reason)
+            response.raise_for_status()
+            profiles = response.json()
+            if not isinstance(profiles, list):
+                raise ValueError("DexScreener returned an invalid token-profile list")
+            addresses = list(dict.fromkeys(
+                str(item.get("tokenAddress") or "")
+                for item in profiles
+                if isinstance(item, dict) and item.get("chainId") == "solana" and item.get("tokenAddress")
+            ))[:30]
+            if not addresses:
+                raise ValueError("DexScreener returned no Solana token profiles")
+            # Batch up to 30 addresses in one call; no API key is required.
+            token_url = "https://api.dexscreener.com/tokens/v1/solana/" + ",".join(addresses)
+            response = await client.get(token_url)
+            _stats["requests"] += 1
+            _stats["last_endpoint"] = token_url
+            _stats["last_request_utc"] = datetime.now(timezone.utc).isoformat()
+            _stats["last_http_status"] = response.status_code
+            response.raise_for_status()
+            pairs = response.json()
+            if not isinstance(pairs, list):
+                raise ValueError("DexScreener returned an invalid token-pair list")
+            best_by_address: dict[str, dict] = {}
+            for pair in pairs:
+                if not isinstance(pair, dict) or pair.get("chainId") != "solana":
+                    continue
+                token = pair.get("baseToken") if isinstance(pair.get("baseToken"), dict) else {}
+                address = str(token.get("address") or "")
+                if not address:
+                    continue
+                old = best_by_address.get(address)
+                liquidity = _num((pair.get("liquidity") or {}).get("usd"))
+                old_liquidity = _num(((old or {}).get("liquidity") or {}).get("usd"))
+                if old is None or liquidity > old_liquidity:
+                    best_by_address[address] = pair
+            for address, pair in best_by_address.items():
+                token = pair.get("baseToken") or {}
+                volume = pair.get("volume") or {}
+                txns = pair.get("txns") or {}
+                h24 = txns.get("h24") or {}
+                change = pair.get("priceChange") or {}
+                liquidity = (pair.get("liquidity") or {})
+                buys = int(_num(h24.get("buys")))
+                sells = int(_num(h24.get("sells")))
+                volume24 = _num(volume.get("h24"))
+                price = _num(pair.get("priceUsd"))
+                change24 = change.get("h24")
+                candidates.append({
+                    "token_address": address,
+                    "symbol": str(token.get("symbol") or "UNKNOWN").strip() or "UNKNOWN",
+                    "token_symbol": str(token.get("symbol") or "UNKNOWN").strip() or "UNKNOWN",
+                    "name": str(token.get("name") or ""),
+                    "price_usd": price,
+                    "liquidity_usd": _num(liquidity.get("usd")),
+                    "volume_24h_usd": volume24,
+                    "volume_24h_present": volume.get("h24") is not None,
+                    "buys_24h": buys, "sells_24h": sells,
+                    "buy_sell_counts_present": h24.get("buys") is not None and h24.get("sells") is not None,
+                    "buy_sell_ratio": buys / sells if sells > 0 else 0.0,
+                    "buys_to_sells_ratio": buys / sells if sells > 0 else 0.0,
+                    "pool_address": pair.get("pairAddress"), "pair_address": pair.get("pairAddress"),
+                    "provider": "DexScreener",
+                    "url": pair.get("url") or f"https://dexscreener.com/solana/{address}",
+                    "listed_at": pair.get("pairCreatedAt"),
+                    "market_cap_usd": _num(pair.get("marketCap")),
+                    "fdv_usd": _num(pair.get("fdv")),
+                    "unique_wallets_24h": 0,
+                    "trade_count_24h": buys + sells,
+                    "price_change_24h_pct": _num(change24),
+                    "price_change_24h_present": _has_finite_number(change24),
+                })
+            _stats["listing_items"] = len(candidates)
+            _stats["last_error"] = None
     except Exception as exc:
-        errors.append(f"birdeye_token_list_v3: {type(exc).__name__}: {str(exc)[:180]}")
+        errors.append(f"dexscreener_discovery: {type(exc).__name__}: {str(exc)[:180]}")
+        _stats["last_error"] = errors[-1]
 
-    _stats["listing_items"] = total_items
     diagnostics = {
-        "provider": "Birdeye",
-        "source_counts": {"Birdeye_token_list_v3": total_items},
+        "provider": "DexScreener",
+        "source_counts": {"DexScreener_token_profiles_and_pairs": len(candidates)},
         "source_errors": errors[-10:],
         "last_error": errors[-1] if errors else None,
-        "overview_batch_size": total_items,
-        "endpoint": BIRDEYE_LIST_URL,
-        "sort_by": "liquidity",
-        "sort_type": "desc",
+        "overview_batch_size": len(candidates),
+        "endpoint": "https://api.dexscreener.com/tokens/v1/solana/{up-to-30-token-addresses}",
         "local_min_liquidity_usd": MIN_LIQUIDITY_USD,
         "local_min_volume_24h_usd": MIN_VOLUME_24H_USD,
-        "has_next": has_next,
         "request_interval_seconds": REQUEST_INTERVAL_SECONDS,
-        "cooldown_default_seconds": COOLDOWN_DEFAULT_SECONDS,
-        "note": "Discovery and market metrics use Birdeye Token List V3. Paper mode only.",
-        "mode": TRADING_MODE,
-        "real_trading_enabled": REAL_TRADING_ENABLED,
+        "note": "Keyless DexScreener public API; public rate limits apply. Paper mode only.",
+        "mode": TRADING_MODE, "real_trading_enabled": REAL_TRADING_ENABLED,
     }
     return candidates, diagnostics
 
@@ -363,7 +410,7 @@ async def get_signal_candidates(
         "mode": TRADING_MODE, "real_trading_enabled": REAL_TRADING_ENABLED,
         "provider_diagnostics": get_signal_engine_status(),
     })
-    return {"provider": "Birdeye", "checked": len(candidates),
+    return {"provider": "DexScreener", "checked": len(candidates),
             "candidate_count": len(filtered), "signals": signals,
             "note": diagnostics.get("note"), "last_error": diagnostics.get("last_error"),
             "source_errors": diagnostics.get("source_errors", []), "diagnostics": diagnostics_out}
@@ -372,7 +419,7 @@ async def get_signal_candidates(
 def get_signal_engine_status() -> dict:
     now = time.monotonic()
     return {
-        "provider": "Birdeye", "mode": TRADING_MODE,
+        "provider": "DexScreener", "mode": TRADING_MODE,
         "real_trading_enabled": REAL_TRADING_ENABLED,
         "cache_age_seconds": round(now - float(_cache.get("timestamp", 0)), 1) if _cache.get("timestamp") else None,
         "cache_ttl_seconds": int(_cache.get("cache_for_seconds", CACHE_SECONDS)),
