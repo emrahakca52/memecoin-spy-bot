@@ -125,3 +125,80 @@ def _score(c: dict) -> float:
 async def get_signal_candidates(
     min_liquidity_usd: float | None = None,
     min_volume_24h_usd: float | None = None,
+    min_buys_sells_ratio: float | None = None,
+    limit: int = 20,
+) -> dict:
+    min_liq = MIN_LIQUIDITY_USD if min_liquidity_usd is None else min_liquidity_usd
+    min_vol = MIN_VOLUME_24H_USD if min_volume_24h_usd is None else min_volume_24h_usd
+    min_ratio = MIN_BUYS_SELLS_RATIO if min_buys_sells_ratio is None else min_buys_sells_ratio
+
+    async with _lock:
+        now = time.monotonic()
+        if now - _cache["timestamp"] < CACHE_SECONDS and _cache["candidates"]:
+            candidates = _cache["candidates"]
+            diagnostics = _cache["diagnostics"]
+        else:
+            candidates, diagnostics = await _fetch_candidates()
+            _cache.update({"timestamp": now, "candidates": candidates, "diagnostics": diagnostics})
+
+    filtered = []
+    rejected = []
+    for c in candidates:
+        reasons = []
+        liq = _num(c.get("liquidity_usd"))
+        vol = _num(c.get("volume_24h_usd"))
+        ratio = _num(c.get("buy_sell_ratio"))
+        price = _num(c.get("price_usd"))
+        trades = int(_num(c.get("trade_count_24h")))
+        change = _num(c.get("price_change_24h_pct"))
+
+        if liq < min_liq:
+            reasons.append("low_liquidity")
+        if vol < min_vol:
+            reasons.append("low_volume")
+        if ratio < min_ratio or c.get("buys_24h", 0) == 0 or c.get("sells_24h", 0) == 0:
+            reasons.append("weak_buy_sell")
+        if trades < MIN_TRADES_24H:
+            reasons.append("low_trades")
+        if abs(change) > MAX_PRICE_CHANGE_24H_PCT:
+            reasons.append("extreme_price_change")
+        if change < -MAX_NEGATIVE_PRICE_CHANGE_24H_PCT:
+            reasons.append("too_negative")
+        if price <= 0:
+            reasons.append("bad_price")
+
+        if reasons:
+            rejected.append({"symbol": c.get("symbol"), "reasons": reasons})
+            continue
+
+        item = dict(c)
+        item["score"] = round(_score(item), 2)
+        filtered.append(item)
+
+    filtered.sort(key=lambda x: x["score"], reverse=True)
+    signals = filtered[:limit]
+
+    return {
+        "provider": "DexScreener",
+        "checked": len(candidates),
+        "candidate_count": len(filtered),
+        "signals": signals,
+        "diagnostics": {
+            **diagnostics,
+            "rejected_count": len(rejected),
+            "filters": {
+                "min_liquidity_usd": min_liq,
+                "min_volume_24h_usd": min_vol,
+                "min_buys_sells_ratio": min_ratio,
+            },
+        },
+        "mode": TRADING_MODE,
+    }
+
+def get_signal_engine_status() -> dict:
+    return {
+        "provider": "DexScreener",
+        "mode": TRADING_MODE,
+        "cache_age_seconds": round(time.monotonic() - _cache.get("timestamp", 0), 1),
+        "last_candidate_count": len(_cache.get("candidates", [])),
+    }
