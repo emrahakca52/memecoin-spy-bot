@@ -129,6 +129,37 @@ class ExtremeQuoteExitGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(paper_engine._paper_trades[0]["realized_pnl_usd"], -0.8)
 
 
+class PaperExecutionCostTests(unittest.TestCase):
+    def setUp(self):
+        self.positions = paper_engine._open_positions
+        self.trades = paper_engine._paper_trades
+        self.realized = paper_engine._realized_pnl_usd
+        paper_engine._open_positions = {}
+        paper_engine._paper_trades = []
+        paper_engine._realized_pnl_usd = 0.0
+
+    def tearDown(self):
+        paper_engine._open_positions = self.positions
+        paper_engine._paper_trades = self.trades
+        paper_engine._realized_pnl_usd = self.realized
+
+    def test_new_buy_and_sell_record_estimated_costs_without_changing_gross_pnl(self):
+        with (
+            patch.object(paper_engine, "_save_paper_state", return_value=True),
+            patch.object(paper_engine, "PAPER_FEE_PCT_PER_SIDE", 0.1),
+            patch.object(paper_engine, "PAPER_SLIPPAGE_PCT_PER_SIDE", 0.2),
+        ):
+            paper_engine.open_paper_position("fee-token", "FEE", 10.0, 1.0)
+            position = paper_engine._open_positions["fee-token"]
+            self.assertAlmostEqual(position["estimated_entry_cost_usd"], 0.03)
+            paper_engine.record_paper_trade("fee-token", "SELL", 11.0, 1.1, "FEE")
+        sell = paper_engine._paper_trades[-1]
+        self.assertAlmostEqual(sell["realized_pnl_usd"], 1.0)
+        self.assertAlmostEqual(sell["estimated_exit_cost_usd"], 0.033)
+        self.assertAlmostEqual(sell["net_realized_pnl_usd"], 0.937)
+        self.assertAlmostEqual(sell["estimated_transaction_cost_usd"], 0.063)
+
+
 class StalePriceMarkTests(unittest.TestCase):
     def test_stale_mark_is_excluded_from_current_valuation(self):
         original_positions = paper_engine._open_positions

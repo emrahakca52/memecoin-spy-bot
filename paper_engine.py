@@ -41,6 +41,17 @@ PRICE_JUMP_PENDING_MAX_AGE_SECONDS = max(
     30, int(os.getenv("PRICE_JUMP_PENDING_MAX_AGE_SECONDS", "600"))
 )
 
+# Illustrative paper-only execution-cost assumptions; override with env vars.
+# These are estimates, not measured venue fees or guaranteed slippage.
+PAPER_FEE_PCT_PER_SIDE = max(0.0, float(os.getenv("PAPER_FEE_PCT_PER_SIDE", "0.1")))
+PAPER_SLIPPAGE_PCT_PER_SIDE = max(0.0, float(os.getenv("PAPER_SLIPPAGE_PCT_PER_SIDE", "0.2")))
+
+
+def _estimated_execution_cost(notional_usd):
+    notional = max(0.0, _num(notional_usd))
+    return round(notional * (PAPER_FEE_PCT_PER_SIDE + PAPER_SLIPPAGE_PCT_PER_SIDE) / 100.0, 8)
+
+
 # These remain the existing paper-strategy thresholds. They are not validated
 # live-trading parameters.
 TAKE_PROFIT_PCT = 10.0
@@ -735,6 +746,9 @@ def record_paper_trade(
     }
 
     if side == "BUY":
+        entry_cost = _estimated_execution_cost(amount_usd)
+        trade["estimated_entry_cost_usd"] = entry_cost
+        trade["estimated_transaction_cost_usd"] = entry_cost
         quantity = amount_usd / price_usd
         if not math.isfinite(quantity) or quantity <= 0:
             raise ValueError("calculated buy quantity is invalid")
@@ -748,6 +762,7 @@ def record_paper_trade(
                 "entry_price_usd": price_usd,
                 "current_price_usd": price_usd,
                 "invested_usd": amount_usd,
+                "estimated_entry_cost_usd": entry_cost,
                 "quantity": quantity,
                 "unrealized_pnl_usd": 0.0,
                 "opened_at": time.time(),
@@ -768,6 +783,9 @@ def record_paper_trade(
             ) / total_qty
             position["quantity"] = total_qty
             position["invested_usd"] = old_invested + amount_usd
+            position["estimated_entry_cost_usd"] = (
+                _num(position.get("estimated_entry_cost_usd")) + entry_cost
+            )
             position["current_price_usd"] = price_usd
             position["unrealized_pnl_usd"] = (
                 total_qty * price_usd - old_invested - amount_usd
@@ -796,7 +814,24 @@ def record_paper_trade(
         trade["amount_usd"] = round(proceeds, 8)
         trade["quantity_sold"] = sell_qty
         trade["cost_basis_usd"] = round(cost, 8)
+        entry_cost_known = position.get("estimated_entry_cost_usd") is not None
+        allocated_entry_cost = (
+            _num(position.get("estimated_entry_cost_usd")) * sell_qty / qty
+            if entry_cost_known else None
+        )
+        exit_cost = _estimated_execution_cost(proceeds)
         trade["realized_pnl_usd"] = round(realized, 8)
+        trade["estimated_entry_cost_allocated_usd"] = (
+            round(allocated_entry_cost, 8) if entry_cost_known else None
+        )
+        trade["estimated_exit_cost_usd"] = exit_cost
+        trade["estimated_transaction_cost_usd"] = (
+            round(allocated_entry_cost + exit_cost, 8) if entry_cost_known else None
+        )
+        trade["net_realized_pnl_usd"] = (
+            round(realized - allocated_entry_cost - exit_cost, 8)
+            if entry_cost_known else None
+        )
         _paper_trades.append(trade)
         _realized_pnl_usd += realized
 
@@ -805,6 +840,10 @@ def record_paper_trade(
         else:
             position["quantity"] = remaining_qty
             position["invested_usd"] = remaining_invested
+            if entry_cost_known:
+                position["estimated_entry_cost_usd"] = max(
+                    0.0, _num(position.get("estimated_entry_cost_usd")) - allocated_entry_cost
+                )
             position["unrealized_pnl_usd"] = (
                 remaining_qty * _num(position.get("current_price_usd"))
                 - remaining_invested
@@ -907,6 +946,9 @@ def _close_position(address, position, price, reason, observed_change_pct=None):
         else None
     )
     change = (price / entry - 1) * 100
+    estimated_costs_known = position.get("estimated_entry_cost_usd") is not None
+    estimated_entry_cost = _num(position.get("estimated_entry_cost_usd")) if estimated_costs_known else 0.0
+    estimated_exit_cost = _estimated_execution_cost(value)
     trade = {
         "token_address": address,
         "token_symbol": position.get("token_symbol", address[:8]),
@@ -916,6 +958,10 @@ def _close_position(address, position, price, reason, observed_change_pct=None):
         "source": "auto",
         "reason": reason,
         "realized_pnl_usd": round(pnl, 8),
+        "estimated_exit_cost_usd": estimated_exit_cost,
+        "estimated_entry_cost_allocated_usd": round(estimated_entry_cost, 8) if estimated_costs_known else None,
+        "estimated_transaction_cost_usd": round(estimated_entry_cost + estimated_exit_cost, 8) if estimated_costs_known else None,
+        "net_realized_pnl_usd": round(pnl - estimated_entry_cost - estimated_exit_cost, 8) if estimated_costs_known else None,
         "entry_price_usd": entry,
         "change_pct": round(change, 4),
         "trigger_price_usd": trigger,
@@ -1249,6 +1295,44 @@ def get_paper_status():
         positions.append(position)
 
     accounting = _reported_realized_pnl(_paper_trades)
+    estimated_realized_costs = 0.0
+    net_costs_incomplete = False
+    for trade in _paper_trades:
+        if not isinstance(trade, dict) or str(trade.get("side", "")).upper() != "SELL":
+            continue
+        if trade.get("accounting_quarantined") or _is_quarantined_trade(trade):
+            net_costs_incomplete = True
+            continue
+        costs = trade.get("estimated_transaction_cost_usd")
+        if costs is None:
+            net_costs_incomplete = True
+        else:
+            estimated_realized_costs += _num(costs)
+    open_position_estimated_costs = 0.0
+    estimated_open_exit_costs = 0.0
+    for stored in _open_positions.values():
+        entry_cost = stored.get("estimated_entry_cost_usd")
+        if entry_cost is None:
+            net_costs_incomplete = True
+        else:
+            open_position_estimated_costs += _num(entry_cost)
+        status = stored.get("price_mark_status")
+        mark_age = _price_mark_age_seconds(stored)
+        if (
+            status == "unverified_extreme_quote"
+            or (status != "independently_verified_extreme_quote"
+                and (mark_age is None or mark_age > stale_threshold))
+        ):
+            net_costs_incomplete = True
+            continue
+        marked_notional = _num(stored.get("quantity")) * _num(stored.get("current_price_usd"))
+        estimated_open_exit_costs += _estimated_execution_cost(marked_notional)
+    estimated_net_total_pnl = (
+        verified_unrealized + _realized_pnl_usd
+        - estimated_realized_costs
+        - open_position_estimated_costs
+        - estimated_open_exit_costs
+    )
     accounting_incomplete = bool(
         unverified_count
         or stale_count
@@ -1269,6 +1353,16 @@ def get_paper_status():
         "paper_unrealized_pnl_usd": round(verified_unrealized, 8),
         "paper_realized_pnl_usd": round(_realized_pnl_usd, 8),
         "paper_total_pnl_usd": round(verified_unrealized + _realized_pnl_usd, 8),
+        "paper_estimated_net_total_pnl_usd": round(estimated_net_total_pnl, 8),
+        "paper_estimated_realized_transaction_costs_usd": round(estimated_realized_costs, 8),
+        "paper_estimated_open_entry_costs_usd": round(open_position_estimated_costs, 8),
+        "paper_estimated_open_exit_costs_usd": round(estimated_open_exit_costs, 8),
+        "paper_estimated_net_pnl_incomplete": net_costs_incomplete,
+        "paper_execution_cost_assumptions": {
+            "fee_pct_per_side": PAPER_FEE_PCT_PER_SIDE,
+            "slippage_pct_per_side": PAPER_SLIPPAGE_PCT_PER_SIDE,
+            "note": "Illustrative estimates only; actual fees and slippage vary by venue, liquidity, and execution."
+        },
         "unverified_position_count": unverified_count,
         "unverified_position_invested_usd": round(unverified_invested, 8),
         "stale_price_position_count": stale_count,
