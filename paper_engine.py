@@ -1,4 +1,4 @@
-"""Paper trading engine with improved exits and risk controls."""
+"""Paper trading engine with basic price diagnostics."""
 import asyncio
 import json
 import logging
@@ -16,10 +16,6 @@ from config import (
 )
 
 logger = logging.getLogger("memecoin_spy.paper_engine")
-
-PRICE_TIMEOUT_SECONDS = 12
-PRICE_CACHE_SECONDS = 90
-MIN_HOLD_SECONDS = MIN_HOLD_SECONDS
 
 _price_cache = {}
 _open_positions = {}
@@ -105,7 +101,7 @@ async def get_token_prices_usd(token_addresses, reference_prices=None):
     if not addresses:
         return {}
     results = {}
-    async with httpx.AsyncClient(timeout=PRICE_TIMEOUT_SECONDS) as client:
+    async with httpx.AsyncClient(timeout=12) as client:
         for offset in range(0, len(addresses), 30):
             batch = addresses[offset:offset+30]
             url = "https://api.dexscreener.com/tokens/v1/solana/" + ",".join(batch)
@@ -127,6 +123,17 @@ async def get_token_prices_usd(token_addresses, reference_prices=None):
             except Exception:
                 continue
     return results
+
+async def get_token_price_usd(token_address):
+    prices = await get_token_prices_usd([token_address])
+    return prices.get(token_address)
+
+def get_price_diagnostics():
+    return {
+        "provider": "dexscreener",
+        "status": "ok",
+        "cached_prices": len(_price_cache),
+    }
 
 def record_paper_trade(token_address, side, amount_usd, price_usd, token_symbol="", source="manual", reason=None):
     global _realized_pnl_usd
@@ -253,20 +260,17 @@ async def update_paper_prices():
             pos["current_price_usd"] = price
             continue
 
-        # Update highest for trailing
         highest = max(pos.get("highest_price", entry), price)
         pos["highest_price"] = highest
         pos["current_price_usd"] = price
 
-        # Trailing stop
-        if change > 8:  # en az %8 kâr varsa
+        if change > 8:
             trail = highest * (1 - TRAILING_STOP_PCT / 100)
             if price <= trail:
                 if _close_position(address, pos, price, "trailing_stop", change):
                     closed += 1
                     continue
 
-        # Normal TP / SL
         if change >= TAKE_PROFIT_PCT:
             if _close_position(address, pos, price, "take_profit", change):
                 closed += 1
@@ -300,3 +304,6 @@ def get_paper_trades():
 
 def paper_status():
     return get_paper_status()
+
+def list_paper_trades():
+    return get_paper_trades()
