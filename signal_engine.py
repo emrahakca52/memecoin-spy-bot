@@ -86,11 +86,20 @@ def _jupiter_candidates(tokens: Any) -> list[dict]:
             ) + _first_num(
                 stats.get("sellVolume"), stats.get("sellVolumeUsd"), stats.get("sellVolume24h")
             )
-        # Jupiter reports stats24h.priceChange as a ratio (0.10 means +10%).
-        price_change_raw = stats.get("priceChangePercent", token.get("priceChange24h"))
-        if price_change_raw is None and _has_finite_number(stats.get("priceChange")):
-            price_change_raw = _num(stats.get("priceChange")) * 100.0
-        change_present = _has_finite_number(price_change_raw)
+        # Keep percentage fields as percentages; Jupiter stats24h.priceChange is a ratio.
+        # Do not infer units from the magnitude: a genuine +0.5% must remain +0.5%.
+        if _has_finite_number(stats.get("priceChangePercent")):
+            price_change_pct = _num(stats.get("priceChangePercent"))
+            change_present = True
+        elif _has_finite_number(token.get("priceChange24h")):
+            price_change_pct = _num(token.get("priceChange24h"))
+            change_present = True
+        elif _has_finite_number(stats.get("priceChange")):
+            price_change_pct = _num(stats.get("priceChange")) * 100.0
+            change_present = True
+        else:
+            price_change_pct = 0.0
+            change_present = False
         candidates.append({
             "token_address": address,
             "symbol": token.get("symbol") or "UNKNOWN",
@@ -102,7 +111,7 @@ def _jupiter_candidates(tokens: Any) -> list[dict]:
             "sells_24h": sells,
             "buy_sell_ratio": buys / sells if sells > 0 else 0.0,
             "trade_count_24h": int(_first_num(stats.get("numTraders"), stats.get("tradeCount"), buys + sells)),
-            "price_change_24h_pct": _num(price_change_raw) * (100.0 if abs(_num(price_change_raw)) <= 1.0 else 1.0),
+            "price_change_24h_pct": price_change_pct,
             "price_change_24h_present": change_present,
             "market_cap_usd": _first_num(token.get("mcap"), token.get("marketCap")),
             "provider": "Jupiter",
