@@ -17,7 +17,7 @@ class JupiterDiscoveryTests(unittest.TestCase):
                 "numSells": 60,
                 "buyVolume": 18000,
                 "sellVolume": 12000,
-                "priceChange": 12.5,
+                "priceChange": 0.125,
                 "numTraders": 150,
             },
         }]
