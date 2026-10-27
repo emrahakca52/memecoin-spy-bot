@@ -86,7 +86,10 @@ def _jupiter_candidates(tokens: Any) -> list[dict]:
             ) + _first_num(
                 stats.get("sellVolume"), stats.get("sellVolumeUsd"), stats.get("sellVolume24h")
             )
-        price_change_raw = stats.get("priceChange", stats.get("priceChangePercent", token.get("priceChange24h")))
+        # Jupiter reports stats24h.priceChange as a ratio (0.10 means +10%).
+        price_change_raw = stats.get("priceChangePercent", token.get("priceChange24h"))
+        if price_change_raw is None and _has_finite_number(stats.get("priceChange")):
+            price_change_raw = _num(stats.get("priceChange")) * 100.0
         change_present = _has_finite_number(price_change_raw)
         candidates.append({
             "token_address": address,
