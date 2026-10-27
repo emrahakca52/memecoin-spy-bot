@@ -937,6 +937,37 @@ def _close_position(address, position, price, reason, observed_change_pct=None):
     return True
 
 
+async def _fetch_dexscreener_price(address):
+    """Fetch an independent Solana token price from DexScreener for safety checks."""
+    if not address:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=8.0, headers={"Accept": "application/json"}) as client:
+            response = await client.get(
+                f"https://api.dexscreener.com/latest/dex/tokens/{address}"
+            )
+            response.raise_for_status()
+            payload = response.json()
+        pairs = payload.get("pairs") if isinstance(payload, dict) else None
+        candidates = []
+        for pair in pairs or []:
+            if not isinstance(pair, dict) or str(pair.get("chainId", "")).lower() != "solana":
+                continue
+            base = pair.get("baseToken") or {}
+            if str(base.get("address", "")).lower() != str(address).lower():
+                continue
+            price = _num(pair.get("priceUsd"))
+            liquidity = _num((pair.get("liquidity") or {}).get("usd"))
+            if price > 0 and liquidity > 0 and math.isfinite(price):
+                candidates.append((liquidity, price))
+        if not candidates:
+            return None
+        return max(candidates, key=lambda item: item[0])[1]
+    except (httpx.HTTPError, ValueError, TypeError, AttributeError) as exc:
+        logger.warning("Independent DexScreener price check failed for %s: %s", address[:10], type(exc).__name__)
+        return None
+
+
 async def update_paper_prices():
     updated = closed = errors = 0
     addresses = list(_open_positions)
@@ -1019,6 +1050,29 @@ async def update_paper_prices():
         # position mark/unrealized P&L or trigger an automatic paper sale.
         # Existing current_price_usd and unrealized_pnl_usd remain unchanged.
         if extreme_quote:
+            # An independent market-data source may corroborate a genuine crash.
+            # This makes the paper mark visible, but deliberately never auto-sells
+            # on an extreme move; the position remains open for review.
+            independent_price = await _fetch_dexscreener_price(address)
+            corroborated = (
+                independent_price is not None
+                and abs(independent_price / price - 1.0) * 100.0
+                <= PRICE_JUMP_CONFIRMATION_TOLERANCE_PCT
+            )
+            if corroborated:
+                position["current_price_usd"] = independent_price
+                qty = _num(position.get("quantity"))
+                invested = _num(position.get("invested_usd"))
+                position["unrealized_pnl_usd"] = round(qty * independent_price - invested, 8)
+                position["last_price_update_utc"] = _utc_now()
+                position["price_mark_status"] = "independently_verified_extreme_quote"
+                position["price_verification_provider"] = "DexScreener"
+                position["price_verification_price_usd"] = independent_price
+                position["price_safety_warning"] = (
+                    "Extreme move corroborated by independent DexScreener market data; "
+                    "position remains open and automatic exit is withheld for safety."
+                )
+                updated += 1
             errors += 1
             continue
 
