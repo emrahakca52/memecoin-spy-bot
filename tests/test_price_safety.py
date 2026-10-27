@@ -108,7 +108,7 @@ class AccountingQuarantineRegressionTests(unittest.TestCase):
         result = paper_engine._reported_realized_pnl(history)
 
         self.assertAlmostEqual(result["realized_pnl_usd"], -2.5)
-        self.assertEqual(len(result["quarantined_trades"]), 1)
+        self.assertEqual(len(result["quarantined_sell_records"]), 1)
         self.assertEqual(history, before)
 
     def test_non_finite_numeric_values_fall_back_safely(self):
