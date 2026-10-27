@@ -86,5 +86,36 @@ class ExtremeQuoteExitGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(paper_engine._paper_trades[0]["realized_pnl_usd"], -0.8)
 
 
+class AccountingQuarantineRegressionTests(unittest.TestCase):
+    def test_known_bad_mrbeast_sell_is_excluded_without_mutating_history(self):
+        bad_trade = {
+            "side": "SELL",
+            "token_symbol": "MRBEAST",
+            "token_address": "4hqN5vhCG1q13qYUQvBhyMDDnpWKP98DoswDeDCVQaCn",
+            "price_usd": 123.45,
+            "realized_pnl_usd": 16_100_066.6799,
+        }
+        valid_trade = {
+            "side": "SELL",
+            "token_symbol": "SAFE",
+            "token_address": "ordinary-token",
+            "price_usd": 0.12,
+            "realized_pnl_usd": -2.5,
+        }
+        history = [bad_trade.copy(), valid_trade.copy()]
+        before = [trade.copy() for trade in history]
+
+        result = paper_engine._reported_realized_pnl(history)
+
+        self.assertAlmostEqual(result["realized_pnl_usd"], -2.5)
+        self.assertEqual(len(result["quarantined_trades"]), 1)
+        self.assertEqual(history, before)
+
+    def test_non_finite_numeric_values_fall_back_safely(self):
+        for value in (float("nan"), float("inf"), float("-inf"), "not-a-number"):
+            with self.subTest(value=value):
+                self.assertEqual(paper_engine._num(value), 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()
