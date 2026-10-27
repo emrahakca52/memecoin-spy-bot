@@ -52,6 +52,10 @@ class ExtremeQuoteExitGuardTests(unittest.IsolatedAsyncioTestCase):
                 paper_engine, "get_token_prices_usd",
                 new=AsyncMock(return_value={"token-address": 0.001}),
             ),
+            patch.object(
+                paper_engine, "_fetch_dexscreener_price",
+                new=AsyncMock(return_value=None),
+            ),
             patch.object(paper_engine, "_save_paper_state", return_value=True),
         ):
             result = await paper_engine.update_paper_prices()
@@ -70,6 +74,10 @@ class ExtremeQuoteExitGuardTests(unittest.IsolatedAsyncioTestCase):
                 paper_engine, "get_token_prices_usd",
                 new=AsyncMock(return_value={"token-address": 10.0}),
             ),
+            patch.object(
+                paper_engine, "_fetch_dexscreener_price",
+                new=AsyncMock(return_value=None),
+            ),
             patch.object(paper_engine, "_save_paper_state", return_value=True),
         ):
             result = await paper_engine.update_paper_prices()
@@ -79,6 +87,29 @@ class ExtremeQuoteExitGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             paper_engine._open_positions["token-address"]["current_price_usd"], 0.1
         )
+        self.assertEqual(paper_engine._paper_trades, [])
+
+    async def test_independent_price_corroboration_marks_extreme_quote_but_does_not_sell(self):
+        with (
+            patch.object(
+                paper_engine, "get_token_prices_usd",
+                new=AsyncMock(return_value={"token-address": 0.001}),
+            ),
+            patch.object(
+                paper_engine, "_fetch_dexscreener_price",
+                new=AsyncMock(return_value=0.00102),
+            ),
+            patch.object(paper_engine, "_save_paper_state", return_value=True),
+        ):
+            result = await paper_engine.update_paper_prices()
+
+        self.assertEqual(result["closed"], 0)
+        self.assertEqual(result["updated"], 1)
+        position = paper_engine._open_positions["token-address"]
+        self.assertEqual(position["price_mark_status"], "independently_verified_extreme_quote")
+        self.assertEqual(position["price_verification_provider"], "DexScreener")
+        self.assertAlmostEqual(position["current_price_usd"], 0.00102)
+        self.assertAlmostEqual(position["unrealized_pnl_usd"], -9.898)
         self.assertEqual(paper_engine._paper_trades, [])
 
     async def test_normal_stop_loss_can_still_close_position(self):
