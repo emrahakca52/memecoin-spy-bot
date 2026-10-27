@@ -22,6 +22,7 @@ from paper_engine import (
 )
 
 logger = logging.getLogger(__name__)
+logger.info("AUTO_PAPER_BOT LOADED - NEW VERSION")
 
 POLL_SECONDS = max(30, int(os.getenv("PAPER_BOT_POLL_SECONDS", "180")))
 MAX_ENTRY_PRICE_DEVIATION_PCT = 10.0
@@ -171,39 +172,4 @@ async def _loop(stop_event):
             pass
 
 async def start_bot():
-    global _task, _stop_event
-    if _task is not None and not _task.done():
-        return bot_status()
-    _stop_event = asyncio.Event()
-    _task = asyncio.create_task(_loop(_stop_event))
-    return bot_status()
-
-async def stop_bot():
-    global _task, _stop_event
-    if _stop_event:
-        _stop_event.set()
-    if _task:
-        try:
-            await asyncio.wait_for(_task, timeout=5)
-        except asyncio.TimeoutError:
-            _task.cancel()
-    _task = None
-    _stop_event = None
-    return bot_status()
-
-def bot_status():
-    return {
-        "mode": "paper",
-        "running": _task is not None and not _task.done(),
-        "real_trading_enabled": False,
-        "poll_interval_seconds": POLL_SECONDS,
-        "paper_amount_per_position_usd": PAPER_AMOUNT_USD,
-        "max_open_positions": MAX_OPEN_POSITIONS,
-        "take_profit_pct": TAKE_PROFIT_PCT,
-        "stop_loss_pct": STOP_LOSS_PCT,
-        "last_run_utc": _last_run,
-        "last_error": _last_error,
-        "last_skipped": _last_skipped[-8:],
-        "copyfomo_gate_enabled": COPYFOMO_GATE_ENABLED,
-        "warning": "Paper only.",
-    }
+    global _task, _stop_
