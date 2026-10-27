@@ -899,9 +899,16 @@ def _close_position(address, position, price, reason, observed_change_pct=None):
     # A suspicious quote must not realize a paper loss/profit solely because a
     # caller invokes this helper directly. Keep the position open for review.
     change = (price / entry - 1) * 100
+    verified_extreme_close = (
+        position.get("price_mark_status") == "independently_verified_extreme_quote"
+        and position.get("price_verification_provider") == "DexScreener"
+        and _num(position.get("price_verification_price_usd")) > 0
+        and abs(_num(position.get("price_verification_price_usd")) / price - 1.0) * 100
+        <= PRICE_JUMP_CONFIRMATION_TOLERANCE_PCT
+    )
     if reason == "stop_loss_5pct":
         overshoot = STOP_LOSS_PCT - change
-        if overshoot > MAX_STOP_LOSS_OVERSHOOT_PCT:
+        if overshoot > MAX_STOP_LOSS_OVERSHOOT_PCT and not verified_extreme_close:
             message = (
                 f"{position.get('token_symbol', address[:8])} close refused: "
                 f"stop-loss quote implies {change:.2f}% from entry "
@@ -1114,11 +1121,21 @@ async def update_paper_prices():
                 position["price_mark_status"] = "independently_verified_extreme_quote"
                 position["price_verification_provider"] = "DexScreener"
                 position["price_verification_price_usd"] = independent_price
-                position["price_safety_warning"] = (
-                    "Extreme move corroborated by independent DexScreener market data; "
-                    "position remains open and automatic exit is withheld for safety."
-                )
-                updated += 1
+                # A second provider confirms the extreme move. In paper mode,
+                # allow a confirmed crash to trigger the existing stop-loss so
+                # the simulation does not strand a position indefinitely.
+                # Keep extreme take-profit exits guarded against anomalous spikes.
+                if change <= STOP_LOSS_PCT:
+                    closed += int(_close_position(
+                        address, position, independent_price,
+                        "stop_loss_5pct", change
+                    ))
+                else:
+                    position["price_safety_warning"] = (
+                        "Extreme move corroborated by independent DexScreener market data; "
+                        "position remains open because automatic extreme take-profit is withheld."
+                    )
+                    updated += 1
             errors += 1
             continue
 
