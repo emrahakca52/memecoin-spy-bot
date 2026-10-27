@@ -68,18 +68,26 @@ def _jupiter_candidates(tokens: Any) -> list[dict]:
         address = token.get("id") or token.get("mint") or token.get("address")
         if not address:
             continue
-        stats = token.get("stats24h") or token.get("stats24H") or {}
+        stats = token.get("stats24h") or token.get("stats24H") or token.get("stats") or {}
         if not isinstance(stats, dict):
             stats = {}
-        stats = stats.get("24h", stats) if isinstance(stats.get("24h", stats), dict) else stats
+        stats = stats.get("24h", stats.get("h24", stats))
+        if not isinstance(stats, dict):
+            stats = {}
         buys = int(_first_num(stats.get("numBuys"), stats.get("buys"), token.get("numBuys"), token.get("buys24h")))
         sells = int(_first_num(stats.get("numSells"), stats.get("sells"), token.get("numSells"), token.get("sells24h")))
-        volume = _first_num(stats.get("volume"), stats.get("volumeUsd"), stats.get("totalVolume"),
-                            token.get("volume24h"), token.get("volume24H"))
+        volume = _first_num(
+            stats.get("volume"), stats.get("volumeUsd"), stats.get("totalVolume"),
+            stats.get("volumeUSD"), token.get("volume24h"), token.get("volume24H")
+        )
         if not volume:
-            volume = _first_num(stats.get("buyVolume"), stats.get("buyVolumeUsd")) + _first_num(
-                stats.get("sellVolume"), stats.get("sellVolumeUsd")
+            volume = _first_num(
+                stats.get("buyVolume"), stats.get("buyVolumeUsd"), stats.get("buyVolume24h")
+            ) + _first_num(
+                stats.get("sellVolume"), stats.get("sellVolumeUsd"), stats.get("sellVolume24h")
             )
+        price_change_raw = stats.get("priceChange", stats.get("priceChangePercent", token.get("priceChange24h")))
+        change_present = _has_finite_number(price_change_raw)
         candidates.append({
             "token_address": address,
             "symbol": token.get("symbol") or "UNKNOWN",
@@ -90,8 +98,9 @@ def _jupiter_candidates(tokens: Any) -> list[dict]:
             "buys_24h": buys,
             "sells_24h": sells,
             "buy_sell_ratio": buys / sells if sells > 0 else 0.0,
-            "trade_count_24h": buys + sells,
-            "price_change_24h_pct": _first_num(stats.get("priceChange"), token.get("priceChange24h")),
+            "trade_count_24h": int(_first_num(stats.get("numTraders"), stats.get("tradeCount"), buys + sells)),
+            "price_change_24h_pct": _num(price_change_raw),
+            "price_change_24h_present": change_present,
             "market_cap_usd": _first_num(token.get("mcap"), token.get("marketCap")),
             "provider": "Jupiter",
             "url": f"https://jup.ag/tokens/{address}",
@@ -199,6 +208,8 @@ async def get_signal_candidates(
         ratio, price = _num(candidate.get("buy_sell_ratio")), _num(candidate.get("price_usd"))
         trades = int(_num(candidate.get("trade_count_24h")))
         change = _num(candidate.get("price_change_24h_pct"))
+        if candidate.get("price_change_24h_present") is False:
+            continue
         if liq < min_liq or vol < min_vol or ratio < min_ratio or trades < MIN_TRADES_24H:
             continue
         if abs(change) > MAX_PRICE_CHANGE_24H_PCT or change < -MAX_NEGATIVE_PRICE_CHANGE_24H_PCT or price <= 0:
