@@ -71,6 +71,12 @@ def health():
     }
 
 
+@app.get("/signals/status")
+def signal_status():
+    """Read-only discovery-provider diagnostics; does not trigger a market-data scan."""
+    return get_signal_engine_status()
+
+
 @app.get("/signals")
 async def signals(
     min_liquidity_usd: float = Query(10000, ge=0),
