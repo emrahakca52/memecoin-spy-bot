@@ -39,7 +39,6 @@ async def _fetch_candidates() -> tuple[list[dict], dict]:
     errors = []
     try:
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, headers={"User-Agent": "MemecoinSpy/1.0"}) as client:
-            # Latest token profiles
             r = await client.get("https://api.dexscreener.com/token-profiles/latest/v1")
             if r.status_code == 429:
                 raise RuntimeError("DexScreener rate limited")
@@ -59,7 +58,6 @@ async def _fetch_candidates() -> tuple[list[dict], dict]:
             if not addresses:
                 return [], {"error": "No Solana tokens found"}
 
-            # Fetch pair data
             token_url = "https://api.dexscreener.com/tokens/v1/solana/" + ",".join(addresses)
             r = await client.get(token_url)
             if r.status_code == 429:
@@ -86,4 +84,44 @@ async def _fetch_candidates() -> tuple[list[dict], dict]:
                 volume = pair.get("volume", {})
                 txns = pair.get("txns", {}).get("h24", {})
                 change = pair.get("priceChange", {})
-                liq = pair.get
+                liq = pair.get("liquidity", {})
+
+                buys = int(_num(txns.get("buys")))
+                sells = int(_num(txns.get("sells")))
+                candidates.append({
+                    "token_address": addr,
+                    "symbol": token.get("symbol") or "UNKNOWN",
+                    "name": token.get("name") or "",
+                    "price_usd": _num(pair.get("priceUsd")),
+                    "liquidity_usd": _num(liq.get("usd")),
+                    "volume_24h_usd": _num(volume.get("h24")),
+                    "buys_24h": buys,
+                    "sells_24h": sells,
+                    "buy_sell_ratio": buys / sells if sells > 0 else 0,
+                    "trade_count_24h": buys + sells,
+                    "price_change_24h_pct": _num(change.get("h24")),
+                    "market_cap_usd": _num(pair.get("marketCap")),
+                    "provider": "DexScreener",
+                    "url": pair.get("url"),
+                })
+    except Exception as e:
+        errors.append(str(e)[:200])
+
+    diagnostics = {
+        "provider": "DexScreener",
+        "candidate_count": len(candidates),
+        "errors": errors,
+        "mode": TRADING_MODE,
+    }
+    return candidates, diagnostics
+
+def _score(c: dict) -> float:
+    return (
+        min(_num(c.get("liquidity_usd")) / 10000, 5) +
+        min(_num(c.get("volume_24h_usd")) / 20000, 5) +
+        min(_num(c.get("buy_sell_ratio")), 4)
+    )
+
+async def get_signal_candidates(
+    min_liquidity_usd: float | None = None,
+    min_volume_24h_usd: float | None = None,
