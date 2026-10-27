@@ -114,6 +114,16 @@ async def _get_json(client: httpx.AsyncClient, url: str, params: dict[str, Any])
     if response.status_code >= 400:
         detail = " ".join(response.text.split())[:240]
         _stats["last_error"] = f"HTTP {response.status_code}: {detail}"
+        # Birdeye can return HTTP 400 when the account's monthly CU allowance
+        # is exhausted. Repeating the same request cannot fix that and can
+        # waste more quota, so pause discovery for six hours and serve cached
+        # results (if any) until a later retry.
+        if "compute units usage limit exceeded" in detail.lower():
+            global _cooldown_until, _cooldown_reason
+            delay = max(21600, COOLDOWN_DEFAULT_SECONDS)
+            _cooldown_until = time.monotonic() + delay
+            _cooldown_reason = f"Birdeye CU limit exceeded; retry after cooldown ({delay}s)"
+            _stats["last_error"] = f"HTTP {response.status_code}: {detail}; {_cooldown_reason}"
         raise RuntimeError(_stats["last_error"])
     payload = response.json()
     if not isinstance(payload, dict) or payload.get("success") is False:
