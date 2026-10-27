@@ -80,7 +80,6 @@ async def _loop(stop_event):
                 "provider": data.get("provider"),
                 "checked": data.get("checked", 0),
                 "candidate_count": data.get("candidate_count", len(signals)),
-                "filters": diagnostics.get("filters", {}),
             }
 
             eligible_signals = signals
@@ -92,40 +91,36 @@ async def _loop(stop_event):
                     if stop_event.is_set():
                         break
                     gate = await evaluate_candidate(token)
-                    checked.append({"symbol": token.get("symbol"), "token_address": token.get("token_address"), **gate})
+                    checked.append({"symbol": token.get("symbol"), **gate})
                     if gate.get("passed"):
                         eligible_signals.append(token)
                     else:
-                        _last_skipped.append({"symbol": token.get("symbol"), "reason": "copyfomo_gate_rejected"})
+                        _last_skipped.append({"symbol": token.get("symbol"), "reason": "copyfomo_rejected"})
                 _last_copyfomo_checks = checked
 
             valid_signals = []
             for token in eligible_signals:
                 address = token.get("token_address")
-                symbol = token.get("symbol") or token.get("token_symbol") or ""
+                symbol = token.get("symbol") or ""
                 signal_price = _positive_finite_float(token.get("price_usd"))
                 if not address or signal_price is None:
-                    _last_skipped.append({"symbol": symbol, "reason": "invalid_signal_price"})
                     continue
                 valid_signals.append((token, address, symbol, signal_price))
 
             prices = {}
             if valid_signals:
-                prices = await get_token_prices_usd(
-                    [a for _, a, _, _ in valid_signals],
-                    reference_prices={a: p for _, a, _, p in valid_signals},
-                )
+                prices = await get_token_prices_usd([a for _, a, _, _ in valid_signals])
 
             for token, address, symbol, signal_price in valid_signals:
                 if stop_event.is_set():
                     break
                 live_price = prices.get(address)
-                if live_price is None or live_price <= 0:
+                if not live_price or live_price <= 0:
                     _last_skipped.append({"symbol": symbol, "reason": "live_price_unavailable"})
                     continue
                 deviation = abs(live_price / signal_price - 1) * 100
                 if deviation > MAX_ENTRY_PRICE_DEVIATION_PCT:
-                    _last_skipped.append({"symbol": symbol, "reason": "price_deviation", "deviation_pct": round(deviation, 2)})
+                    _last_skipped.append({"symbol": symbol, "reason": "price_deviation"})
                     continue
 
                 result = open_paper_position(
@@ -134,19 +129,13 @@ async def _loop(stop_event):
                     amount_usd=PAPER_AMOUNT_USD,
                     price_usd=live_price,
                     max_open_positions=MAX_OPEN_POSITIONS,
-                    metadata={
-                        "liquidity_usd": token.get("liquidity_usd"),
-                        "volume_24h_usd": token.get("volume_24h_usd"),
-                        "take_profit_pct": TAKE_PROFIT_PCT,
-                        "stop_loss_pct": STOP_LOSS_PCT,
-                    },
                 )
                 if result.get("skipped"):
                     _last_skipped.append({"symbol": symbol, "reason": result.get("reason")})
 
         except Exception as exc:
-            _last_error = f"{type(exc).__name__}: {str(exc)[:200]}"
-            logger.exception("Paper bot scan failed")
+            _last_error = f"{type(exc).__name__}: {str(exc)[:180]}"
+            logger.exception("Scan failed")
         finally:
             _last_run = _utc_now()
 
@@ -160,7 +149,7 @@ async def start_bot():
     if _task is not None and not _task.done():
         return bot_status()
     _stop_event = asyncio.Event()
-    _task = asyncio.create_task(_loop(_stop_event), name="paper-bot-loop")
+    _task = asyncio.create_task(_loop(_stop_event))
     return bot_status()
 
 async def stop_bot():
@@ -186,11 +175,9 @@ def bot_status():
         "max_open_positions": MAX_OPEN_POSITIONS,
         "take_profit_pct": TAKE_PROFIT_PCT,
         "stop_loss_pct": STOP_LOSS_PCT,
-        "max_daily_loss_usd": MAX_DAILY_LOSS_USD,
         "last_run_utc": _last_run,
         "last_error": _last_error,
-        "last_skipped": _last_skipped[-10:],
+        "last_skipped": _last_skipped[-8:],
         "copyfomo_gate_enabled": COPYFOMO_GATE_ENABLED,
-        "price_diagnostics": get_price_diagnostics(),
-        "warning": "Paper simulation only. No real orders.",
+        "warning": "Paper only.",
     }
