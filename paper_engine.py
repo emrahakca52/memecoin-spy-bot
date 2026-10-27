@@ -1,4 +1,4 @@
-"""Paper engine with Jupiter quote support."""
+"""Paper engine with Jupiter + DexScreener fallback."""
 import asyncio
 import json
 import logging
@@ -84,7 +84,6 @@ def load_paper_state():
         return {"ok": False}
 
 async def get_jupiter_quote(input_mint: str, output_mint: str, amount: int) -> dict | None:
-    """Get Jupiter quote. amount in smallest units."""
     params = {
         "inputMint": input_mint,
         "outputMint": output_mint,
@@ -96,22 +95,37 @@ async def get_jupiter_quote(input_mint: str, output_mint: str, amount: int) -> d
             r = await client.get(JUPITER_QUOTE_URL, params=params)
             if r.status_code == 200:
                 return r.json()
-    except Exception as e:
-        logger.warning("Jupiter quote failed: %s", e)
+    except Exception:
+        pass
     return None
 
 async def get_token_price_usd(token_address: str) -> float | None:
-    """Get approximate USD price via Jupiter (token -> USDC)."""
-    # 1 token unit (adjust decimals later if needed)
+    # Jupiter dene
     quote = await get_jupiter_quote(token_address, USDC_MINT, 1_000_000)
-    if not quote or "outAmount" not in quote:
-        return None
+    if quote and "outAmount" in quote:
+        try:
+            out = int(quote["outAmount"])
+            price = out / 1_000_000
+            if price > 0:
+                return price
+        except Exception:
+            pass
+
+    # DexScreener fallback
     try:
-        out = int(quote["outAmount"])
-        # USDC has 6 decimals
-        return out / 1_000_000
+        async with httpx.AsyncClient(timeout=8) as client:
+            r = await client.get(f"https://api.dexscreener.com/tokens/v1/solana/{token_address}")
+            if r.status_code == 200:
+                pairs = r.json()
+                if isinstance(pairs, list) and pairs:
+                    best = max(pairs, key=lambda p: _num((p.get("liquidity") or {}).get("usd")))
+                    price = _num(best.get("priceUsd"))
+                    if price > 0:
+                        return price
     except Exception:
-        return None
+        pass
+
+    return None
 
 async def get_token_prices_usd(token_addresses, reference_prices=None):
     results = {}
@@ -122,7 +136,7 @@ async def get_token_prices_usd(token_addresses, reference_prices=None):
     return results
 
 def get_price_diagnostics():
-    return {"provider": "jupiter", "status": "ok"}
+    return {"provider": "jupiter+dexscreener", "status": "ok"}
 
 def record_paper_trade(token_address, side, amount_usd, price_usd, token_symbol="", source="manual", reason=None):
     global _realized_pnl_usd
@@ -141,7 +155,6 @@ def record_paper_trade(token_address, side, amount_usd, price_usd, token_symbol=
         "source": source,
         "reason": reason,
         "timestamp": time.time(),
-        "provider": "jupiter_quote",
     }
 
     if side == "BUY":
@@ -218,7 +231,6 @@ def _close_position(address, position, price, reason, change_pct):
         "realized_pnl_usd": round(pnl, 4),
         "change_pct": round(change_pct, 2),
         "timestamp": time.time(),
-        "provider": "jupiter_quote",
     }
     _paper_trades.append(trade)
     _realized_pnl_usd += pnl
@@ -283,7 +295,7 @@ def get_paper_status():
         "paper_unrealized_pnl_usd": round(unrealized, 2),
         "paper_realized_pnl_usd": round(_realized_pnl_usd, 2),
         "paper_total_pnl_usd": round(unrealized + _realized_pnl_usd, 2),
-        "provider": "jupiter_quote",
+        "provider": "jupiter+dexscreener",
     }
 
 def get_paper_trades():
