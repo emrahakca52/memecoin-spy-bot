@@ -127,22 +127,48 @@ async def _discover_jupiter(client: httpx.AsyncClient) -> list[dict]:
 
 
 async def _discover_dexscreener(client: httpx.AsyncClient) -> list[dict]:
-    response = await client.get("https://api.dexscreener.com/token-profiles/latest/v1")
-    response.raise_for_status()
-    profiles = response.json()
-    if not isinstance(profiles, list):
-        raise ValueError("Invalid DexScreener profile response")
-    addresses = [
-        p.get("tokenAddress") for p in profiles
-        if isinstance(p, dict) and p.get("chainId") == "solana" and p.get("tokenAddress")
-    ][:30]
+    """Build a broader Solana candidate pool from DexScreener profiles and boosts."""
+    source_urls = (
+        "https://api.dexscreener.com/token-profiles/latest/v1",
+        "https://api.dexscreener.com/token-boosts/latest/v1",
+        "https://api.dexscreener.com/token-boosts/top/v1",
+    )
+    addresses = []
+    seen = set()
+    # Each discovery feed is optional: one unavailable feed must not disable fallback.
+    for url in source_urls:
+        try:
+            response = await client.get(url)
+            response.raise_for_status()
+            items = response.json()
+        except Exception:
+            continue
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict) or item.get("chainId") != "solana":
+                continue
+            address = item.get("tokenAddress")
+            if address and address not in seen:
+                seen.add(address)
+                addresses.append(address)
+            if len(addresses) >= 90:
+                break
+        if len(addresses) >= 90:
+            break
     if not addresses:
         return []
-    response = await client.get("https://api.dexscreener.com/tokens/v1/solana/" + ",".join(addresses))
-    response.raise_for_status()
-    pairs = response.json()
-    best = {}
-    if isinstance(pairs, list):
+    candidates_by_address = {}
+    # DexScreener's token endpoint accepts comma-separated addresses in batches.
+    for offset in range(0, len(addresses), 30):
+        batch = addresses[offset:offset + 30]
+        response = await client.get(
+            "https://api.dexscreener.com/tokens/v1/solana/" + ",".join(batch)
+        )
+        response.raise_for_status()
+        pairs = response.json()
+        if not isinstance(pairs, list):
+            continue
         for pair in pairs:
             if not isinstance(pair, dict) or pair.get("chainId") != "solana":
                 continue
@@ -151,10 +177,10 @@ async def _discover_dexscreener(client: httpx.AsyncClient) -> list[dict]:
             if not address:
                 continue
             liquidity = _num((pair.get("liquidity") or {}).get("usd"))
-            if address not in best or liquidity > best[address][0]:
-                best[address] = (liquidity, pair)
+            if address not in candidates_by_address or liquidity > candidates_by_address[address][0]:
+                candidates_by_address[address] = (liquidity, pair)
     candidates = []
-    for address, (_, pair) in best.items():
+    for address, (_, pair) in candidates_by_address.items():
         token = pair.get("baseToken") or {}
         volume = pair.get("volume") or {}
         txns = (pair.get("txns") or {}).get("h24") or {}
@@ -167,6 +193,7 @@ async def _discover_dexscreener(client: httpx.AsyncClient) -> list[dict]:
             "volume_24h_usd": _num(volume.get("h24")), "buys_24h": buys, "sells_24h": sells,
             "buy_sell_ratio": buys / sells if sells > 0 else 0.0, "trade_count_24h": buys + sells,
             "price_change_24h_pct": _num(change.get("h24")),
+            "price_change_24h_present": _has_finite_number(change.get("h24")),
             "market_cap_usd": _num(pair.get("marketCap")), "provider": "DexScreener",
             "url": pair.get("url"),
         })
