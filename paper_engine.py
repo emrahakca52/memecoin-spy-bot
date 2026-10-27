@@ -1,4 +1,4 @@
-"""Paper engine with Jupiter + DexScreener fallback."""
+"""Paper engine with Jupiter + DexScreener + Telegram."""
 import asyncio
 import json
 import logging
@@ -18,6 +18,9 @@ from config import (
 
 logger = logging.getLogger("memecoin_spy.paper_engine")
 
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
 _open_positions = {}
 _paper_trades = []
 _realized_pnl_usd = 0.0
@@ -28,6 +31,20 @@ def _num(value, default=0.0):
         return n if math.isfinite(n) else default
     except (TypeError, ValueError, OverflowError):
         return default
+
+async def send_telegram(message: str):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            await client.post(url, json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": message,
+                "parse_mode": "HTML",
+            })
+    except Exception:
+        pass
 
 def _database_url():
     url = os.getenv("DATABASE_URL", "").strip()
@@ -100,7 +117,6 @@ async def get_jupiter_quote(input_mint: str, output_mint: str, amount: int) -> d
     return None
 
 async def get_token_price_usd(token_address: str) -> float | None:
-    # Jupiter dene
     quote = await get_jupiter_quote(token_address, USDC_MINT, 1_000_000)
     if quote and "outAmount" in quote:
         try:
@@ -111,7 +127,6 @@ async def get_token_price_usd(token_address: str) -> float | None:
         except Exception:
             pass
 
-    # DexScreener fallback
     try:
         async with httpx.AsyncClient(timeout=8) as client:
             r = await client.get(f"https://api.dexscreener.com/tokens/v1/solana/{token_address}")
@@ -124,7 +139,6 @@ async def get_token_price_usd(token_address: str) -> float | None:
                         return price
     except Exception:
         pass
-
     return None
 
 async def get_token_prices_usd(token_addresses, reference_prices=None):
@@ -179,6 +193,7 @@ def record_paper_trade(token_address, side, amount_usd, price_usd, token_symbol=
             pos["invested_usd"] += amount_usd
             pos["highest_price"] = max(pos.get("highest_price", price_usd), price_usd)
         _paper_trades.append(trade)
+        asyncio.create_task(send_telegram(f"🟢 <b>BUY</b>\n{token_symbol}\n${amount_usd:.2f} @ {price_usd}"))
     else:
         pos = _open_positions.get(token_address)
         if not pos:
@@ -198,6 +213,7 @@ def record_paper_trade(token_address, side, amount_usd, price_usd, token_symbol=
         else:
             pos["quantity"] = remaining
             pos["invested_usd"] = invested - cost
+        asyncio.create_task(send_telegram(f"🔴 <b>SELL</b>\n{token_symbol}\nP/L: {realized:.2f}$"))
 
     _save_paper_state()
     return {"ok": True, "trade": trade}
@@ -236,6 +252,10 @@ def _close_position(address, position, price, reason, change_pct):
     _realized_pnl_usd += pnl
     _open_positions.pop(address, None)
     _save_paper_state()
+    asyncio.create_task(send_telegram(
+        f"🔴 <b>SELL</b> ({reason})\n{position.get('token_symbol')}\n"
+        f"P/L: {pnl:.2f}$ ({change_pct:.1f}%)"
+    ))
     return True
 
 async def update_paper_prices():
