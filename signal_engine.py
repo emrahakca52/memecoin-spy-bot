@@ -27,6 +27,7 @@ _lock = asyncio.Lock()
 _jupiter_lock = asyncio.Lock()
 _last_jupiter_request = 0.0
 _cache = {"timestamp": 0.0, "candidates": [], "diagnostics": {}}
+_last_dexscreener_discovery = {}
 
 
 def _num(value: Any, default: float = 0.0) -> float:
@@ -133,29 +134,41 @@ async def _discover_dexscreener(client: httpx.AsyncClient) -> list[dict]:
         "https://api.dexscreener.com/token-boosts/latest/v1",
         "https://api.dexscreener.com/token-boosts/top/v1",
     )
+    global _last_dexscreener_discovery
     addresses = []
     seen = set()
+    feed_diagnostics = []
     # Each discovery feed is optional: one unavailable feed must not disable fallback.
     for url in source_urls:
+        feed = {"feed": url.rsplit("/", 1)[-1], "item_count": 0, "solana_tokens": 0, "error": None}
         try:
             response = await client.get(url)
             response.raise_for_status()
             items = response.json()
-        except Exception:
+        except Exception as exc:
+            feed["error"] = f"{type(exc).__name__}: {str(exc)[:160]}"
+            feed_diagnostics.append(feed)
             continue
         if not isinstance(items, list):
+            feed["error"] = "Unexpected response type: " + type(items).__name__
+            feed_diagnostics.append(feed)
             continue
+        feed["item_count"] = len(items)
         for item in items:
             if not isinstance(item, dict) or item.get("chainId") != "solana":
                 continue
             address = item.get("tokenAddress")
-            if address and address not in seen:
-                seen.add(address)
-                addresses.append(address)
+            if address:
+                feed["solana_tokens"] += 1
+                if address not in seen:
+                    seen.add(address)
+                    addresses.append(address)
             if len(addresses) >= 90:
                 break
+        feed_diagnostics.append(feed)
         if len(addresses) >= 90:
             break
+    _last_dexscreener_discovery = {"feeds": feed_diagnostics, "unique_addresses": len(addresses)}
     if not addresses:
         return []
     candidates_by_address = {}
@@ -179,6 +192,7 @@ async def _discover_dexscreener(client: httpx.AsyncClient) -> list[dict]:
             liquidity = _num((pair.get("liquidity") or {}).get("usd"))
             if address not in candidates_by_address or liquidity > candidates_by_address[address][0]:
                 candidates_by_address[address] = (liquidity, pair)
+    _last_dexscreener_discovery["pairs_returned"] = len(candidates_by_address)
     candidates = []
     for address, (_, pair) in candidates_by_address.items():
         token = pair.get("baseToken") or {}
@@ -245,6 +259,7 @@ async def get_signal_candidates(
                 "jupiter_error": jupiter_error,
                 "fallback_error": fallback_error,
                 "candidate_count": len(candidates),
+                "fallback_discovery": dict(_last_dexscreener_discovery),
                 "mode": TRADING_MODE,
             }
             _cache.update({"timestamp": now, "candidates": candidates, "diagnostics": diagnostics})
