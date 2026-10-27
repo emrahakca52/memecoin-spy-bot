@@ -814,15 +814,24 @@ def record_paper_trade(
         trade["amount_usd"] = round(proceeds, 8)
         trade["quantity_sold"] = sell_qty
         trade["cost_basis_usd"] = round(cost, 8)
+        entry_cost_known = position.get("estimated_entry_cost_usd") is not None
         allocated_entry_cost = (
             _num(position.get("estimated_entry_cost_usd")) * sell_qty / qty
+            if entry_cost_known else None
         )
         exit_cost = _estimated_execution_cost(proceeds)
         trade["realized_pnl_usd"] = round(realized, 8)
-        trade["estimated_entry_cost_allocated_usd"] = round(allocated_entry_cost, 8)
+        trade["estimated_entry_cost_allocated_usd"] = (
+            round(allocated_entry_cost, 8) if entry_cost_known else None
+        )
         trade["estimated_exit_cost_usd"] = exit_cost
-        trade["estimated_transaction_cost_usd"] = round(allocated_entry_cost + exit_cost, 8)
-        trade["net_realized_pnl_usd"] = round(realized - allocated_entry_cost - exit_cost, 8)
+        trade["estimated_transaction_cost_usd"] = (
+            round(allocated_entry_cost + exit_cost, 8) if entry_cost_known else None
+        )
+        trade["net_realized_pnl_usd"] = (
+            round(realized - allocated_entry_cost - exit_cost, 8)
+            if entry_cost_known else None
+        )
         _paper_trades.append(trade)
         _realized_pnl_usd += realized
 
@@ -831,9 +840,10 @@ def record_paper_trade(
         else:
             position["quantity"] = remaining_qty
             position["invested_usd"] = remaining_invested
-            position["estimated_entry_cost_usd"] = max(
-                0.0, _num(position.get("estimated_entry_cost_usd")) - allocated_entry_cost
-            )
+            if entry_cost_known:
+                position["estimated_entry_cost_usd"] = max(
+                    0.0, _num(position.get("estimated_entry_cost_usd")) - allocated_entry_cost
+                )
             position["unrealized_pnl_usd"] = (
                 remaining_qty * _num(position.get("current_price_usd"))
                 - remaining_invested
@@ -936,9 +946,9 @@ def _close_position(address, position, price, reason, observed_change_pct=None):
         else None
     )
     change = (price / entry - 1) * 100
-    estimated_entry_cost = _num(position.get("estimated_entry_cost_usd"), default=float("nan"))
+    estimated_costs_known = position.get("estimated_entry_cost_usd") is not None
+    estimated_entry_cost = _num(position.get("estimated_entry_cost_usd")) if estimated_costs_known else 0.0
     estimated_exit_cost = _estimated_execution_cost(value)
-    estimated_costs_known = math.isfinite(estimated_entry_cost)
     trade = {
         "token_address": address,
         "token_symbol": position.get("token_symbol", address[:8]),
