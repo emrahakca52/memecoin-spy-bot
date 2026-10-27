@@ -1195,6 +1195,13 @@ def get_paper_status():
             verified_unrealized += pnl
         positions.append(position)
 
+    accounting = _reported_realized_pnl(_paper_trades)
+    accounting_incomplete = bool(
+        unverified_count
+        or accounting["quarantined_sell_records"]
+        or accounting["sell_records_missing_pnl"]
+    )
+
     return {
         "mode": "paper",
         "real_trading_enabled": False,
@@ -1210,16 +1217,16 @@ def get_paper_status():
         "paper_total_pnl_usd": round(verified_unrealized + _realized_pnl_usd, 8),
         "unverified_position_count": unverified_count,
         "unverified_position_invested_usd": round(unverified_invested, 8),
-        "paper_total_pnl_incomplete": unverified_count > 0,
+        "paper_total_pnl_incomplete": accounting_incomplete,
         "persistence": get_persistence_status(),
-        "accounting": _reported_realized_pnl(_paper_trades),
+        "accounting": accounting,
         "price_diagnostics": get_price_diagnostics(),
         "note": (
             "Paper simulation only; no real orders. Unverified extreme quotes are "
             "excluded from marked value and unrealized P/L until a trustworthy mark "
             "is available; their invested amount is reported separately. Same-provider "
             "confirmation is not independent verification. Realized P/L excludes "
-            "quarantined historical rows without deleting trade history."
+            "quarantined historical rows without deleting trade history. Total P/L is incomplete "            "when any position or historical SELL record is quarantined or missing realized P/L."
         ),
     }
 
