@@ -526,7 +526,7 @@ def get_paper_status():
     accounting = _reported_realized_pnl(_paper_trades)
     sell_rows = [t for t in _paper_trades if isinstance(t, dict) and str(t.get("side", "")).upper() == "SELL"]
     sell_missing_costs = sum(1 for t in sell_rows if "estimated_transaction_cost_usd" not in t)
-    quarantined_sell_costs = sum(1 for t in sell_rows if t.get("accounting_quarantined") and "estimated_transaction_cost_usd" not in t)
+    quarantined_sell_costs = sum(1 for t in sell_rows if t.get("accounting_quarantined"))
     open_missing_entry_costs = sum(
         1 for p in _open_positions.values()
         if p.get("estimated_entry_cost_usd") is None or isinstance(p.get("estimated_entry_cost_usd"), bool) or not math.isfinite(_num(p.get("estimated_entry_cost_usd"), float("nan")))
