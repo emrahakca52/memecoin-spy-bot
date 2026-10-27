@@ -532,11 +532,80 @@ async def _fetch_birdeye_price(client, address):
 
 
 async def _fetch_prices_batch(client, token_addresses):
-    results = {}
-    for address in token_addresses:
-        results[address] = await _fetch_birdeye_price(client, address)
+    """Fetch prices in DexScreener's multi-token endpoint (up to 30 per call)."""
+    addresses = list(dict.fromkeys(
+        str(address).strip() for address in token_addresses if str(address).strip()
+    ))
+    results = {address: None for address in addresses}
+    if not addresses or _provider_is_cooling("dexscreener"):
+        return results
+
+    for offset in range(0, len(addresses), 30):
         if _provider_is_cooling("dexscreener"):
             break
+        batch = addresses[offset:offset + 30]
+        url = "https://api.dexscreener.com/tokens/v1/solana/" + ",".join(batch)
+        details = _price_diagnostics.setdefault("dexscreener", {})
+        _record_provider(
+            "dexscreener",
+            requests=int(details.get("requests", 0)) + 1,
+            last_attempt_utc=_utc_now(),
+            last_endpoint=url,
+            last_http_status=None,
+            last_error=None,
+            last_prices_found=0,
+        )
+        try:
+            await _respect_birdeye_rate_limit()
+            response = await client.get(url)
+            _record_provider("dexscreener", last_http_status=response.status_code)
+            if response.status_code == 429:
+                cooldown = 300
+                _set_provider_cooldown("dexscreener", cooldown, f"HTTP 429; cooldown {cooldown}s")
+                _record_provider("dexscreener", last_error=f"HTTP 429; cooldown {cooldown}s")
+                break
+            response.raise_for_status()
+            pairs = response.json()
+            if not isinstance(pairs, list):
+                _record_provider("dexscreener", last_error="invalid token-pairs response")
+                continue
+
+            best = {}
+            requested = set(batch)
+            for pair in pairs:
+                if not isinstance(pair, dict) or pair.get("chainId") != "solana":
+                    continue
+                base = pair.get("baseToken")
+                if not isinstance(base, dict):
+                    continue
+                address = str(base.get("address") or "")
+                if address not in requested:
+                    continue
+                price = _num(pair.get("priceUsd"))
+                if price <= 0:
+                    continue
+                liquidity = _num((pair.get("liquidity") or {}).get("usd"))
+                if address not in best or liquidity > best[address][0]:
+                    best[address] = (liquidity, price)
+
+            for address, (_, price) in best.items():
+                results[address] = price
+            _record_provider(
+                "dexscreener",
+                last_prices_found=sum(value is not None for value in results.values()),
+                last_error=None if best else "no usable Solana pair prices found",
+            )
+        except httpx.HTTPStatusError as exc:
+            _record_provider(
+                "dexscreener", last_http_status=exc.response.status_code,
+                last_error=f"HTTP {exc.response.status_code}",
+            )
+        except httpx.TimeoutException:
+            _record_provider("dexscreener", last_error="request timed out")
+        except httpx.HTTPError as exc:
+            _record_provider("dexscreener", last_error=f"network error: {type(exc).__name__}")
+        except (ValueError, AttributeError, TypeError) as exc:
+            _record_provider("dexscreener", last_error=f"invalid response: {type(exc).__name__}")
     return results
 
 
