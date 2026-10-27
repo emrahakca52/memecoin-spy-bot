@@ -1104,24 +1104,38 @@ async def update_paper_prices():
 
 
 def get_paper_status():
-    positions = list(_open_positions.values())
-    invested = sum(_num(p.get("invested_usd")) for p in positions)
-    value = sum(
-        _num(p.get("quantity")) * _num(p.get("current_price_usd"))
-        for p in positions
-    )
-    # Derive unrealized P/L from the same marks used for portfolio value so the
-    # totals cannot drift from stale per-position cached P/L fields.
-    unrealized = sum(
-        _num(p.get("quantity")) * _num(p.get("current_price_usd"))
-        - _num(p.get("invested_usd"))
-        for p in positions
-    )
-    for p in positions:
-        p["unrealized_pnl_usd"] = round(
-            _num(p.get("quantity")) * _num(p.get("current_price_usd"))
-            - _num(p.get("invested_usd")), 8
-        )
+    # Do not present an unverified extreme quote as a live mark or P/L.
+    # Keep the original position/trade data intact; expose the suspect quote
+    # separately for diagnostics and omit that position from marked totals.
+    positions = []
+    invested = 0.0
+    verified_value = 0.0
+    verified_unrealized = 0.0
+    unverified_count = 0
+    unverified_invested = 0.0
+
+    for stored in _open_positions.values():
+        position = dict(stored)
+        cost = _num(position.get("invested_usd"))
+        invested += cost
+        if position.get("price_mark_status") == "unverified_extreme_quote":
+            unverified_count += 1
+            unverified_invested += cost
+            position["current_price_usd"] = None
+            position["unrealized_pnl_usd"] = None
+            position["price_safety_warning"] = position.get(
+                "price_safety_warning",
+                "Current quote is unverified; mark and P/L withheld.",
+            )
+        else:
+            price = _num(position.get("current_price_usd"))
+            qty = _num(position.get("quantity"))
+            marked_value = qty * price
+            pnl = marked_value - cost
+            position["unrealized_pnl_usd"] = round(pnl, 8)
+            verified_value += marked_value
+            verified_unrealized += pnl
+        positions.append(position)
 
     return {
         "mode": "paper",
@@ -1132,22 +1146,24 @@ def get_paper_status():
         "take_profit_pct": TAKE_PROFIT_PCT,
         "stop_loss_pct": STOP_LOSS_PCT,
         "paper_invested_usd": round(invested, 8),
-        "paper_current_value_usd": round(value, 8),
-        "paper_unrealized_pnl_usd": round(unrealized, 8),
+        "paper_current_value_usd": round(verified_value, 8),
+        "paper_unrealized_pnl_usd": round(verified_unrealized, 8),
         "paper_realized_pnl_usd": round(_realized_pnl_usd, 8),
-        "paper_total_pnl_usd": round(unrealized + _realized_pnl_usd, 8),
+        "paper_total_pnl_usd": round(verified_unrealized + _realized_pnl_usd, 8),
+        "unverified_position_count": unverified_count,
+        "unverified_position_invested_usd": round(unverified_invested, 8),
+        "paper_total_pnl_incomplete": unverified_count > 0,
         "persistence": get_persistence_status(),
         "accounting": _reported_realized_pnl(_paper_trades),
         "price_diagnostics": get_price_diagnostics(),
         "note": (
-            "Paper simulation only; no real orders. Quotes that pass the price-jump "
-            "gate update the displayed paper mark/P&L; extreme TP/SL overshoots are "
-            "flagged and remain open pending verification. Same-provider confirmation "
-            "is not independent verification. Realized P/L is calculated from recorded SELL rows, "
-            "excluding quarantined rows without deleting history."
+            "Paper simulation only; no real orders. Unverified extreme quotes are "
+            "excluded from marked value and unrealized P/L until a trustworthy mark "
+            "is available; their invested amount is reported separately. Same-provider "
+            "confirmation is not independent verification. Realized P/L excludes "
+            "quarantined historical rows without deleting trade history."
         ),
     }
-
 
 def portfolio_status():
     status = get_paper_status()
