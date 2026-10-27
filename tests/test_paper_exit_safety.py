@@ -72,3 +72,47 @@ def test_plausible_stop_loss_can_still_close_position(monkeypatch):
     assert "token" not in paper_engine._open_positions
     assert len(paper_engine._paper_trades) == 1
     assert paper_engine._paper_trades[0]["realized_pnl_usd"] == -0.6
+
+
+
+def test_status_withholds_unverified_quote_from_marked_value_and_pnl(monkeypatch):
+    verified = {
+        "token_address": "verified",
+        "token_symbol": "SAFE",
+        "entry_price_usd": 1.0,
+        "current_price_usd": 0.99,
+        "invested_usd": 10.0,
+        "quantity": 10.0,
+        "unrealized_pnl_usd": -0.1,
+    }
+    unverified = {
+        "token_address": "unverified",
+        "token_symbol": "XTO",
+        "entry_price_usd": 1.0,
+        "current_price_usd": 0.0000025,
+        "invested_usd": 10.0,
+        "quantity": 10.0,
+        "unrealized_pnl_usd": -9.999975,
+        "price_mark_status": "unverified_extreme_quote",
+        "last_suspect_price_usd": 0.0000025,
+        "price_safety_warning": "suspect quote",
+    }
+    monkeypatch.setattr(
+        paper_engine, "_open_positions",
+        {"verified": verified, "unverified": unverified},
+    )
+    monkeypatch.setattr(paper_engine, "_paper_trades", [])
+    monkeypatch.setattr(paper_engine, "_realized_pnl_usd", 0.0)
+
+    status = paper_engine.get_paper_status()
+    by_symbol = {p["token_symbol"]: p for p in status["open_positions"]}
+
+    assert by_symbol["XTO"]["current_price_usd"] is None
+    assert by_symbol["XTO"]["unrealized_pnl_usd"] is None
+    assert by_symbol["XTO"]["last_suspect_price_usd"] == 0.0000025
+    assert status["paper_invested_usd"] == 20.0
+    assert status["paper_current_value_usd"] == 9.9
+    assert status["paper_unrealized_pnl_usd"] == -0.1
+    assert status["unverified_position_count"] == 1
+    assert status["unverified_position_invested_usd"] == 10.0
+    assert status["paper_total_pnl_incomplete"] is True
