@@ -95,6 +95,7 @@ async def _loop(stop_event):
                 "checked": data.get("checked", 0),
                 "candidate_count": len(signals),
                 "filter_diagnostics": data.get("filter_diagnostics", {}),
+                "signal_diagnostics": data.get("diagnostics", {}),
             }
             logger.info("Signals found: %s", len(signals))
 
