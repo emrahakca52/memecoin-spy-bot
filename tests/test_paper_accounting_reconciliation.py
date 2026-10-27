@@ -70,6 +70,33 @@ class LoadPaperStateAccountingTests(unittest.TestCase):
         self.assertAlmostEqual(paper_engine._realized_pnl_usd, 4.0)
         self.assertEqual(len(paper_engine._reported_realized_pnl(paper_engine._paper_trades)["quarantined_sell_records"]), 1)
 
+    def test_extreme_legacy_auto_exits_are_quarantined_without_deleting_history(self):
+        state = {
+            "open_positions": {},
+            "paper_trades": [
+                {"side": "SELL", "source": "auto", "reason": "take_profit_10pct",
+                 "token_symbol": "SAFE", "observed_change_pct": 12.0,
+                 "realized_pnl_usd": 1.2},
+                {"side": "SELL", "source": "auto", "reason": "stop_loss_5pct",
+                 "token_symbol": "DOTF", "observed_change_pct": -96.7397,
+                 "realized_pnl_usd": -9.67396832},
+                {"side": "SELL", "source": "auto", "reason": "take_profit_10pct",
+                 "token_symbol": "GOIF", "observed_change_pct": 67.5337,
+                 "realized_pnl_usd": 6.75336796},
+            ],
+            "realized_pnl_usd": -1.72060036,
+        }
+        self.load_state(state)
+        self.assertEqual(len(paper_engine._paper_trades), 3)
+        self.assertFalse(paper_engine._paper_trades[0].get("accounting_quarantined", False))
+        self.assertTrue(paper_engine._paper_trades[1]["accounting_quarantined"])
+        self.assertTrue(paper_engine._paper_trades[2]["accounting_quarantined"])
+        self.assertAlmostEqual(paper_engine._realized_pnl_usd, 1.2)
+        quarantined = paper_engine._reported_realized_pnl(
+            paper_engine._paper_trades
+        )["quarantined_sell_records"]
+        self.assertEqual({row["token_symbol"] for row in quarantined}, {"DOTF", "GOIF"})
+
 
 if __name__ == "__main__":
     unittest.main()
