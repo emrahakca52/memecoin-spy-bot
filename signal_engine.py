@@ -204,13 +204,41 @@ async def _fetch_candidates() -> tuple[list[dict], dict]:
             profiles = response.json()
             if not isinstance(profiles, list):
                 raise ValueError("DexScreener returned an invalid token-profile list")
-            addresses = list(dict.fromkeys(
+            # Add one complementary discovery feed without polling every endpoint.
+            # One extra public request per cache refresh, then one batched pair lookup.
+            boost_url = "https://api.dexscreener.com/token-boosts/latest/v1"
+            boost_addresses: list[str] = []
+            try:
+                boost_response = await client.get(boost_url)
+                _stats["requests"] += 1
+                _stats["last_endpoint"] = boost_url
+                _stats["last_request_utc"] = datetime.now(timezone.utc).isoformat()
+                _stats["last_http_status"] = boost_response.status_code
+                if boost_response.status_code == 429:
+                    raise RuntimeError("DexScreener boost feed rate limited")
+                boost_response.raise_for_status()
+                boost_items = boost_response.json()
+                if isinstance(boost_items, list):
+                    boost_addresses = [
+                        str(item.get("tokenAddress") or "")
+                        for item in boost_items
+                        if isinstance(item, dict)
+                        and item.get("chainId") == "solana"
+                        and item.get("tokenAddress")
+                    ]
+            except Exception as boost_exc:
+                # Keep profile discovery usable if the supplemental feed is unavailable.
+                errors.append(f"dexscreener_boosts: {type(boost_exc).__name__}: {str(boost_exc)[:120]}")
+
+            profile_addresses = [
                 str(item.get("tokenAddress") or "")
                 for item in profiles
                 if isinstance(item, dict) and item.get("chainId") == "solana" and item.get("tokenAddress")
-            ))[:30]
+            ]
+            # Prioritize newly boosted addresses, then fill from latest token profiles.
+            addresses = list(dict.fromkeys(boost_addresses + profile_addresses))[:30]
             if not addresses:
-                raise ValueError("DexScreener returned no Solana token profiles")
+                raise ValueError("DexScreener returned no Solana token addresses")
             # Batch up to 30 addresses in one call; no API key is required.
             token_url = "https://api.dexscreener.com/tokens/v1/solana/" + ",".join(addresses)
             response = await client.get(token_url)
