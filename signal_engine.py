@@ -223,6 +223,16 @@ async def _fetch_candidates() -> tuple[list[dict], dict]:
             _stats["last_endpoint"] = token_url
             _stats["last_request_utc"] = datetime.now(timezone.utc).isoformat()
             _stats["last_http_status"] = response.status_code
+            if response.status_code == 429:
+                retry_after = response.headers.get("Retry-After")
+                try:
+                    delay = max(30, min(1800, int(float(retry_after)))) if retry_after else 300
+                except (TypeError, ValueError, OverflowError):
+                    delay = 300
+                _cooldown_until = time.monotonic() + delay
+                _cooldown_reason = f"DexScreener HTTP 429; retry after {delay}s"
+                _stats["last_error"] = _cooldown_reason
+                raise RuntimeError(_cooldown_reason)
             response.raise_for_status()
             pairs = response.json()
             if not isinstance(pairs, list):
