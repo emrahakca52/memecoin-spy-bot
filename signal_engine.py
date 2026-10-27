@@ -215,11 +215,37 @@ async def get_signal_candidates(
             _cache.update({"timestamp": now, "candidates": candidates, "diagnostics": diagnostics})
 
     filtered = []
+    rejected = {
+        "missing_price_change": 0,
+        "low_liquidity": 0,
+        "low_volume": 0,
+        "low_buy_sell_ratio": 0,
+        "too_few_trades": 0,
+        "price_change_out_of_range": 0,
+        "invalid_price": 0,
+    }
     for candidate in candidates:
         liq, vol = _num(candidate.get("liquidity_usd")), _num(candidate.get("volume_24h_usd"))
         ratio, price = _num(candidate.get("buy_sell_ratio")), _num(candidate.get("price_usd"))
         trades = int(_num(candidate.get("trade_count_24h")))
         change = _num(candidate.get("price_change_24h_pct"))
+
+        # Count every failed criterion independently so diagnostics show the actual bottlenecks.
+        if candidate.get("price_change_24h_present") is False:
+            rejected["missing_price_change"] += 1
+        if liq < min_liq:
+            rejected["low_liquidity"] += 1
+        if vol < min_vol:
+            rejected["low_volume"] += 1
+        if ratio < min_ratio:
+            rejected["low_buy_sell_ratio"] += 1
+        if trades < MIN_TRADES_24H:
+            rejected["too_few_trades"] += 1
+        if abs(change) > MAX_PRICE_CHANGE_24H_PCT or change < -MAX_NEGATIVE_PRICE_CHANGE_24H_PCT:
+            rejected["price_change_out_of_range"] += 1
+        if price <= 0:
+            rejected["invalid_price"] += 1
+
         if candidate.get("price_change_24h_present") is False:
             continue
         if liq < min_liq or vol < min_vol or ratio < min_ratio or trades < MIN_TRADES_24H:
@@ -235,6 +261,18 @@ async def get_signal_candidates(
         "checked": len(candidates),
         "candidate_count": len(filtered),
         "signals": filtered[:max(0, int(limit))],
+        "filter_diagnostics": {
+            "thresholds": {
+                "min_liquidity_usd": min_liq,
+                "min_volume_24h_usd": min_vol,
+                "min_buys_sells_ratio": min_ratio,
+                "min_trades_24h": MIN_TRADES_24H,
+                "max_abs_price_change_24h_pct": MAX_PRICE_CHANGE_24H_PCT,
+                "max_negative_price_change_24h_pct": MAX_NEGATIVE_PRICE_CHANGE_24H_PCT,
+            },
+            "rejected_by_criterion": rejected,
+            "note": "Counts overlap: one token can fail multiple criteria. These diagnostics do not place trades.",
+        },
         "mode": TRADING_MODE,
         "diagnostics": diagnostics,
     }
