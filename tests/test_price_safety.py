@@ -119,6 +119,7 @@ class ExtremeQuoteExitGuardTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(return_value={"token-address": 0.092}),
             ),
             patch.object(paper_engine, "_save_paper_state", return_value=True),
+            patch.object(paper_engine, "STOP_LOSS_PCT", -5.0),
         ):
             result = await paper_engine.update_paper_prices()
 
