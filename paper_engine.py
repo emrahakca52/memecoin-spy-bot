@@ -1308,6 +1308,21 @@ def get_paper_status():
             net_costs_incomplete = True
         else:
             estimated_realized_costs += _num(costs)
+    sell_records_missing_costs = 0
+    quarantined_sell_cost_records = 0
+    for trade in _paper_trades:
+        if not isinstance(trade, dict) or str(trade.get("side", "")).upper() != "SELL":
+            continue
+        if trade.get("estimated_transaction_cost_usd") is None:
+            sell_records_missing_costs += 1
+        if trade.get("accounting_quarantined") or _is_quarantined_trade(trade):
+            quarantined_sell_cost_records += 1
+
+    open_positions_missing_entry_costs = sum(
+        1 for stored in _open_positions.values()
+        if stored.get("estimated_entry_cost_usd") is None
+    )
+
     open_position_estimated_costs = 0.0
     estimated_open_exit_costs = 0.0
     for stored in _open_positions.values():
@@ -1362,6 +1377,9 @@ def get_paper_status():
         "paper_estimated_open_entry_costs_usd": round(open_position_estimated_costs, 8),
         "paper_estimated_open_exit_costs_usd": round(estimated_open_exit_costs, 8),
         "paper_estimated_net_pnl_incomplete": net_costs_incomplete,
+        "paper_sell_records_missing_costs": sell_records_missing_costs,
+        "paper_quarantined_sell_cost_records": quarantined_sell_cost_records,
+        "paper_open_positions_missing_entry_costs": open_positions_missing_entry_costs,
         "paper_execution_cost_assumptions": {
             "fee_pct_per_side": PAPER_FEE_PCT_PER_SIDE,
             "slippage_pct_per_side": PAPER_SLIPPAGE_PCT_PER_SIDE,
