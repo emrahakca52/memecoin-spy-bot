@@ -122,10 +122,46 @@ def _jupiter_candidates(tokens: Any) -> list[dict]:
     return candidates
 
 
+_last_jupiter_discovery = {}
+
+
 async def _discover_jupiter(client: httpx.AsyncClient) -> list[dict]:
-    # /recent includes newly listed mints and token statistics in Jupiter's Tokens API V2.
-    data = await _jupiter_get(client, "/tokens/v2/recent")
-    return _jupiter_candidates(data)
+    """Aggregate Jupiter recent, trending, and top-traded token feeds."""
+    global _last_jupiter_discovery
+    endpoints = (
+        ("/tokens/v2/recent", "recent"),
+        ("/tokens/v2/toptrending/1h?limit=100", "toptrending_1h"),
+        ("/tokens/v2/toptraded/24h?limit=100", "toptraded_24h"),
+    )
+    all_candidates = {}
+    feed_diagnostics = []
+    for path, label in endpoints:
+        feed = {"feed": label, "count": 0, "error": None}
+        try:
+            data = await _jupiter_get(client, path)
+            parsed = _jupiter_candidates(data)
+            feed["count"] = len(parsed)
+            for candidate in parsed:
+                address = candidate.get("token_address")
+                if not address:
+                    continue
+                # Keep the richer record if an address occurs in multiple feeds.
+                previous = all_candidates.get(address)
+                if previous is None or (
+                    candidate.get("liquidity_usd", 0) + candidate.get("volume_24h_usd", 0)
+                    > previous.get("liquidity_usd", 0) + previous.get("volume_24h_usd", 0)
+                ):
+                    all_candidates[address] = candidate
+        except Exception as exc:
+            feed["error"] = f"{type(exc).__name__}: {str(exc)[:160]}"
+        feed_diagnostics.append(feed)
+    _last_jupiter_discovery = {
+        "feeds": feed_diagnostics,
+        "unique_candidates": len(all_candidates),
+    }
+    if not all_candidates and all(feed["error"] for feed in feed_diagnostics):
+        raise RuntimeError("All Jupiter discovery feeds failed")
+    return list(all_candidates.values())
 
 
 async def _discover_dexscreener(client: httpx.AsyncClient) -> list[dict]:
@@ -338,6 +374,7 @@ async def get_signal_candidates(
                 "jupiter_error": jupiter_error,
                 "fallback_error": fallback_error,
                 "candidate_count": len(candidates),
+                "jupiter_discovery": dict(_last_jupiter_discovery),
                 "fallback_discovery": dict(_last_dexscreener_discovery),
                 "geckoterminal_discovery": dict(_last_geckoterminal_discovery),
                 "mode": TRADING_MODE,
