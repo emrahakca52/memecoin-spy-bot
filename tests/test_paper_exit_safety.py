@@ -116,3 +116,37 @@ def test_status_withholds_unverified_quote_from_marked_value_and_pnl(monkeypatch
     assert status["unverified_position_count"] == 1
     assert status["unverified_position_invested_usd"] == 10.0
     assert status["paper_total_pnl_incomplete"] is True
+
+
+def test_accepted_normal_quote_clears_previous_unverified_mark(monkeypatch):
+    import asyncio
+    import time
+
+    position = {
+        "token_address": "token",
+        "token_symbol": "XTO",
+        "entry_price_usd": 1.0,
+        "current_price_usd": 1.0,
+        "invested_usd": 10.0,
+        "quantity": 10.0,
+        "unrealized_pnl_usd": 0.0,
+        "opened_at": time.time() - 60,
+        "price_mark_status": "unverified_extreme_quote",
+        "last_suspect_price_usd": 0.0000025,
+        "price_safety_warning": "suspect quote",
+    }
+    monkeypatch.setattr(paper_engine, "_open_positions", {"token": position})
+    monkeypatch.setattr(paper_engine, "_save_paper_state", lambda: True)
+
+    async def accepted_prices(addresses, reference_prices=None):
+        return {"token": 0.99}
+
+    monkeypatch.setattr(paper_engine, "get_token_prices_usd", accepted_prices)
+    result = asyncio.run(paper_engine.update_paper_prices())
+
+    assert result["updated"] == 1
+    assert position["current_price_usd"] == 0.99
+    assert position["unrealized_pnl_usd"] == -0.1
+    assert "price_mark_status" not in position
+    assert "price_safety_warning" not in position
+    assert position["last_suspect_price_usd"] == 0.0000025
