@@ -7,6 +7,18 @@ import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import paper_engine
+import auto_paper_bot
+
+
+class SignalPriceValidationTests(unittest.TestCase):
+    def test_rejects_non_finite_non_positive_and_malformed_prices(self):
+        for value in (float("nan"), float("inf"), float("-inf"), "NaN", "bad", None, 0, -1):
+            with self.subTest(value=value):
+                self.assertIsNone(auto_paper_bot._positive_finite_float(value))
+
+    def test_accepts_positive_finite_prices(self):
+        self.assertEqual(auto_paper_bot._positive_finite_float("0.000001"), 0.000001)
+        self.assertEqual(auto_paper_bot._positive_finite_float(12), 12.0)
 
 
 class ExtremeQuoteExitGuardTests(unittest.IsolatedAsyncioTestCase):

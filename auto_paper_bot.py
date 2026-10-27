@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import math
 import os
 from datetime import datetime, timezone
 
@@ -53,6 +54,17 @@ COPYFOMO_GATE_ENABLED = (
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _positive_finite_float(value):
+    """Return a positive finite float, or None for malformed/unsafe values."""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(parsed) or parsed <= 0:
+        return None
+    return parsed
 
 
 async def _loop(stop_event):
@@ -138,12 +150,9 @@ async def _loop(stop_event):
             for token in eligible_signals:
                 address = token.get("token_address")
                 symbol = token.get("symbol") or token.get("token_symbol") or ""
-                try:
-                    signal_price = float(token.get("price_usd") or 0)
-                except (TypeError, ValueError, OverflowError):
-                    signal_price = 0.0
+                signal_price = _positive_finite_float(token.get("price_usd"))
 
-                if not address or signal_price <= 0:
+                if not address or signal_price is None:
                     _last_skipped.append({
                         "symbol": symbol,
                         "reason": "invalid_signal_price",
