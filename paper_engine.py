@@ -501,7 +501,7 @@ async def _fetch_birdeye_price(client, address):
         if response.status_code == 429:
             retry_after = response.headers.get("Retry-After")
             try:
-                cooldown = max(300, min(3600, int(float(retry_after)))) if retry_after else 900
+                cooldown = max(900, min(3600, int(float(retry_after)))) if retry_after else 1800
             except (TypeError, ValueError, OverflowError):
                 cooldown = 900
             reason = f"HTTP 429; cooldown {cooldown}s"
@@ -567,9 +567,9 @@ async def _fetch_prices_batch(client, token_addresses):
             if response.status_code == 429:
                 retry_after = response.headers.get("Retry-After")
                 try:
-                    cooldown = max(300, min(3600, int(float(retry_after)))) if retry_after else 900
+                    cooldown = max(900, min(3600, int(float(retry_after)))) if retry_after else 1800
                 except (TypeError, ValueError, OverflowError):
-                    cooldown = 900
+                    cooldown = 1800
                 reason = f"HTTP 429; cooldown {cooldown}s"
                 _set_provider_cooldown("dexscreener", cooldown, reason)
                 _record_provider("dexscreener", last_error=reason)
