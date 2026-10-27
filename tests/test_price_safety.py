@@ -154,6 +154,25 @@ class AccountingQuarantineRegressionTests(unittest.TestCase):
         self.assertEqual(len(result["quarantined_sell_records"]), 1)
         self.assertEqual(history, before)
 
+    def test_total_pnl_is_incomplete_when_historical_sell_is_quarantined(self):
+        original_trades = paper_engine._paper_trades
+        original_positions = paper_engine._open_positions
+        try:
+            paper_engine._paper_trades = [{
+                "side": "SELL",
+                "token_symbol": "MRBEAST",
+                "token_address": "4hqN5vhCG1q13qYUQvBhyMDDnpWKP98DoswDeDCVQaCn",
+                "price_usd": 123.45,
+                "realized_pnl_usd": 16_100_066.6799,
+            }]
+            paper_engine._open_positions = {}
+            status = paper_engine.get_paper_status()
+            self.assertTrue(status["paper_total_pnl_incomplete"])
+            self.assertEqual(len(status["accounting"]["quarantined_sell_records"]), 1)
+        finally:
+            paper_engine._paper_trades = original_trades
+            paper_engine._open_positions = original_positions
+
     def test_non_finite_numeric_values_fall_back_safely(self):
         for value in (float("nan"), float("inf"), float("-inf"), "not-a-number"):
             with self.subTest(value=value):
