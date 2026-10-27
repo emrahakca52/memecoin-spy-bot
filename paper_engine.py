@@ -53,11 +53,11 @@ STOP_LOSS_PCT = -5.0
 # If a quote implies a loss far beyond the configured stop, do not auto-close
 # from that quote alone. This is a safety brake for bad price feeds, not a
 # guarantee that the quote is false. Review/verify the position manually.
-MAX_STOP_LOSS_OVERSHOOT_PCT = max(
-    10.0, float(os.getenv("MAX_STOP_LOSS_OVERSHOOT_PCT", "35"))
+MAX_STOP_LOSS_OVERSHOOT_PCT = min(
+    10.0, max(5.0, float(os.getenv("MAX_STOP_LOSS_OVERSHOOT_PCT", "10")))
 )
-MAX_TAKE_PROFIT_OVERSHOOT_PCT = max(
-    20.0, float(os.getenv("MAX_TAKE_PROFIT_OVERSHOOT_PCT", "100"))
+MAX_TAKE_PROFIT_OVERSHOOT_PCT = min(
+    50.0, max(10.0, float(os.getenv("MAX_TAKE_PROFIT_OVERSHOOT_PCT", "50")))
 )
 
 _price_cache = {}
