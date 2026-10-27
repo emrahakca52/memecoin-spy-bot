@@ -24,7 +24,7 @@ from paper_engine import (
 logger = logging.getLogger(__name__)
 
 POLL_SECONDS = max(30, int(os.getenv("PAPER_BOT_POLL_SECONDS", "180")))
-MAX_ENTRY_PRICE_DEVIATION_PCT = 8.0
+MAX_ENTRY_PRICE_DEVIATION_PCT = 10.0
 
 _task = None
 _stop_event = None
@@ -61,41 +61,58 @@ async def _loop(stop_event):
         try:
             _last_error = None
             _last_skipped = []
-            _last_price_update = await update_paper_prices()
+            logger.info("Scan cycle started")
+
+            try:
+                _last_price_update = await asyncio.wait_for(update_paper_prices(), timeout=30)
+            except asyncio.TimeoutError:
+                logger.warning("Price update timed out")
+                _last_price_update = {"error": "timeout"}
 
             if _daily_loss_exceeded():
                 _last_skipped.append({"reason": "daily_loss_limit_reached"})
                 await asyncio.sleep(POLL_SECONDS)
                 continue
 
-            data = await get_signal_candidates(
-                min_liquidity_usd=MIN_LIQUIDITY_USD,
-                min_volume_24h_usd=MIN_VOLUME_24H_USD,
-                min_buys_sells_ratio=MIN_BUYS_SELLS_RATIO,
-                limit=20,
-            )
+            try:
+                data = await asyncio.wait_for(
+                    get_signal_candidates(
+                        min_liquidity_usd=MIN_LIQUIDITY_USD,
+                        min_volume_24h_usd=MIN_VOLUME_24H_USD,
+                        min_buys_sells_ratio=MIN_BUYS_SELLS_RATIO,
+                        limit=20,
+                    ),
+                    timeout=40,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Signal fetch timed out")
+                data = {"signals": [], "checked": 0}
+
             signals = data.get("signals", []) or []
-            diagnostics = data.get("diagnostics") or {}
             _last_scan = {
                 "provider": data.get("provider"),
                 "checked": data.get("checked", 0),
-                "candidate_count": data.get("candidate_count", len(signals)),
+                "candidate_count": len(signals),
             }
+            logger.info("Signals found: %s", len(signals))
 
             eligible_signals = signals
-            if COPYFOMO_GATE_ENABLED:
+            if COPYFOMO_GATE_ENABLED and signals:
                 ordered = sorted(signals, key=lambda x: float(x.get("score") or 0), reverse=True)
                 checked = []
                 eligible_signals = []
                 for token in ordered[:MAX_GROK_CHECKS_PER_SCAN]:
                     if stop_event.is_set():
                         break
-                    gate = await evaluate_candidate(token)
-                    checked.append({"symbol": token.get("symbol"), **gate})
-                    if gate.get("passed"):
-                        eligible_signals.append(token)
-                    else:
-                        _last_skipped.append({"symbol": token.get("symbol"), "reason": "copyfomo_rejected"})
+                    try:
+                        gate = await asyncio.wait_for(evaluate_candidate(token), timeout=20)
+                        checked.append({"symbol": token.get("symbol"), **gate})
+                        if gate.get("passed"):
+                            eligible_signals.append(token)
+                        else:
+                            _last_skipped.append({"symbol": token.get("symbol"), "reason": "rugcheck_rejected"})
+                    except asyncio.TimeoutError:
+                        _last_skipped.append({"symbol": token.get("symbol"), "reason": "rugcheck_timeout"})
                 _last_copyfomo_checks = checked
 
             valid_signals = []
@@ -109,7 +126,13 @@ async def _loop(stop_event):
 
             prices = {}
             if valid_signals:
-                prices = await get_token_prices_usd([a for _, a, _, _ in valid_signals])
+                try:
+                    prices = await asyncio.wait_for(
+                        get_token_prices_usd([a for _, a, _, _ in valid_signals]),
+                        timeout=25,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning("Price fetch timed out")
 
             for token, address, symbol, signal_price in valid_signals:
                 if stop_event.is_set():
@@ -120,7 +143,7 @@ async def _loop(stop_event):
                     continue
                 deviation = abs(live_price / signal_price - 1) * 100
                 if deviation > MAX_ENTRY_PRICE_DEVIATION_PCT:
-                    _last_skipped.append({"symbol": symbol, "reason": "price_deviation"})
+                    _last_skipped.append({"symbol": symbol, "reason": "price_deviation", "deviation_pct": round(deviation, 2)})
                     continue
 
                 result = open_paper_position(
@@ -132,12 +155,15 @@ async def _loop(stop_event):
                 )
                 if result.get("skipped"):
                     _last_skipped.append({"symbol": symbol, "reason": result.get("reason")})
+                else:
+                    logger.info("Opened position: %s", symbol)
 
         except Exception as exc:
             _last_error = f"{type(exc).__name__}: {str(exc)[:180]}"
             logger.exception("Scan failed")
         finally:
             _last_run = _utc_now()
+            logger.info("Scan cycle finished")
 
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=POLL_SECONDS)
