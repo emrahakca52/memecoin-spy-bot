@@ -1,4 +1,4 @@
-"""Paper trading engine with basic price diagnostics."""
+"""Paper engine with Jupiter quote support."""
 import asyncio
 import json
 import logging
@@ -13,18 +13,14 @@ import psycopg
 from config import (
     TAKE_PROFIT_PCT, STOP_LOSS_PCT, TRAILING_STOP_PCT,
     MIN_HOLD_SECONDS, MAX_DAILY_LOSS_USD,
+    JUPITER_QUOTE_URL, JUPITER_SLIPPAGE_BPS, USDC_MINT,
 )
 
 logger = logging.getLogger("memecoin_spy.paper_engine")
 
-_price_cache = {}
 _open_positions = {}
 _paper_trades = []
 _realized_pnl_usd = 0.0
-_price_lock = asyncio.Lock()
-
-def _utc_now():
-    return datetime.now(timezone.utc).isoformat()
 
 def _num(value, default=0.0):
     try:
@@ -41,9 +37,7 @@ def _database_url():
 
 def _connect_database():
     url = _database_url()
-    if not url:
-        return None
-    return psycopg.connect(url, connect_timeout=8, autocommit=True)
+    return psycopg.connect(url, connect_timeout=8, autocommit=True) if url else None
 
 def _ensure_state_table(conn):
     conn.execute("""
@@ -56,84 +50,79 @@ def _ensure_state_table(conn):
 
 def _save_paper_state():
     if not _database_url():
-        return False
+        return
     try:
         snapshot = json.dumps({
             "open_positions": _open_positions,
             "paper_trades": _paper_trades,
             "realized_pnl_usd": _realized_pnl_usd,
-            "saved_at_utc": _utc_now(),
         }, default=str)
         with _connect_database() as conn:
             _ensure_state_table(conn)
             conn.execute("""
-                INSERT INTO memecoin_paper_state (id, state, updated_at)
-                VALUES (1, %s::jsonb, NOW())
-                ON CONFLICT (id) DO UPDATE
-                SET state = EXCLUDED.state, updated_at = NOW()
+                INSERT INTO memecoin_paper_state (id, state) VALUES (1, %s::jsonb)
+                ON CONFLICT (id) DO UPDATE SET state = EXCLUDED.state, updated_at = NOW()
             """, (snapshot,))
-        return True
     except Exception as e:
-        logger.exception("Save failed: %s", e)
-        return False
+        logger.exception("Save error: %s", e)
 
 def load_paper_state():
     global _open_positions, _paper_trades, _realized_pnl_usd
     if not _database_url():
-        return {"ok": False, "loaded": False}
+        return {"ok": False}
     try:
         with _connect_database() as conn:
             _ensure_state_table(conn)
             row = conn.execute("SELECT state FROM memecoin_paper_state WHERE id = 1").fetchone()
-        if not row:
-            return {"ok": True, "loaded": False}
-        state = json.loads(row[0]) if isinstance(row[0], str) else row[0]
-        _open_positions = state.get("open_positions", {})
-        _paper_trades = state.get("paper_trades", [])
-        _realized_pnl_usd = _num(state.get("realized_pnl_usd"))
-        return {"ok": True, "loaded": True}
+        if row:
+            state = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+            _open_positions = state.get("open_positions", {})
+            _paper_trades = state.get("paper_trades", [])
+            _realized_pnl_usd = _num(state.get("realized_pnl_usd"))
+        return {"ok": True}
+    except Exception:
+        return {"ok": False}
+
+async def get_jupiter_quote(input_mint: str, output_mint: str, amount: int) -> dict | None:
+    """Get Jupiter quote. amount in smallest units."""
+    params = {
+        "inputMint": input_mint,
+        "outputMint": output_mint,
+        "amount": str(amount),
+        "slippageBps": JUPITER_SLIPPAGE_BPS,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(JUPITER_QUOTE_URL, params=params)
+            if r.status_code == 200:
+                return r.json()
     except Exception as e:
-        logger.exception("Load failed")
-        return {"ok": False, "error": str(e)}
+        logger.warning("Jupiter quote failed: %s", e)
+    return None
+
+async def get_token_price_usd(token_address: str) -> float | None:
+    """Get approximate USD price via Jupiter (token -> USDC)."""
+    # 1 token unit (adjust decimals later if needed)
+    quote = await get_jupiter_quote(token_address, USDC_MINT, 1_000_000)
+    if not quote or "outAmount" not in quote:
+        return None
+    try:
+        out = int(quote["outAmount"])
+        # USDC has 6 decimals
+        return out / 1_000_000
+    except Exception:
+        return None
 
 async def get_token_prices_usd(token_addresses, reference_prices=None):
-    addresses = [str(a) for a in token_addresses if a]
-    if not addresses:
-        return {}
     results = {}
-    async with httpx.AsyncClient(timeout=12) as client:
-        for offset in range(0, len(addresses), 30):
-            batch = addresses[offset:offset+30]
-            url = "https://api.dexscreener.com/tokens/v1/solana/" + ",".join(batch)
-            try:
-                r = await client.get(url)
-                if r.status_code != 200:
-                    continue
-                pairs = r.json()
-                if not isinstance(pairs, list):
-                    continue
-                for pair in pairs:
-                    if pair.get("chainId") != "solana":
-                        continue
-                    base = pair.get("baseToken", {})
-                    addr = base.get("address")
-                    price = _num(pair.get("priceUsd"))
-                    if addr and price > 0:
-                        results[addr] = price
-            except Exception:
-                continue
+    for addr in token_addresses:
+        price = await get_token_price_usd(addr)
+        if price and price > 0:
+            results[addr] = price
     return results
 
-async def get_token_price_usd(token_address):
-    prices = await get_token_prices_usd([token_address])
-    return prices.get(token_address)
-
 def get_price_diagnostics():
-    return {
-        "provider": "dexscreener",
-        "status": "ok",
-        "cached_prices": len(_price_cache),
-    }
+    return {"provider": "jupiter", "status": "ok"}
 
 def record_paper_trade(token_address, side, amount_usd, price_usd, token_symbol="", source="manual", reason=None):
     global _realized_pnl_usd
@@ -141,7 +130,7 @@ def record_paper_trade(token_address, side, amount_usd, price_usd, token_symbol=
     amount_usd = _num(amount_usd)
     price_usd = _num(price_usd)
     if side not in ("BUY", "SELL") or amount_usd <= 0 or price_usd <= 0:
-        raise ValueError("Invalid trade parameters")
+        raise ValueError("Invalid params")
 
     trade = {
         "token_address": token_address,
@@ -152,6 +141,7 @@ def record_paper_trade(token_address, side, amount_usd, price_usd, token_symbol=
         "source": source,
         "reason": reason,
         "timestamp": time.time(),
+        "provider": "jupiter_quote",
     }
 
     if side == "BUY":
@@ -170,17 +160,16 @@ def record_paper_trade(token_address, side, amount_usd, price_usd, token_symbol=
             }
         else:
             old_qty = _num(pos.get("quantity"))
-            total_qty = old_qty + qty
-            pos["entry_price_usd"] = (pos["entry_price_usd"] * old_qty + price_usd * qty) / total_qty
-            pos["quantity"] = total_qty
+            total = old_qty + qty
+            pos["entry_price_usd"] = (pos["entry_price_usd"] * old_qty + price_usd * qty) / total
+            pos["quantity"] = total
             pos["invested_usd"] += amount_usd
-            pos["current_price_usd"] = price_usd
             pos["highest_price"] = max(pos.get("highest_price", price_usd), price_usd)
         _paper_trades.append(trade)
     else:
         pos = _open_positions.get(token_address)
         if not pos:
-            raise ValueError("No open position")
+            raise ValueError("No position")
         qty = _num(pos["quantity"])
         invested = _num(pos["invested_usd"])
         sell_qty = min(qty, amount_usd / price_usd)
@@ -229,6 +218,7 @@ def _close_position(address, position, price, reason, change_pct):
         "realized_pnl_usd": round(pnl, 4),
         "change_pct": round(change_pct, 2),
         "timestamp": time.time(),
+        "provider": "jupiter_quote",
     }
     _paper_trades.append(trade)
     _realized_pnl_usd += pnl
@@ -255,8 +245,7 @@ async def update_paper_prices():
         if entry <= 0:
             continue
         change = (price / entry - 1) * 100
-        opened = _num(pos.get("opened_at"))
-        if time.time() - opened < MIN_HOLD_SECONDS:
+        if time.time() - _num(pos.get("opened_at")) < MIN_HOLD_SECONDS:
             pos["current_price_usd"] = price
             continue
 
@@ -294,9 +283,7 @@ def get_paper_status():
         "paper_unrealized_pnl_usd": round(unrealized, 2),
         "paper_realized_pnl_usd": round(_realized_pnl_usd, 2),
         "paper_total_pnl_usd": round(unrealized + _realized_pnl_usd, 2),
-        "take_profit_pct": TAKE_PROFIT_PCT,
-        "stop_loss_pct": STOP_LOSS_PCT,
-        "trailing_stop_pct": TRAILING_STOP_PCT,
+        "provider": "jupiter_quote",
     }
 
 def get_paper_trades():
