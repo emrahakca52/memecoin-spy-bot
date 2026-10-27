@@ -29,10 +29,15 @@ MIN_HOLD_SECONDS = int(os.getenv("MIN_HOLD_SECONDS", "120"))
 
 # Jupiter
 JUPITER_QUOTE_URL = "https://quote-api.jup.ag/v6/quote"
-JUPITER_SLIPPAGE_BPS = int(os.getenv("JUPITER_SLIPPAGE_BPS", "100"))  # %1
+JUPITER_SLIPPAGE_BPS = int(os.getenv("JUPITER_SLIPPAGE_BPS", "100"))
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 SOL_MINT = "So11111111111111111111111111111111111111112"
 
-COPYFOMO_GATE_ENABLED = os.getenv("COPYFOMO_GATE_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+# Grok
+GROK_API_BASE = os.getenv("XAI_API_BASE", "https://api.x.ai/v1").rstrip("/")
+GROK_MODEL = os.getenv("XAI_MODEL", "grok-3-mini")
+GROK_TIMEOUT_SECONDS = float(os.getenv("XAI_TIMEOUT_SECONDS", "20"))
 GROK_CONFIDENCE_THRESHOLD = 0.65
-MAX_GROK_CHECKS_PER_SCAN = 3
+MAX_GROK_CHECKS_PER_SCAN = max(1, int(os.getenv("MAX_GROK_CHECKS_PER_SCAN", "3")))
+
+COPYFOMO_GATE_ENABLED = os.getenv("COPYFOMO_GATE_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
