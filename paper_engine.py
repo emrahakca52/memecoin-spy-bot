@@ -901,13 +901,14 @@ async def update_paper_prices():
             # before allowing the quote to update the mark.
             pass
 
+        extreme_quote = False
         if change <= STOP_LOSS_PCT:
             overshoot = STOP_LOSS_PCT - change
             if overshoot > MAX_STOP_LOSS_OVERSHOOT_PCT:
                 message = (
                     f"{position.get('token_symbol', address[:8])} quote implies "
-                    f"{change:.2f}% from entry; extreme quote is reflected in "
-                    "paper mark/P&L, but automatic stop-loss is withheld pending verification"
+                    f"{change:.2f}% from entry; suspect extreme quote is stored "
+                    "for diagnostics only; current mark/P&L and auto stop-loss are withheld pending verification"
                 )
                 position["last_suspect_price_usd"] = price
                 position["last_suspect_price_utc"] = _utc_now()
@@ -915,16 +916,15 @@ async def update_paper_prices():
                 position["price_mark_status"] = "unverified_extreme_quote"
                 _record_provider("birdeye", last_price_jump_warning=message)
                 logger.error(message)
-                # Intentionally do not continue: update the marked price/P&L
-                # below, but leave the position open in the auto-close guard.
+                extreme_quote = True
 
         if change >= TAKE_PROFIT_PCT:
             overshoot = change - TAKE_PROFIT_PCT
             if overshoot > MAX_TAKE_PROFIT_OVERSHOOT_PCT:
                 message = (
                     f"{position.get('token_symbol', address[:8])} quote implies "
-                    f"+{change:.2f}% from entry; extreme quote is reflected in "
-                    "paper mark/P&L, but automatic take-profit is withheld pending verification"
+                    f"+{change:.2f}% from entry; suspect extreme quote is stored "
+                    "for diagnostics only; current mark/P&L and auto take-profit are withheld pending verification"
                 )
                 position["last_suspect_price_usd"] = price
                 position["last_suspect_price_utc"] = _utc_now()
@@ -932,11 +932,17 @@ async def update_paper_prices():
                 position["price_mark_status"] = "unverified_extreme_quote"
                 _record_provider("birdeye", last_price_jump_warning=message)
                 logger.error(message)
-                # Intentionally do not continue: mark the position for display,
-                # but the auto-close guard below keeps it open.
+                extreme_quote = True
 
-        # Accepted quotes update the paper mark and unrealized P/L. Extreme
-        # quotes retain an explicit warning and are not automatically closed.
+        # Critical safety rule: a quote that implies an implausibly large move
+        # from entry is diagnostic-only. Do not let it corrupt the displayed
+        # position mark/unrealized P&L or trigger an automatic paper sale.
+        # Existing current_price_usd and unrealized_pnl_usd remain unchanged.
+        if extreme_quote:
+            errors += 1
+            continue
+
+        # Only accepted, non-extreme quotes update the paper mark and P/L.
         position["current_price_usd"] = price
         qty = _num(position.get("quantity"))
         invested = _num(position.get("invested_usd"))
