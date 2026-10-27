@@ -368,8 +368,22 @@ def load_paper_state():
 
         _open_positions = positions
         _paper_trades = trades
-        _realized_pnl_usd = reconciled["realized_pnl_usd"]
         warning_parts = []
+
+        # Rebuild the aggregate only when every SELL row has a usable realized-P/L
+        # value. If legacy rows are missing that field, summing only the known rows
+        # would silently erase part of the saved lifetime total on the next save.
+        # In that case preserve the stored aggregate and make the incomplete ledger
+        # explicit until an operator can reconcile it from source records.
+        if reconciled["sell_records_missing_pnl"] == 0:
+            _realized_pnl_usd = reconciled["realized_pnl_usd"]
+        else:
+            _realized_pnl_usd = stored_realized
+            warning_parts.append(
+                f"{reconciled['sell_records_missing_pnl']} SELL record(s) lack realized_pnl_usd; "
+                "stored realized P/L preserved because full reconciliation is incomplete."
+            )
+
         if reconciled["quarantined_sell_records"]:
             warning_parts.append(
                 f"{len(reconciled['quarantined_sell_records'])} SELL record(s) quarantined from reported P/L."
@@ -378,8 +392,8 @@ def load_paper_state():
 
         if _database_status["accounting_warning"]:
             logger.error("Paper accounting warning: %s", _database_status["accounting_warning"])
-        # Persist the quarantined annotation and reconciled aggregate while keeping
-        # the original trade row present for audit. A DB backup is still recommended.
+        # Save annotations and, only when reconciliation is complete, the rebuilt
+        # aggregate. Original trade rows are retained for audit. A DB backup is still recommended.
         _save_paper_state()
         logger.info(
             "Loaded paper state: %s positions, %s trades.",
