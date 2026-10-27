@@ -5,7 +5,7 @@ This package is based on the project ZIP supplied by the owner. It preserves the
 ## Safety defaults
 - `TRADING_MODE` is paper.
 - `REAL_TRADING_ENABLED` is hard-coded `False` in the strategy engine.
-- The bot does **not** start automatically on deployment. It loads saved paper state and remains stopped until `POST /paper-bot/start` is explicitly called.
+- The current `app.py` startup lifecycle loads saved paper state and then automatically starts the **paper-only scanner** on deployment. Check `/health` and `/paper/status` after deploy; use `POST /paper-bot/stop` to stop the paper scanner.
 - No wallet signing or real swap/order implementation is included.
 
 ## Render settings
@@ -25,7 +25,7 @@ This package is based on the project ZIP supplied by the owner. It preserves the
 The engine uses the existing PostgreSQL `DATABASE_URL` and the `memecoin_paper_state` table. Do not delete the Render PostgreSQL database. The first startup attempts to load the saved state; if there is no saved state or the database URL is missing, verify configuration before taking further action.
 
 ## Safe verification
-- `GET /health` should show `mode: paper`, `real_trading_enabled: false`, and `bot.running: false` after deployment.
+- `GET /health` should show `mode: paper` and `real_trading_enabled: false`. With the current startup behavior, `bot.running` is expected to be `true` after a successful startup; if it is not, inspect logs and `/paper/status`.
 - `GET /paper/status` reports persistence and paper accounting status.
 - `GET /paper/trades` lists persisted simulated trades.
 - Only after those checks should you manually call `POST /paper-bot/start` if you want the paper scanner running.
@@ -41,4 +41,4 @@ Python syntax and module-import checks are not the same as a live Render integra
 - Tightens automatic-exit quote guards: stop-loss overshoot is capped at 10 percentage points (default 10), and take-profit overshoot is capped at 50 percentage points (default 50). Configured values are also clamped to these maximums. Excessive quotes are flagged and the position remains open for review; this is safer for simulation integrity but can leave a position open during a genuine rapid market move.
 - This patch does not rewrite or delete historical trade records, including quarantined anomalous records.
 
-Deploy by replacing the repository's source files with the contents of this ZIP. Do not upload the ZIP file itself and do not remove the Render PostgreSQL database or environment variables. Start the paper bot only after checking `/health`, `/paper/status`, and `/paper/trades`.
+Deploy changes through GitHub and let Render deploy. Do not upload the ZIP file itself and do not remove the Render PostgreSQL database or environment variables. Check `/health`, `/paper/status`, and `/paper/trades` after deployment. Note: the current application code automatically starts the paper scanner; this is separate from real trading, which remains disabled.
