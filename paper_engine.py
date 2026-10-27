@@ -495,6 +495,7 @@ async def _fetch_birdeye_price(client, address):
         last_attempt_utc=_utc_now(), last_endpoint=url, last_http_status=None,
         last_error=None, last_prices_found=0)
     try:
+        await _respect_birdeye_rate_limit()
         response = await client.get(url)
         _record_provider("dexscreener", last_http_status=response.status_code)
         if response.status_code == 429:
@@ -640,6 +641,8 @@ async def get_token_prices_usd(token_addresses, reference_prices=None):
                 still_missing.append(address)
 
         if not still_missing:
+            return prices
+        if _provider_is_cooling("dexscreener"):
             return prices
 
         try:
