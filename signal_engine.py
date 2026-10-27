@@ -111,7 +111,10 @@ async def _get_json(client: httpx.AsyncClient, url: str, params: dict[str, Any])
     if response.status_code in (401, 403):
         _stats["last_error"] = f"HTTP {response.status_code}; verify API key and endpoint access/plan"
         raise RuntimeError(_stats["last_error"])
-    response.raise_for_status()
+    if response.status_code >= 400:
+        detail = " ".join(response.text.split())[:240]
+        _stats["last_error"] = f"HTTP {response.status_code}: {detail}"
+        raise RuntimeError(_stats["last_error"])
     payload = response.json()
     if not isinstance(payload, dict) or payload.get("success") is False:
         _stats["last_error"] = "Birdeye returned an unsuccessful or invalid JSON payload"
@@ -189,11 +192,12 @@ async def _fetch_candidates() -> tuple[list[dict], dict]:
         }
 
     headers = {"accept": "application/json", "X-API-KEY": api_key, "x-chain": "solana"}
+    # Keep discovery requests to the documented required fields. Liquidity and
+    # volume thresholds are applied locally after the API response, which also
+    # avoids plan/parameter validation differences causing a total scan failure.
     params = {
         "sort_by": "liquidity",
         "sort_type": "desc",
-        "min_liquidity": MIN_LIQUIDITY_USD,
-        "min_volume_24h_usd": MIN_VOLUME_24H_USD,
         "offset": 0,
         "limit": LISTING_LIMIT,
     }
