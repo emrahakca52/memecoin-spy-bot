@@ -4,6 +4,7 @@ Discovery and market metrics use Birdeye only. Paper mode; no orders are submitt
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import time
 from datetime import datetime, timezone
@@ -49,6 +50,16 @@ def _num(value: Any, default: float = 0.0) -> float:
     except (TypeError, ValueError, OverflowError):
         pass
     return default
+
+
+def _has_finite_number(value: Any) -> bool:
+    """Return whether a provider metric is present and finite."""
+    if value is None or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return False
 
 
 def _api_key() -> str:
@@ -153,7 +164,7 @@ def _normalize(item: dict) -> dict:
         "unique_wallets_24h": int(_num(item.get("unique_wallet_24h"))),
         "trade_count_24h": int(_num(item.get("trade_24h_count"))),
         "price_change_24h_pct": _num(item.get("price_change_24h_percent")),
-        "price_change_24h_present": item.get("price_change_24h_percent") is not None,
+        "price_change_24h_present": _has_finite_number(item.get("price_change_24h_percent")),
     }
 
 
@@ -277,7 +288,7 @@ async def get_signal_candidates(
         if trades < MIN_TRADES_24H:
             reasons.append("trade_count_24h_below_minimum")
         if not candidate.get("price_change_24h_present", False):
-            reasons.append("missing_price_change_24h")
+            reasons.append("missing_or_invalid_price_change_24h")
         elif abs(change_24h) > MAX_PRICE_CHANGE_24H_PCT:
             reasons.append("extreme_price_change_24h")
         elif change_24h < -MAX_NEGATIVE_PRICE_CHANGE_24H_PCT:
@@ -327,7 +338,7 @@ async def get_signal_candidates(
                              for reason in ("liquidity_below_minimum", "volume_24h_below_minimum",
                                             "buy_sell_activity_insufficient", "trade_count_24h_below_minimum",
                                             "extreme_price_change_24h", "negative_price_change_24h_exceeded",
-                                            "missing_price_change_24h", "missing_token_address",
+                                            "missing_or_invalid_price_change_24h", "missing_token_address",
                                             "missing_or_zero_price")},
         "additional_filters": {
             "min_trades_24h": MIN_TRADES_24H,
