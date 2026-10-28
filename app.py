@@ -17,6 +17,7 @@ from paper_engine import (
     load_paper_state,
 )
 from auto_paper_bot import bot_status, start_bot, stop_bot
+from config import MIN_LIQUIDITY_USD, MIN_VOLUME_24H_USD, MIN_BUYS_SELLS_RATIO
 
 logger = logging.getLogger("memecoin_spy")
 
@@ -79,9 +80,9 @@ def signal_status():
 
 @app.get("/signals")
 async def signals(
-    min_liquidity_usd: float = Query(10000, ge=0),
-    min_volume_24h_usd: float = Query(20000, ge=0),
-    min_buys_sells_ratio: float = Query(1.0, ge=0),
+    min_liquidity_usd: float = Query(MIN_LIQUIDITY_USD, ge=0),
+    min_volume_24h_usd: float = Query(MIN_VOLUME_24H_USD, ge=0),
+    min_buys_sells_ratio: float = Query(MIN_BUYS_SELLS_RATIO, ge=0),
     limit: int = Query(20, ge=1, le=50),
 ):
     try:
