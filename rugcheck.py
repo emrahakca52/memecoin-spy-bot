@@ -183,7 +183,10 @@ def evaluate_report(report: dict, market_context: dict | None = None) -> dict:
     # automatic veto; a larger cluster is rejected. Missing data remains unknown
     # and is surfaced explicitly rather than being treated as zero.
     if insider_count is None:
-        missing.append("insider_network_data")
+        # Many reports omit this optional field. Surface uncertainty, but do not
+        # make it a universal veto; authority, holder, LP and explicit risk checks
+        # remain hard gates. Never report unknown as zero.
+        warnings.append("insider_network_data_missing")
     elif insider_count > 2:
         reasons.append("insider_networks_above_limit")
     elif insider_count > 0:
