@@ -9,50 +9,71 @@ from grok import evaluate_token
 from rugcheck import check_token
 
 logger = logging.getLogger(__name__)
-SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com").strip()
+
+def _solana_rpc_urls() -> list[str]:
+    """Use configured RPC endpoints first, with public fallbacks for transient outages."""
+    configured = os.getenv("SOLANA_RPC_URLS", "").strip()
+    raw_urls = [item.strip() for item in configured.split(",") if item.strip()]
+    if not raw_urls:
+        primary = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com").strip()
+        raw_urls = [primary, "https://solana-rpc.publicnode.com"]
+    # Preserve order while removing duplicate URLs.
+    return list(dict.fromkeys(raw_urls))
 
 
 async def check_onchain_mint_authorities(address: str) -> dict:
-    """Independently verify mint/freeze authorities from Solana RPC, as in safety.ts."""
+    """Independently verify mint/freeze authorities; RPC outages never count as approval."""
     if not address:
         return {"passed": False, "reasons": ["missing_token_address"]}
     payload = {
         "jsonrpc": "2.0", "id": 1, "method": "getParsedAccountInfo",
         "params": [address, {"encoding": "jsonParsed", "commitment": "confirmed"}],
     }
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(8.0, connect=4.0)) as client:
-            response = await client.post(SOLANA_RPC_URL, json=payload)
-            response.raise_for_status()
-            data = response.json()
-        if data.get("error"):
-            return {"passed": False, "reasons": ["onchain_rpc_error"]}
-        value = ((data.get("result") or {}).get("value"))
-        parsed = (((value or {}).get("data") or {}).get("parsed") or {})
-        info = parsed.get("info") if isinstance(parsed, dict) else None
-        if not isinstance(info, dict):
-            return {"passed": False, "reasons": ["onchain_mint_data_missing"]}
-        if parsed.get("type") != "mint":
-            return {"passed": False, "reasons": ["account_is_not_a_parsed_token_mint"]}
-        mint_authority = info.get("mintAuthority")
-        freeze_authority = info.get("freezeAuthority")
-        reasons = []
-        if mint_authority:
-            reasons.append("onchain_mint_authority_active")
-        if freeze_authority:
-            reasons.append("onchain_freeze_authority_active")
-        return {
-            "passed": not reasons,
-            "reasons": reasons,
-            "mint_authority_active": bool(mint_authority),
-            "freeze_authority_active": bool(freeze_authority),
-            "decimals": info.get("decimals"),
-            "supply": info.get("supply"),
-        }
-    except (httpx.HTTPError, ValueError, TypeError, AttributeError) as exc:
-        # Fail closed: a failed independent check is not an approval.
-        return {"passed": False, "reasons": ["onchain_rpc_check_unavailable"],
-                "error": type(exc).__name__}
+    errors = []
+    async with httpx.AsyncClient(timeout=httpx.Timeout(8.0, connect=4.0)) as client:
+        for rpc_url in _solana_rpc_urls():
+            try:
+                response = await client.post(rpc_url, json=payload)
+                response.raise_for_status()
+                data = response.json()
+                if data.get("error"):
+                    errors.append("jsonrpc_error")
+                    continue
+                value = (data.get("result") or {}).get("value")
+                if value is None:
+                    return {"passed": False, "reasons": ["onchain_account_not_found"], "rpc_endpoint": rpc_url}
+                parsed = ((value.get("data") or {}).get("parsed") or {})
+                info = parsed.get("info") if isinstance(parsed, dict) else None
+                if not isinstance(info, dict):
+                    return {"passed": False, "reasons": ["onchain_mint_data_missing"], "rpc_endpoint": rpc_url}
+                if parsed.get("type") != "mint":
+                    return {"passed": False, "reasons": ["account_is_not_a_parsed_token_mint"], "rpc_endpoint": rpc_url}
+                mint_authority = info.get("mintAuthority")
+                freeze_authority = info.get("freezeAuthority")
+                reasons = []
+                if mint_authority:
+                    reasons.append("onchain_mint_authority_active")
+                if freeze_authority:
+                    reasons.append("onchain_freeze_authority_active")
+                return {
+                    "passed": not reasons,
+                    "reasons": reasons,
+                    "mint_authority_active": bool(mint_authority),
+                    "freeze_authority_active": bool(freeze_authority),
+                    "decimals": info.get("decimals"),
+                    "supply": info.get("supply"),
+                    "rpc_endpoint": rpc_url,
+                }
+            except (httpx.HTTPError, ValueError, TypeError, AttributeError) as exc:
+                errors.append(type(exc).__name__)
+                continue
+    # Fail closed after every configured endpoint fails.
+    return {
+        "passed": False,
+        "reasons": ["onchain_rpc_check_unavailable"],
+        "error": ",".join(errors[-3:]) or "all_rpc_endpoints_failed",
+        "rpc_endpoint_count": len(_solana_rpc_urls()),
+    }
 
 
 async def check_jupiter_round_trip(token_address: str) -> dict:
