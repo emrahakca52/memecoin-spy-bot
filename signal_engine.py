@@ -485,6 +485,55 @@ async def get_signal_candidates(
                             globals()["_last_geckoterminal_discovery"] = {
                                 "error": f"{type(gecko_exc).__name__}: {str(gecko_exc)[:160]}"
                             }
+
+                # Do not let a successful Jupiter feed suppress independent DEX market
+                # discovery. Jupiter's trending feeds can contain thin, spoofed-ticker or
+                # poorly tradable assets; DexScreener adds pool-level liquidity/volume
+                # and broadens the candidate set. Keep safety checks downstream unchanged.
+                if provider == "Jupiter":
+                    try:
+                        dex_candidates = await _discover_dexscreener(client)
+                        by_address = {
+                            str(item.get("token_address")): dict(item)
+                            for item in candidates
+                            if item.get("token_address")
+                        }
+                        market_fields = (
+                            "price_usd", "liquidity_usd", "volume_24h_usd",
+                            "volume_1h_usd", "volume_5m_usd", "buys_24h", "sells_24h",
+                            "buy_sell_ratio", "buy_sell_ratio_1h", "trade_count_24h",
+                            "trade_count_1h", "price_change_24h_pct",
+                            "price_change_1h_pct", "price_change_5m_pct",
+                            "price_change_24h_present", "market_cap_usd", "url",
+                        )
+                        for dex_item in dex_candidates:
+                            address = str(dex_item.get("token_address") or "")
+                            if not address:
+                                continue
+                            if address not in by_address:
+                                by_address[address] = dict(dex_item)
+                                continue
+                            merged = by_address[address]
+                            # Prefer DEX pair data for tradability and short-window stats;
+                            # preserve Jupiter metadata when DEX fields are absent.
+                            for key in market_fields:
+                                value = dex_item.get(key)
+                                if value is not None and value != "" and value != 0:
+                                    merged[key] = value
+                            if not merged.get("name") and dex_item.get("name"):
+                                merged["name"] = dex_item["name"]
+                            if not merged.get("symbol") or merged.get("symbol") == "UNKNOWN":
+                                merged["symbol"] = dex_item.get("symbol") or merged.get("symbol")
+                            merged["market_data_provider"] = "DexScreener"
+                            by_address[address] = merged
+                        candidates = list(by_address.values())
+                        provider = "Jupiter + DexScreener"
+                    except Exception as dex_exc:
+                        _last_dexscreener_discovery = {
+                            **(_last_dexscreener_discovery if isinstance(_last_dexscreener_discovery, dict) else {}),
+                            "merge_error": f"{type(dex_exc).__name__}: {str(dex_exc)[:160]}",
+                        }
+
             diagnostics = {
                 "provider": provider,
                 "jupiter_error": jupiter_error,
