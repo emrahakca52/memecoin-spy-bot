@@ -1,9 +1,10 @@
 """Fail-closed token safety + AI screening orchestration."""
 from __future__ import annotations
+import asyncio
 import logging
 import os
 import httpx
-from config import JUPITER_QUOTE_URL, JUPITER_SLIPPAGE_BPS, USDC_MINT
+from config import JUPITER_QUOTE_URL, JUPITER_API_KEY, JUPITER_SLIPPAGE_BPS, USDC_MINT
 from grok import evaluate_token
 from rugcheck import check_token
 
@@ -70,7 +71,10 @@ async def check_jupiter_round_trip(token_address: str) -> dict:
         "slippageBps": str(JUPITER_SLIPPAGE_BPS),
     }
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(12.0, connect=5.0)) as client:
+        headers = {"x-api-key": JUPITER_API_KEY} if JUPITER_API_KEY else {}
+        async with httpx.AsyncClient(timeout=httpx.Timeout(7.0, connect=4.0), headers=headers) as client:
+            # Current Jupiter Swap API permits keyless prototyping at a low rate;
+            # serialize the two quote calls with a small pause to avoid burst 429s.
             buy_response = await client.get(JUPITER_QUOTE_URL, params=buy_params)
             if buy_response.status_code != 200:
                 return {"passed": False, "reasons": ["jupiter_buy_quote_unavailable"],
@@ -85,6 +89,7 @@ async def check_jupiter_round_trip(token_address: str) -> dict:
                 "amount": out_amount,
                 "slippageBps": str(JUPITER_SLIPPAGE_BPS),
             }
+            await asyncio.sleep(2.1)
             sell_response = await client.get(JUPITER_QUOTE_URL, params=sell_params)
             if sell_response.status_code != 200:
                 return {"passed": False, "reasons": ["jupiter_sell_quote_unavailable"],
