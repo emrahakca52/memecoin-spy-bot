@@ -48,7 +48,8 @@ MAX_GROK_CHECKS_PER_SCAN = max(1, min(10, int(os.getenv("MAX_GROK_CHECKS_PER_SCA
 COPYFOMO_GATE_ENABLED = True
 
 # Momentum entry thresholds; wallet-level buyer counts are not available in current feeds.
-MOMENTUM_MIN_SCORE = float(os.getenv("MOMENTUM_MIN_SCORE", "50"))
-MOMENTUM_MIN_BUY_SELL_RATIO = float(os.getenv("MOMENTUM_MIN_BUY_SELL_RATIO", "1.2"))
+# PAPER-only tuning: reduce false negatives while keeping hard safety gates unchanged.
+MOMENTUM_MIN_SCORE = float(os.getenv("MOMENTUM_MIN_SCORE", "40"))
+MOMENTUM_MIN_BUY_SELL_RATIO = float(os.getenv("MOMENTUM_MIN_BUY_SELL_RATIO", "1.0"))
 MOMENTUM_MIN_OBSERVED_CHANGE_PCT = float(os.getenv("MOMENTUM_MIN_OBSERVED_CHANGE_PCT", "-0.5"))
 MOMENTUM_MAX_OBSERVED_CHANGE_PCT = float(os.getenv("MOMENTUM_MAX_OBSERVED_CHANGE_PCT", "8"))
