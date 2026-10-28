@@ -85,7 +85,7 @@ def _save_paper_state():
         logger.exception("Save error: %s", e)
 
 def load_paper_state():
-    global _open_positions, _paper_trades, _realized_pnl_usd
+    global _open_positions, _paper_trades, _realized_pnl_usd, _paper_starting_balance_usd
     if not _database_url():
         return {"ok": False}
     try:
@@ -416,7 +416,7 @@ def _reported_realized_pnl(trades):
     return {"realized_pnl_usd": round(realized, 4), "quarantined_sell_records": quarantined}
 
 def load_paper_state():
-    global _open_positions, _paper_trades, _realized_pnl_usd
+    global _open_positions, _paper_trades, _realized_pnl_usd, _paper_starting_balance_usd
     if not _database_url():
         return {"ok": False, "loaded": False}
     try:
