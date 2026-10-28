@@ -437,6 +437,13 @@ async def get_signal_candidates(
             }
             _cache.update({"timestamp": now, "candidates": candidates, "diagnostics": diagnostics})
 
+    # Bounded market-filter adjustment: ease activity thresholds slightly while
+    # keeping liquidity, trade-count, price-momentum and all RugCheck gates unchanged.
+    requested_min_vol = min_vol
+    requested_min_ratio = min_ratio
+    min_vol = max(20000.0, min_vol * (2.0 / 3.0))
+    min_ratio = max(1.0, min_ratio - 0.1)
+
     filtered = []
     rejected = {
         "missing_price_change": 0,
@@ -502,7 +509,7 @@ async def get_signal_candidates(
                 "max_negative_price_change_24h_pct": MAX_NEGATIVE_PRICE_CHANGE_24H_PCT,
             },
             "rejected_by_criterion": rejected,
-            "note": "Counts overlap: one token can fail multiple criteria. These diagnostics do not place trades.",
+            "requested_min_volume_24h_usd": requested_min_vol,\n                "requested_min_buys_sells_ratio": requested_min_ratio,\n                "note": "Activity thresholds are modestly relaxed within bounded floors; liquidity, trade-count, price limits and RugCheck safety gates remain unchanged. Counts overlap.",
         },
         "mode": TRADING_MODE,
         "diagnostics": diagnostics,
