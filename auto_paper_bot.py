@@ -38,6 +38,7 @@ _last_price_update = None
 _last_scan = None
 _last_skipped = []
 _last_copyfomo_checks = []
+_last_momentum_observations = []
 _last_telegram_report = {"sent": False, "reason": "not_sent_yet", "at_utc": None}
 
 def _utc_now() -> str:
@@ -109,7 +110,7 @@ def _daily_loss_exceeded() -> bool:
         return False
 
 async def _loop(stop_event):
-    global _last_run, _last_started, _last_error, _last_price_update, _last_scan, _last_skipped, _last_copyfomo_checks, _last_telegram_report
+    global _last_run, _last_started, _last_error, _last_price_update, _last_scan, _last_skipped, _last_copyfomo_checks, _last_momentum_observations, _last_telegram_report
 
     while not stop_event.is_set():
         _last_started = _utc_now()
@@ -122,6 +123,7 @@ async def _loop(stop_event):
         try:
             _last_error = None
             _last_skipped = []
+            _last_momentum_observations = []
             logger.info("Scan cycle started")
 
             try:
@@ -234,10 +236,19 @@ async def _loop(stop_event):
                     )
                     for row, outcome in zip(observation_batch, observed):
                         address = row[1]
+                        token = row[0]
                         if isinstance(outcome, Exception):
                             observation_results[address] = {"passed": False, "reason": type(outcome).__name__}
                         else:
                             observation_results[address] = outcome
+                        _last_momentum_observations.append({
+                            "symbol": token.get("symbol"),
+                            "token_address": address,
+                            "score": token.get("score"),
+                            "buy_sell_ratio_5m": token.get("buy_sell_ratio_5m"),
+                            "trade_count_5m": token.get("trade_count_5m"),
+                            "result": observation_results[address],
+                        })
 
                 observed_addresses = set(observation_results)
                 for token, address, symbol, signal_price in valid_signals:
@@ -317,6 +328,7 @@ async def _loop(stop_event):
                     if isinstance(item.get("grok"), dict)
                     and item["grok"].get("api_ok") is True
                 )
+                _last_scan["momentum_observations"] = list(_last_momentum_observations)
                 _last_scan["processing"] = {
                     "security_approved": scan_approved_count,
                     "rugcheck_passed": rugcheck_passed_count,
