@@ -101,6 +101,29 @@ async def _observe_candidate(token: dict) -> dict:
     return {"passed": True, "reason": "observation_passed", "observed_change_pct": round(change_pct, 2), "observed_price_usd": samples[-1], "samples": len(samples), "ratio_window": ratio_window, "ratio": ratio, "trades_5m": trades_5m}
 
 
+def _ai_quota_fallback_allowed(gate: dict) -> bool:
+    """Paper-only fallback when AI is rate-limited, never when a safety gate fails.
+
+    RugCheck, independent on-chain authority checks, and Jupiter round-trip
+    must all have passed. This prevents a temporary AI quota error from silently
+    blocking every otherwise-verified paper candidate, without weakening hard
+    token-safety checks or enabling real trading.
+    """
+    if not isinstance(gate, dict) or gate.get("passed"):
+        return False
+    rug = gate.get("rugcheck") if isinstance(gate.get("rugcheck"), dict) else {}
+    onchain = gate.get("onchain_safety") if isinstance(gate.get("onchain_safety"), dict) else {}
+    route = gate.get("round_trip") if isinstance(gate.get("round_trip"), dict) else {}
+    ai = gate.get("grok") if isinstance(gate.get("grok"), dict) else {}
+    if not (rug.get("passed") is True and onchain.get("passed") is True and route.get("passed") is True):
+        return False
+    status = str(ai.get("http_status") or ai.get("status_code") or "")
+    error = str(ai.get("error") or ai.get("provider_status") or "").lower()
+    message = str(ai.get("message") or ai.get("provider_message") or "").lower()
+    quota_limited = status == "429" or "resource_exhausted" in error or "quota" in error or "quota" in message
+    return quota_limited and ai.get("api_ok") is False
+
+
 def _daily_loss_exceeded() -> bool:
     try:
         status = get_paper_status()
@@ -184,6 +207,18 @@ async def _loop(stop_event):
                             checked.append({"symbol": token.get("symbol"), **gate})
                             if gate.get("passed"):
                                 eligible_signals.append(token)
+                            elif _ai_quota_fallback_allowed(gate):
+                                # PAPER ONLY: use deterministic hard checks when AI provider
+                                # quota is exhausted; never bypass RugCheck/on-chain/route gates.
+                                gate["paper_fallback"] = "ai_quota_hard_checks_only"
+                                gate["passed"] = True
+                                gate["decision"] = "PAPER_ONLY_FALLBACK"
+                                checked[-1] = {"symbol": token.get("symbol"), **gate}
+                                eligible_signals.append(token)
+                                logger.warning(
+                                    "AI quota fallback allowed for PAPER candidate %s after RugCheck, on-chain and Jupiter checks passed",
+                                    token.get("symbol"),
+                                )
                             else:
                                 rejection_reasons = gate.get("rejection_reasons") or []
                                 rug = gate.get("rugcheck") if isinstance(gate.get("rugcheck"), dict) else {}
