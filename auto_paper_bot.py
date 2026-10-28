@@ -257,12 +257,20 @@ def bot_status():
     copyfomo_summary = []
     for item in _last_copyfomo_checks[-8:]:
         gate = item.get("gate") if isinstance(item.get("gate"), dict) else item
+        ai = gate.get("grok") if isinstance(gate.get("grok"), dict) else {}
         copyfomo_summary.append({
             "symbol": item.get("symbol"),
             "passed": gate.get("passed"),
             "stage": gate.get("stage"),
             "decision": gate.get("decision"),
             "rejection_reasons": gate.get("rejection_reasons", []),
+            "ai_provider": ai.get("provider", "not_called"),
+            "ai_model": ai.get("model"),
+            "ai_api_ok": ai.get("api_ok", False),
+            "ai_decision": ai.get("decision", "NOT_RUN"),
+            "ai_confidence": ai.get("confidence"),
+            "ai_reasons": ai.get("reasons", []),
+            "ai_http_status": ai.get("http_status"),
         })
     return {
         "mode": "paper",
