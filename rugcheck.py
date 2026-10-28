@@ -116,15 +116,18 @@ def evaluate_report(report: dict, market_context: dict | None = None) -> dict:
     change = _num(market.get("price_change_24h_pct")) or 0.0
     volatility = abs(change)
 
-    # Security thresholds adapt to market conditions, but never waive hard vetoes.
-    # A very sharp 24h move is a stronger manipulation/chasing warning than ordinary
-    # low liquidity alone; liquidity is also handled by the market-selection score.
+    # Market conditions may tighten the raw-risk review band, but must never
+    # relax the configured core safety limits. Match the strict baseline in config:
+    # top-10 holder concentration <=25%, LP locked/burned >=80%.
     if volatility >= 80 or liquidity < 9000:
-        profile = {"name": "strict", "max_raw_score": 1000.0, "max_score_normalised": 21.0, "max_top10_pct": 25.0, "min_lp_pct": 50.0}
+        profile = {"name": "strict", "max_raw_score": 1000.0, "max_score_normalised": 21.0,
+                   "max_top10_pct": MAX_TOP10_HOLDER_PCT, "min_lp_pct": MIN_LP_LOCKED_PCT}
     elif liquidity >= 25000 and volume >= 50000 and volatility <= 25:
-        profile = {"name": "balanced", "max_raw_score": 2500.0, "max_score_normalised": 32.0, "max_top10_pct": 40.0, "min_lp_pct": 30.0}
+        profile = {"name": "balanced", "max_raw_score": 2500.0, "max_score_normalised": 32.0,
+                   "max_top10_pct": MAX_TOP10_HOLDER_PCT, "min_lp_pct": MIN_LP_LOCKED_PCT}
     else:
-        profile = {"name": "standard", "max_raw_score": 1500.0, "max_score_normalised": 25.0, "max_top10_pct": 35.0, "min_lp_pct": 40.0}
+        profile = {"name": "standard", "max_raw_score": 1500.0, "max_score_normalised": 25.0,
+                   "max_top10_pct": MAX_TOP10_HOLDER_PCT, "min_lp_pct": MIN_LP_LOCKED_PCT}
 
     risks = report.get("risks") if isinstance(report.get("risks"), list) else []
     # RugCheck score is raw accumulated risk points (often thousands). The normalized
@@ -176,14 +179,16 @@ def evaluate_report(report: dict, market_context: dict | None = None) -> dict:
         elif freeze_active:
             reasons.append("freeze_authority_active")
 
-    # Insider-network data is a risk signal, not an automatic veto by itself.
-    # Strong concentration plus detected insider links is materially riskier than either
-    # signal alone; the AI gets both the warning and the underlying numeric concentration.
-    if insider_count is None:
+    # config requires zero detected insider networks. Missing data fails closed:
+    # an unknown insider result must not silently pass a security gate that requires zero.
+    if REQUIRE_ZERO_INSIDER_NETWORKS:
+        if insider_count is None:
+            missing.append("insider_network_data")
+        elif insider_count > 0:
+            reasons.append("insider_networks_detected")
+    elif insider_count is None:
         warnings.append("insider_network_data_missing")
     elif insider_count > 0:
-        # Linked wallets are a warning, not a standalone veto. Concentration is
-        # evaluated separately against the selected profile's dynamic threshold.
         warnings.append("insider_networks_detected")
 
     dangerous = []
