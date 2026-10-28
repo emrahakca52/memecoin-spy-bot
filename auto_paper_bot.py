@@ -59,13 +59,22 @@ async def _observe_candidate(token: dict) -> dict:
     address = str(token.get("token_address") or "")
     if not address:
         return {"passed": False, "reason": "missing_address"}
-    ratio = _positive_finite_float(token.get("buy_sell_ratio_1h")) or _positive_finite_float(token.get("buy_sell_ratio")) or 0.0
+    trades_5m = int(token.get("trade_count_5m") or 0)
+    ratio_5m = _positive_finite_float(token.get("buy_sell_ratio_5m"))
+    # Prefer the recent 5-minute tape when it has enough activity; otherwise
+    # fall back to the provider's 1h/24h ratio instead of treating missing data as zero.
+    if trades_5m >= 5 and ratio_5m is not None:
+        ratio = ratio_5m
+        ratio_window = "5m"
+    else:
+        ratio = _positive_finite_float(token.get("buy_sell_ratio_1h")) or _positive_finite_float(token.get("buy_sell_ratio")) or 0.0
+        ratio_window = "1h_or_24h"
     trades = int(token.get("trade_count_1h") or token.get("trade_count_24h") or 0)
     score = _positive_finite_float(token.get("score")) or 0.0
     if score < MOMENTUM_MIN_SCORE:
         return {"passed": False, "reason": "momentum_score_below_threshold", "score": score, "min_score": MOMENTUM_MIN_SCORE}
     if ratio < MOMENTUM_MIN_BUY_SELL_RATIO:
-        return {"passed": False, "reason": "buy_sell_ratio_below_momentum_threshold", "ratio": ratio, "min_ratio": MOMENTUM_MIN_BUY_SELL_RATIO}
+        return {"passed": False, "reason": "buy_sell_ratio_below_momentum_threshold", "ratio": ratio, "ratio_window": ratio_window, "trades_5m": trades_5m, "min_ratio": MOMENTUM_MIN_BUY_SELL_RATIO}
     if trades < 20:
         return {"passed": False, "reason": "trade_count_below_20", "trades": trades}
 
@@ -88,7 +97,7 @@ async def _observe_candidate(token: dict) -> dict:
         return {"passed": False, "reason": "observation_momentum_below_threshold", "observed_change_pct": round(change_pct, 2), "min_change_pct": MOMENTUM_MIN_OBSERVED_CHANGE_PCT, "samples": len(samples)}
     if change_pct > MOMENTUM_MAX_OBSERVED_CHANGE_PCT:
         return {"passed": False, "reason": "observation_overheated", "observed_change_pct": round(change_pct, 2), "max_change_pct": MOMENTUM_MAX_OBSERVED_CHANGE_PCT, "samples": len(samples)}
-    return {"passed": True, "reason": "observation_passed", "observed_change_pct": round(change_pct, 2), "samples": len(samples)}
+    return {"passed": True, "reason": "observation_passed", "observed_change_pct": round(change_pct, 2), "samples": len(samples), "ratio_window": ratio_window, "ratio": ratio, "trades_5m": trades_5m}
 
 
 def _daily_loss_exceeded() -> bool:
