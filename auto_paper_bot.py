@@ -95,10 +95,10 @@ async def _observe_candidate(token: dict) -> dict:
         return {"passed": False, "reason": "observation_price_samples_missing", "samples": len(samples)}
     change_pct = (samples[-1] / samples[0] - 1) * 100
     if change_pct < MOMENTUM_MIN_OBSERVED_CHANGE_PCT:
-        return {"passed": False, "reason": "observation_momentum_below_threshold", "observed_change_pct": round(change_pct, 2), "min_change_pct": MOMENTUM_MIN_OBSERVED_CHANGE_PCT, "samples": len(samples)}
+        return {"passed": False, "reason": "observation_momentum_below_threshold", "observed_change_pct": round(change_pct, 2), "observed_price_usd": samples[-1], "min_change_pct": MOMENTUM_MIN_OBSERVED_CHANGE_PCT, "samples": len(samples)}
     if change_pct > MOMENTUM_MAX_OBSERVED_CHANGE_PCT:
-        return {"passed": False, "reason": "observation_overheated", "observed_change_pct": round(change_pct, 2), "max_change_pct": MOMENTUM_MAX_OBSERVED_CHANGE_PCT, "samples": len(samples)}
-    return {"passed": True, "reason": "observation_passed", "observed_change_pct": round(change_pct, 2), "samples": len(samples), "ratio_window": ratio_window, "ratio": ratio, "trades_5m": trades_5m}
+        return {"passed": False, "reason": "observation_overheated", "observed_change_pct": round(change_pct, 2), "observed_price_usd": samples[-1], "max_change_pct": MOMENTUM_MAX_OBSERVED_CHANGE_PCT, "samples": len(samples)}
+    return {"passed": True, "reason": "observation_passed", "observed_change_pct": round(change_pct, 2), "observed_price_usd": samples[-1], "samples": len(samples), "ratio_window": ratio_window, "ratio": ratio, "trades_5m": trades_5m}
 
 
 def _daily_loss_exceeded() -> bool:
@@ -266,7 +266,7 @@ async def _loop(stop_event):
                             "observed_change_pct": observation.get("observed_change_pct"),
                         })
                         continue
-                    live_price = prices.get(address)
+                    live_price = prices.get(address) or (observation or {}).get("observed_price_usd")
                     if not live_price or live_price <= 0:
                         _last_skipped.append({"symbol": symbol, "reason": "live_price_unavailable"})
                         continue
