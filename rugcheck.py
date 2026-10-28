@@ -143,12 +143,13 @@ def evaluate_report(report: dict, market_context: dict | None = None) -> dict:
     missing: list[str] = []
     warnings: list[str] = []
 
-    if raw_score is None and score is None:
-        missing.append("rugcheck_score")
-    if raw_score is not None and raw_score > profile["max_raw_score"]:
+    if raw_score is None:
+        missing.append("rugcheck_raw_score")
+    elif raw_score > profile["max_raw_score"]:
         reasons.append("rugcheck_raw_score_above_dynamic_limit")
-    if score is not None and score > profile["max_score_normalised"]:
-        reasons.append("rugcheck_normalised_score_above_dynamic_limit")
+    # RugCheck normalized-score interpretation has conflicting examples across
+    # third-party docs and responses. Log it for diagnostics, but never reject
+    # solely on this ambiguous field. Raw score and explicit risk flags are the gate.
 
     if top10 is None:
         missing.append("top10_holder_concentration")
