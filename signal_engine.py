@@ -441,7 +441,7 @@ async def get_signal_candidates(
     min_buys_sells_ratio: float | None = None,
     limit: int = 20,
 ) -> dict:
-    global _last_geckoterminal_discovery
+    global _last_geckoterminal_discovery, _last_dexscreener_discovery
     min_liq = MIN_LIQUIDITY_USD if min_liquidity_usd is None else float(min_liquidity_usd)
     min_vol = MIN_VOLUME_24H_USD if min_volume_24h_usd is None else float(min_volume_24h_usd)
     min_ratio = MIN_BUYS_SELLS_RATIO if min_buys_sells_ratio is None else float(min_buys_sells_ratio)
