@@ -46,6 +46,40 @@ def _first_num(*values: Any) -> float:
     return 0.0
 
 
+def _candidate_score(candidate: dict, min_liq: float, min_vol: float) -> tuple[float, dict]:
+    """Rank already-filtered candidates on a bounded 0-100 scale.
+    This score ranks candidates only; it never overrides the hard safety gate.
+    """
+    liq = max(0.0, _num(candidate.get("liquidity_usd")))
+    vol = max(0.0, _num(candidate.get("volume_24h_usd")))
+    ratio = max(0.0, _num(candidate.get("buy_sell_ratio")))
+    trades = max(0.0, _num(candidate.get("trade_count_24h")))
+    change = _num(candidate.get("price_change_24h_pct"))
+
+    # Log scaling prevents huge-cap tokens from dominating every other signal.
+    liquidity_score = min(1.0, math.log1p(liq) / math.log1p(max(min_liq * 10, 1.0)))
+    volume_score = min(1.0, math.log1p(vol) / math.log1p(max(min_vol * 10, 1.0)))
+    ratio_score = min(1.0, max(0.0, (ratio - 1.0) / 2.0))
+    trades_score = min(1.0, trades / 200.0)
+
+    # Prefer modest positive momentum; penalize negative or overheated moves.
+    if change < 0:
+        momentum_score = max(0.0, 1.0 - abs(change) / 30.0) * 0.5
+    elif change <= 20:
+        momentum_score = 0.5 + (change / 20.0) * 0.5
+    else:
+        momentum_score = max(0.0, 1.0 - (change - 20.0) / 80.0)
+
+    components = {
+        "liquidity": round(liquidity_score * 25, 1),
+        "volume": round(volume_score * 25, 1),
+        "buy_sell_balance": round(ratio_score * 20, 1),
+        "trade_activity": round(trades_score * 15, 1),
+        "price_momentum": round(momentum_score * 15, 1),
+    }
+    return round(sum(components.values()), 1), components
+
+
 async def _jupiter_get(client: httpx.AsyncClient, path: str, params: dict | None = None):
     """Respect keyless Jupiter's documented 0.5 requests/second rate limit."""
     global _last_jupiter_request
@@ -421,7 +455,9 @@ async def get_signal_candidates(
         if abs(change) > MAX_PRICE_CHANGE_24H_PCT or change < -MAX_NEGATIVE_PRICE_CHANGE_24H_PCT or price <= 0:
             continue
         item = dict(candidate)
-        item["score"] = round(min(liq / 10000, 5) + min(vol / 20000, 5) + min(ratio, 4), 2)
+        score, score_components = _candidate_score(item, min_liq, min_vol)
+        item["score"] = score
+        item["score_components"] = score_components
         filtered.append(item)
     filtered.sort(key=lambda item: item.get("score", 0), reverse=True)
     return {
