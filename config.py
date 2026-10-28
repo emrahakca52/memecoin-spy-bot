@@ -42,5 +42,5 @@ GROK_API_BASE = os.getenv("XAI_API_BASE", "https://api.x.ai/v1").rstrip("/")
 GROK_MODEL = os.getenv("XAI_MODEL", "grok-3-mini")
 GROK_TIMEOUT_SECONDS = int(os.getenv("AI_REQUEST_TIMEOUT_SECONDS", "60"))
 GROK_CONFIDENCE_THRESHOLD = 0.65
-MAX_GROK_CHECKS_PER_SCAN = max(1, min(10, int(os.getenv("MAX_GROK_CHECKS_PER_SCAN", "6"))))
+MAX_GROK_CHECKS_PER_SCAN = max(1, min(10, int(os.getenv("MAX_GROK_CHECKS_PER_SCAN", "10"))))
 COPYFOMO_GATE_ENABLED = True
