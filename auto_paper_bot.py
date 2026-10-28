@@ -123,7 +123,20 @@ async def _loop(stop_event):
                         if gate.get("passed"):
                             eligible_signals.append(token)
                         else:
-                            _last_skipped.append({"symbol": token.get("symbol"), "reason": "rugcheck_rejected"})
+                            rejection_reasons = gate.get("rejection_reasons") or []
+                            rug = gate.get("rugcheck") if isinstance(gate.get("rugcheck"), dict) else {}
+                            # Preserve the concrete fail-closed reason in status and Telegram reports.
+                            if not rejection_reasons:
+                                rejection_reasons = rug.get("missing_data") or []
+                            if not rejection_reasons and rug.get("error"):
+                                rejection_reasons = [str(rug.get("error"))]
+                            detail = "; ".join(str(reason) for reason in rejection_reasons[:4] if reason)
+                            skipped_item = {"symbol": token.get("symbol"), "reason": "rugcheck_rejected"}
+                            if detail:
+                                skipped_item["detail"] = detail[:220]
+                            if rug.get("http_status") is not None:
+                                skipped_item["http_status"] = rug.get("http_status")
+                            _last_skipped.append(skipped_item)
                     except asyncio.TimeoutError:
                         _last_skipped.append({"symbol": token.get("symbol"), "reason": "rugcheck_timeout"})
                 _last_copyfomo_checks = checked
