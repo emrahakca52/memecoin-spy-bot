@@ -18,7 +18,7 @@ MIN_TRADES_24H = int(os.getenv("MIN_TRADES_24H", "20"))
 
 # Rug protection: keep fail-closed checks enabled.
 MAX_RUGCHECK_SCORE = 35
-MAX_TOP10_HOLDER_PCT = float(os.getenv("MAX_TOP10_HOLDER_PCT", "35"))
+MAX_TOP10_HOLDER_PCT = float(os.getenv("MAX_TOP10_HOLDER_PCT", "40"))
 MIN_LP_LOCKED_PCT = float(os.getenv("MIN_LP_LOCKED_PCT", "50"))
 REQUIRE_MINT_AUTHORITY_REVOKED = True
 REQUIRE_FREEZE_AUTHORITY_REVOKED = True
