@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 async def evaluate_candidate(token: dict) -> dict:
     address = str(token.get("token_address") or "")
     symbol = token.get("symbol") or "UNKNOWN"
-    rug = await check_token(address)
+    rug = await check_token(address, token)
     if not rug.get("passed"):
         reasons = rug.get("rejection_reasons", []) + rug.get("missing_data", [])
         if rug.get("error"):
