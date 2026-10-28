@@ -226,10 +226,14 @@ async def _loop(stop_event):
                         else:
                             observation_results[address] = outcome
 
+                observed_addresses = set(observation_results)
                 for token, address, symbol, signal_price in valid_signals:
                     if stop_event.is_set():
                         break
                     observation = observation_results.get(address)
+                    if address not in observed_addresses:
+                        _last_skipped.append({"symbol": symbol, "reason": "observation_batch_limit"})
+                        continue
                     if observation is not None and not observation.get("passed"):
                         _last_skipped.append({
                             "symbol": symbol,
