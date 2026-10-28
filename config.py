@@ -32,7 +32,8 @@ STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "-28"))
 TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", "22"))
 
 # Jupiter
-JUPITER_QUOTE_URL = "https://quote-api.jup.ag/v6/quote"
+JUPITER_QUOTE_URL = os.getenv("JUPITER_QUOTE_URL", "https://api.jup.ag/swap/v1/quote").rstrip("/")
+JUPITER_API_KEY = os.getenv("JUPITER_API_KEY", "").strip()
 JUPITER_SLIPPAGE_BPS = int(os.getenv("JUPITER_SLIPPAGE_BPS", "60"))
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 
