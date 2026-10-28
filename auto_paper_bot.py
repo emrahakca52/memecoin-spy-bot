@@ -296,6 +296,7 @@ def bot_status():
         gate = item.get("gate") if isinstance(item.get("gate"), dict) else item
         ai = gate.get("grok") if isinstance(gate.get("grok"), dict) else {}
         rug = gate.get("rugcheck") if isinstance(gate.get("rugcheck"), dict) else {}
+        onchain = gate.get("onchain_safety") if isinstance(gate.get("onchain_safety"), dict) else {}
         copyfomo_summary.append({
             "symbol": item.get("symbol"),
             "passed": gate.get("passed"),
@@ -313,6 +314,11 @@ def bot_status():
             "missing_data": rug.get("missing_data", []),
             "rugcheck_error": rug.get("error"),
             "rugcheck_http_status": rug.get("http_status"),
+            "onchain_safety_passed": onchain.get("passed"),
+            "onchain_safety_reasons": onchain.get("reasons", []),
+            "onchain_mint_authority_active": onchain.get("mint_authority_active"),
+            "onchain_freeze_authority_active": onchain.get("freeze_authority_active"),
+            "onchain_rpc_error": onchain.get("error"),
             "ai_provider": ai.get("provider", "not_called"),
             "ai_model": ai.get("model"),
             "ai_api_ok": ai.get("api_ok", False),
