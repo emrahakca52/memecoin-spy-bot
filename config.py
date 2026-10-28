@@ -10,13 +10,13 @@ MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "6"))
 MAX_DAILY_LOSS_USD = float(os.getenv("MAX_DAILY_LOSS_USD", "24"))
 MIN_HOLD_SECONDS = int(os.getenv("MIN_HOLD_SECONDS", "90"))
 
-# More Loosened Filters
+# Market filters
 MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "8000"))
 MIN_VOLUME_24H_USD = float(os.getenv("MIN_VOLUME_24H_USD", "30000"))
 MIN_BUYS_SELLS_RATIO = float(os.getenv("MIN_BUYS_SELLS_RATIO", "1.1"))
 MIN_TRADES_24H = int(os.getenv("MIN_TRADES_24H", "20"))
 
-# Rug Protection
+# Rug protection: keep fail-closed checks enabled.
 MAX_RUGCHECK_SCORE = 35
 MAX_TOP10_HOLDER_PCT = 25.0
 MIN_LP_LOCKED_PCT = 80.0
@@ -36,10 +36,11 @@ JUPITER_QUOTE_URL = "https://quote-api.jup.ag/v6/quote"
 JUPITER_SLIPPAGE_BPS = int(os.getenv("JUPITER_SLIPPAGE_BPS", "60"))
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 
-# Grok
+# Grok / safety-screening budget.
+# Evaluate more of the already market-filtered candidates without weakening safety gates.
 GROK_API_BASE = os.getenv("XAI_API_BASE", "https://api.x.ai/v1").rstrip("/")
 GROK_MODEL = os.getenv("XAI_MODEL", "grok-3-mini")
 GROK_TIMEOUT_SECONDS = 20
 GROK_CONFIDENCE_THRESHOLD = 0.65
-MAX_GROK_CHECKS_PER_SCAN = 3
+MAX_GROK_CHECKS_PER_SCAN = max(1, min(10, int(os.getenv("MAX_GROK_CHECKS_PER_SCAN", "6"))))
 COPYFOMO_GATE_ENABLED = True
