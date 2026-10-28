@@ -126,12 +126,18 @@ def _jupiter_candidates(tokens: Any) -> list[dict]:
         address = token.get("id") or token.get("mint") or token.get("address")
         if not address:
             continue
-        stats = token.get("stats24h") or token.get("stats24H") or token.get("stats") or {}
+        raw_stats = token.get("stats24h") or token.get("stats24H") or token.get("stats") or {}
+        if not isinstance(raw_stats, dict):
+            raw_stats = {}
+        stats = raw_stats.get("24h", raw_stats.get("h24", raw_stats))
         if not isinstance(stats, dict):
             stats = {}
-        stats = stats.get("24h", stats.get("h24", stats))
-        if not isinstance(stats, dict):
-            stats = {}
+        stats1h = raw_stats.get("1h", raw_stats.get("h1", {}))
+        stats5m = raw_stats.get("5m", raw_stats.get("m5", {}))
+        if not isinstance(stats1h, dict):
+            stats1h = {}
+        if not isinstance(stats5m, dict):
+            stats5m = {}
         buys = int(_first_num(stats.get("numBuys"), stats.get("buys"), token.get("numBuys"), token.get("buys24h")))
         sells = int(_first_num(stats.get("numSells"), stats.get("sells"), token.get("numSells"), token.get("sells24h")))
         volume = _first_num(
@@ -158,6 +164,10 @@ def _jupiter_candidates(tokens: Any) -> list[dict]:
         else:
             price_change_pct = 0.0
             change_present = False
+        buys1h = int(_first_num(stats1h.get("numBuys"), stats1h.get("buys")))
+        sells1h = int(_first_num(stats1h.get("numSells"), stats1h.get("sells")))
+        volume1h = _first_num(stats1h.get("volume"), stats1h.get("volumeUsd"), stats1h.get("totalVolume"))
+        volume5m = _first_num(stats5m.get("volume"), stats5m.get("volumeUsd"), stats5m.get("totalVolume"))
         candidates.append({
             "token_address": address,
             "symbol": token.get("symbol") or "UNKNOWN",
@@ -165,11 +175,17 @@ def _jupiter_candidates(tokens: Any) -> list[dict]:
             "price_usd": _first_num(token.get("usdPrice"), token.get("price")),
             "liquidity_usd": _first_num(token.get("liquidity"), token.get("liquidityUsd")),
             "volume_24h_usd": volume,
+            "volume_1h_usd": volume1h,
+            "volume_5m_usd": volume5m,
             "buys_24h": buys,
             "sells_24h": sells,
             "buy_sell_ratio": buys / sells if sells > 0 else 0.0,
+            "buy_sell_ratio_1h": buys1h / sells1h if sells1h > 0 else 0.0,
             "trade_count_24h": int(_first_num(stats.get("numTraders"), stats.get("tradeCount"), buys + sells)),
+            "trade_count_1h": buys1h + sells1h,
             "price_change_24h_pct": price_change_pct,
+            "price_change_1h_pct": _num(stats1h.get("priceChangePercent", stats1h.get("priceChange", 0))),
+            "price_change_5m_pct": _num(stats5m.get("priceChangePercent", stats5m.get("priceChange", 0))),
             "price_change_24h_present": change_present,
             "market_cap_usd": _first_num(token.get("mcap"), token.get("marketCap")),
             "provider": "Jupiter",
