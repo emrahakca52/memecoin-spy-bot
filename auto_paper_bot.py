@@ -50,7 +50,7 @@ def _positive_finite_float(value):
         return None
 
 async def _observe_candidate(token: dict) -> dict:
-    """Short paper-only price observation inspired by early-momentum bots.
+    """20-second paper-only price observation inspired by early-momentum bots.
 
     Our current feeds do not expose a reliable per-trade wallet stream, so this
     samples normalized USD prices rather than pretending to count unique buyers.
@@ -75,7 +75,7 @@ async def _observe_candidate(token: dict) -> dict:
         except Exception:
             pass
         if index < 2:
-            await asyncio.sleep(7)
+            await asyncio.sleep(10)
 
     if len(samples) < 2:
         return {"passed": False, "reason": "observation_price_samples_missing", "samples": len(samples)}
