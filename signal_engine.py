@@ -47,34 +47,56 @@ def _first_num(*values: Any) -> float:
 
 
 def _candidate_score(candidate: dict, min_liq: float, min_vol: float) -> tuple[float, dict]:
-    """Rank already-filtered candidates on a bounded 0-100 scale.
-    This score ranks candidates only; it never overrides the hard safety gate.
-    """
+    """Rank candidates using early-runner features; hard safety checks remain separate."""
     liq = max(0.0, _num(candidate.get("liquidity_usd")))
-    vol = max(0.0, _num(candidate.get("volume_24h_usd")))
-    ratio = max(0.0, _num(candidate.get("buy_sell_ratio")))
-    trades = max(0.0, _num(candidate.get("trade_count_24h")))
-    change = _num(candidate.get("price_change_24h_pct"))
+    vol24 = max(0.0, _num(candidate.get("volume_24h_usd")))
+    vol1h = max(0.0, _num(candidate.get("volume_1h_usd")))
+    vol5m = max(0.0, _num(candidate.get("volume_5m_usd")))
+    ratio24 = max(0.0, _num(candidate.get("buy_sell_ratio")))
+    ratio1h = max(0.0, _num(candidate.get("buy_sell_ratio_1h")))
+    trades24 = max(0.0, _num(candidate.get("trade_count_24h")))
+    trades1h = max(0.0, _num(candidate.get("trade_count_1h")))
+    change24 = _num(candidate.get("price_change_24h_pct"))
+    change1h = _num(candidate.get("price_change_1h_pct"))
+    change5m = _num(candidate.get("price_change_5m_pct"))
 
-    # Log scaling prevents huge-cap tokens from dominating every other signal.
+    # Score relative activity as well as absolute size: high 1h/5m activity
+    # against the 24h baseline can indicate acceleration before a larger move.
     liquidity_score = min(1.0, math.log1p(liq) / math.log1p(max(min_liq * 10, 1.0)))
-    volume_score = min(1.0, math.log1p(vol) / math.log1p(max(min_vol * 10, 1.0)))
-    ratio_score = min(1.0, max(0.0, (ratio - 1.0) / 2.0))
-    trades_score = min(1.0, trades / 200.0)
-
-    # Prefer modest positive momentum; penalize negative or overheated moves.
-    if change < 0:
-        momentum_score = max(0.0, 1.0 - abs(change) / 30.0) * 0.5
-    elif change <= 20:
-        momentum_score = 0.5 + (change / 20.0) * 0.5
+    volume24_score = min(1.0, math.log1p(vol24) / math.log1p(max(min_vol * 10, 1.0)))
+    volume_accel = (vol1h / max(vol24, 1.0)) * 24.0 if vol1h > 0 else 0.0
+    volume_accel_score = min(1.0, max(0.0, volume_accel) / 2.0)
+    if vol5m > 0 and vol1h > 0:
+        short_accel = (vol5m * 12.0) / max(vol1h, 1.0)
+        short_accel_score = min(1.0, max(0.0, short_accel) / 2.0)
     else:
-        momentum_score = max(0.0, 1.0 - (change - 20.0) / 80.0)
+        short_accel_score = 0.5  # neutral when provider has no short-window data
+
+    ratio = ratio1h if ratio1h > 0 else ratio24
+    ratio_score = min(1.0, max(0.0, (ratio - 1.0) / 1.5))
+    trades_score = min(1.0, trades1h / 80.0) if trades1h > 0 else min(1.0, trades24 / 200.0)
+
+    # Reward positive but not parabolic momentum; penalize large 24h run-ups
+    # because buying after an extreme candle can mean chasing the top.
+    momentum = change1h if change1h != 0 else change24
+    if momentum < 0:
+        momentum_score = max(0.0, 1.0 - abs(momentum) / 20.0) * 0.35
+    elif momentum <= 12:
+        momentum_score = 0.45 + (momentum / 12.0) * 0.55
+    else:
+        momentum_score = max(0.0, 1.0 - (momentum - 12.0) / 38.0)
+    if change24 > 80:
+        momentum_score *= max(0.15, 1.0 - (change24 - 80.0) / 120.0)
+    if change5m > 20:
+        momentum_score *= 0.75  # very sharp 5m candles are an overheating warning
 
     components = {
-        "liquidity": round(liquidity_score * 25, 1),
-        "volume": round(volume_score * 25, 1),
+        "liquidity": round(liquidity_score * 20, 1),
+        "volume_24h": round(volume24_score * 10, 1),
+        "volume_acceleration_1h": round(volume_accel_score * 15, 1),
+        "volume_acceleration_5m": round(short_accel_score * 10, 1),
         "buy_sell_balance": round(ratio_score * 20, 1),
-        "trade_activity": round(trades_score * 15, 1),
+        "trade_activity": round(trades_score * 10, 1),
         "price_momentum": round(momentum_score * 15, 1),
     }
     return round(sum(components.values()), 1), components
@@ -289,16 +311,27 @@ async def _discover_dexscreener(client: httpx.AsyncClient) -> list[dict]:
     for address, (_, pair) in candidates_by_address.items():
         token = pair.get("baseToken") or {}
         volume = pair.get("volume") or {}
-        txns = (pair.get("txns") or {}).get("h24") or {}
+        txns_all = pair.get("txns") or {}
+        txns = txns_all.get("h24") or {}
+        txns1h = txns_all.get("h1") or {}
+        txns5m = txns_all.get("m5") or {}
         change = pair.get("priceChange") or {}
         buys, sells = int(_num(txns.get("buys"))), int(_num(txns.get("sells")))
+        buys1h, sells1h = int(_num(txns1h.get("buys"))), int(_num(txns1h.get("sells")))
         candidates.append({
             "token_address": address, "symbol": token.get("symbol") or "UNKNOWN",
             "name": token.get("name") or "", "price_usd": _num(pair.get("priceUsd")),
             "liquidity_usd": _num((pair.get("liquidity") or {}).get("usd")),
-            "volume_24h_usd": _num(volume.get("h24")), "buys_24h": buys, "sells_24h": sells,
-            "buy_sell_ratio": buys / sells if sells > 0 else 0.0, "trade_count_24h": buys + sells,
+            "volume_24h_usd": _num(volume.get("h24")),
+            "volume_1h_usd": _num(volume.get("h1")),
+            "volume_5m_usd": _num(volume.get("m5")),
+            "buys_24h": buys, "sells_24h": sells,
+            "buy_sell_ratio": buys / sells if sells > 0 else 0.0,
+            "buy_sell_ratio_1h": buys1h / sells1h if sells1h > 0 else 0.0,
+            "trade_count_24h": buys + sells, "trade_count_1h": buys1h + sells1h,
             "price_change_24h_pct": _num(change.get("h24")),
+            "price_change_1h_pct": _num(change.get("h1")),
+            "price_change_5m_pct": _num(change.get("m5")),
             "price_change_24h_present": _has_finite_number(change.get("h24")),
             "market_cap_usd": _num(pair.get("marketCap")), "provider": "DexScreener",
             "url": pair.get("url"),
