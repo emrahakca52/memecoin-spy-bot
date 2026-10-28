@@ -2,7 +2,9 @@ import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import logging
+import math
 import os
+import re
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Query
@@ -170,6 +172,200 @@ async def signals(
         )
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail="Could not reach market data provider.") from exc
+
+
+def _chart_num(value, default=0.0):
+    try:
+        number = float(value)
+        return number if math.isfinite(number) else default
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def _ema(values, period):
+    if len(values) < period:
+        return None
+    alpha = 2.0 / (period + 1.0)
+    result = sum(values[:period]) / period
+    for value in values[period:]:
+        result = alpha * value + (1.0 - alpha) * result
+    return result
+
+
+def _rsi(values, period=14):
+    if len(values) <= period:
+        return None
+    changes = [values[i] - values[i - 1] for i in range(1, len(values))]
+    gains = [max(change, 0.0) for change in changes[:period]]
+    losses = [max(-change, 0.0) for change in changes[:period]]
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
+    for change in changes[period:]:
+        avg_gain = (avg_gain * (period - 1) + max(change, 0.0)) / period
+        avg_loss = (avg_loss * (period - 1) + max(-change, 0.0)) / period
+    if avg_loss <= 0:
+        return 100.0 if avg_gain > 0 else 50.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+@app.get("/market/chart/{token_address}")
+async def market_chart(
+    token_address: str,
+    timeframe: str = Query("minute", pattern="^(minute|hour|day)$"),
+    aggregate: int = Query(1, ge=1, le=24),
+    limit: int = Query(60, ge=20, le=200),
+):
+    """Read-only live price, GeckoTerminal OHLCV candles, and technical indicators."""
+    if not re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", token_address):
+        raise HTTPException(status_code=400, detail="Invalid Solana token address.")
+
+    timeout = httpx.Timeout(10.0, connect=5.0)
+    headers = {"accept": "application/json", "user-agent": "MemecoinSpyPro/1.0"}
+    async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
+        # DexScreener provides a current market snapshot and identifies the best liquid pair.
+        pair_payload = None
+        for url in (
+            f"https://api.dexscreener.com/tokens/v1/solana/{token_address}",
+            f"https://api.dexscreener.com/latest/dex/tokens/{token_address}",
+        ):
+            try:
+                response = await client.get(url)
+                if response.status_code == 429:
+                    continue
+                response.raise_for_status()
+                payload = response.json()
+                pairs = payload if isinstance(payload, list) else payload.get("pairs", []) if isinstance(payload, dict) else []
+                sol_pairs = [
+                    pair for pair in pairs
+                    if isinstance(pair, dict)
+                    and str(pair.get("chainId", "solana")).lower() == "solana"
+                    and _chart_num(pair.get("priceUsd")) > 0
+                ]
+                if sol_pairs:
+                    pair_payload = max(
+                        sol_pairs,
+                        key=lambda pair: _chart_num((pair.get("liquidity") or {}).get("usd")),
+                    )
+                    break
+            except (httpx.HTTPError, ValueError):
+                logger.warning("DexScreener chart snapshot failed for token %s", token_address[:8])
+            except Exception:
+                logger.exception("Unexpected DexScreener chart error")
+
+        # GeckoTerminal supplies actual OHLCV candles; do not fabricate candles from snapshots.
+        pool_payload = None
+        pool_address = None
+        try:
+            response = await client.get(
+                f"https://api.geckoterminal.com/api/v2/networks/solana/tokens/{token_address}/pools",
+                params={"page": 1},
+            )
+            response.raise_for_status()
+            pools_data = response.json().get("data", [])
+            if pools_data:
+                ranked_pools = sorted(
+                    [item for item in pools_data if isinstance(item, dict)],
+                    key=lambda item: _chart_num((item.get("attributes") or {}).get("reserve_in_usd")),
+                    reverse=True,
+                )
+                if ranked_pools:
+                    pool_address = (ranked_pools[0].get("attributes") or {}).get("address")
+        except (httpx.HTTPError, ValueError):
+            logger.warning("GeckoTerminal pool discovery failed for token %s", token_address[:8])
+
+        candles = []
+        candle_source = None
+        if pool_address:
+            try:
+                response = await client.get(
+                    f"https://api.geckoterminal.com/api/v2/networks/solana/pools/{pool_address}/ohlcv/{timeframe}",
+                    params={"aggregate": aggregate, "limit": limit, "currency": "usd", "token": "base"},
+                )
+                response.raise_for_status()
+                payload = response.json()
+                ohlcv = ((payload.get("data") or {}).get("attributes") or {}).get("ohlcv_list", [])
+                for row in ohlcv if isinstance(ohlcv, list) else []:
+                    if not isinstance(row, list) or len(row) < 6:
+                        continue
+                    timestamp = int(_chart_num(row[0], -1))
+                    o, h, low, close, volume = map(_chart_num, row[1:6])
+                    if timestamp >= 0 and min(o, h, low, close) > 0:
+                        candles.append({
+                            "timestamp": datetime.fromtimestamp(timestamp, timezone.utc).isoformat(),
+                            "timestamp_unix": timestamp,
+                            "open": o, "high": h, "low": low, "close": close,
+                            "volume_usd": max(0.0, volume),
+                        })
+                candles.sort(key=lambda candle: candle["timestamp_unix"])
+                if candles:
+                    candle_source = "GeckoTerminal OHLCV"
+            except (httpx.HTTPError, ValueError, TypeError, OverflowError):
+                logger.warning("GeckoTerminal OHLCV request failed for token %s", token_address[:8])
+
+    if not pair_payload and not candles:
+        raise HTTPException(status_code=502, detail="Live market data is temporarily unavailable from providers.")
+
+    closes = [candle["close"] for candle in candles]
+    volumes = [candle["volume_usd"] for candle in candles]
+    current_price = _chart_num((pair_payload or {}).get("priceUsd"))
+    if current_price <= 0 and closes:
+        current_price = closes[-1]
+    avg_volume = sum(volumes[-20:]) / len(volumes[-20:]) if volumes else None
+    latest_volume = volumes[-1] if volumes else None
+    volume_ratio = latest_volume / avg_volume if avg_volume and latest_volume is not None else None
+    rsi14 = _rsi(closes, 14)
+    ema9 = _ema(closes, 9)
+    ema21 = _ema(closes, 21)
+    trend = "insufficient_data"
+    if ema9 is not None and ema21 is not None:
+        trend = "bullish" if ema9 > ema21 else "bearish" if ema9 < ema21 else "neutral"
+    signals = []
+    if rsi14 is not None:
+        if rsi14 >= 70:
+            signals.append("RSI overbought zone")
+        elif rsi14 <= 30:
+            signals.append("RSI oversold zone")
+    if volume_ratio is not None and volume_ratio >= 2:
+        signals.append("Latest candle volume is at least 2x its recent average")
+    if trend == "bullish":
+        signals.append("EMA9 is above EMA21")
+    elif trend == "bearish":
+        signals.append("EMA9 is below EMA21")
+
+    pair = pair_payload or {}
+    liquidity = _chart_num((pair.get("liquidity") or {}).get("usd"))
+    volume24 = _chart_num(((pair.get("volume") or {}).get("h24")))
+    return {
+        "token_address": token_address,
+        "symbol": (pair.get("baseToken") or {}).get("symbol"),
+        "name": (pair.get("baseToken") or {}).get("name"),
+        "mode": "paper",
+        "real_trading_enabled": False,
+        "as_of_utc": datetime.now(timezone.utc).isoformat(),
+        "price_usd": current_price or None,
+        "price_change_5m_pct": _chart_num((pair.get("priceChange") or {}).get("m5")) if pair else None,
+        "price_change_1h_pct": _chart_num((pair.get("priceChange") or {}).get("h1")) if pair else None,
+        "price_change_24h_pct": _chart_num((pair.get("priceChange") or {}).get("h24")) if pair else None,
+        "liquidity_usd": liquidity or None,
+        "volume_24h_usd": volume24 or None,
+        "candle_source": candle_source,
+        "timeframe": timeframe,
+        "aggregate": aggregate,
+        "candles_returned": len(candles),
+        "candles": candles,
+        "indicators": {
+            "rsi14": round(rsi14, 2) if rsi14 is not None else None,
+            "ema9": ema9,
+            "ema21": ema21,
+            "trend": trend,
+            "latest_candle_volume_usd": latest_volume,
+            "average_volume_last_20_candles_usd": avg_volume,
+            "latest_volume_vs_average": round(volume_ratio, 2) if volume_ratio is not None else None,
+            "signals": signals,
+        },
+        "chart_data_warning": None if candles else "Price snapshot may be available, but real OHLCV candles are currently unavailable. No synthetic candles were generated.",
+    }
 
 
 @app.get("/paper/status")
