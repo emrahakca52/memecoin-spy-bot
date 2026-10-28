@@ -290,6 +290,7 @@ def bot_status():
         "last_skipped": _last_skipped[-8:],
         "copyfomo_gate_enabled": COPYFOMO_GATE_ENABLED,
         "ai_provider": os.getenv("AI_PROVIDER", "grok").strip().lower(),
+        "ai_model": (os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip() if os.getenv("AI_PROVIDER", "grok").strip().lower() == "gemini" else GROK_MODEL),
         "ai_api_key_configured": bool((os.getenv("GEMINI_API_KEY", "").strip() if os.getenv("AI_PROVIDER", "grok").strip().lower() == "gemini" else os.getenv("XAI_API_KEY", "").strip())),
         "grok_api_key_configured": bool(os.getenv("XAI_API_KEY", "").strip()),
         "gemini_api_key_configured": bool(os.getenv("GEMINI_API_KEY", "").strip()),
