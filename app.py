@@ -222,6 +222,7 @@ async def market_chart(
 
     timeout = httpx.Timeout(10.0, connect=5.0)
     headers = {"accept": "application/json", "user-agent": "MemecoinSpyPro/1.0"}
+    provider_diagnostics = {"dexscreener": [], "geckoterminal_pools": None, "geckoterminal_ohlcv": None}
     async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
         # DexScreener provides a current market snapshot and identifies the best liquid pair.
         pair_payload = None
@@ -232,6 +233,7 @@ async def market_chart(
             try:
                 response = await client.get(url)
                 if response.status_code == 429:
+                    provider_diagnostics["dexscreener"].append({"status": 429, "endpoint": url.rsplit("/", 1)[-1]})
                     continue
                 response.raise_for_status()
                 payload = response.json()
@@ -247,8 +249,11 @@ async def market_chart(
                         sol_pairs,
                         key=lambda pair: _chart_num((pair.get("liquidity") or {}).get("usd")),
                     )
+                    provider_diagnostics["dexscreener"].append({"status": response.status_code, "pairs_found": len(sol_pairs)})
                     break
-            except (httpx.HTTPError, ValueError):
+                provider_diagnostics["dexscreener"].append({"status": response.status_code, "pairs_found": 0})
+            except (httpx.HTTPError, ValueError) as exc:
+                provider_diagnostics["dexscreener"].append({"error": type(exc).__name__, "endpoint": url.rsplit("/", 1)[-1]})
                 logger.warning("DexScreener chart snapshot failed for token %s", token_address[:8])
             except Exception:
                 logger.exception("Unexpected DexScreener chart error")
@@ -261,6 +266,7 @@ async def market_chart(
                 f"https://api.geckoterminal.com/api/v2/networks/solana/tokens/{token_address}/pools",
                 params={"page": 1},
             )
+            provider_diagnostics["geckoterminal_pools"] = {"status": response.status_code}
             response.raise_for_status()
             pools_data = response.json().get("data", [])
             if pools_data:
@@ -271,7 +277,8 @@ async def market_chart(
                 )
                 if ranked_pools:
                     pool_address = (ranked_pools[0].get("attributes") or {}).get("address")
-        except (httpx.HTTPError, ValueError):
+        except (httpx.HTTPError, ValueError) as exc:
+            provider_diagnostics["geckoterminal_pools"] = {"error": type(exc).__name__}
             logger.warning("GeckoTerminal pool discovery failed for token %s", token_address[:8])
 
         candles = []
@@ -282,6 +289,7 @@ async def market_chart(
                     f"https://api.geckoterminal.com/api/v2/networks/solana/pools/{pool_address}/ohlcv/{timeframe}",
                     params={"aggregate": aggregate, "limit": limit, "currency": "usd", "token": "base"},
                 )
+                provider_diagnostics["geckoterminal_ohlcv"] = {"status": response.status_code}
                 response.raise_for_status()
                 payload = response.json()
                 ohlcv = ((payload.get("data") or {}).get("attributes") or {}).get("ohlcv_list", [])
@@ -300,11 +308,19 @@ async def market_chart(
                 candles.sort(key=lambda candle: candle["timestamp_unix"])
                 if candles:
                     candle_source = "GeckoTerminal OHLCV"
-            except (httpx.HTTPError, ValueError, TypeError, OverflowError):
+            except (httpx.HTTPError, ValueError, TypeError, OverflowError) as exc:
+                provider_diagnostics["geckoterminal_ohlcv"] = {"error": type(exc).__name__}
                 logger.warning("GeckoTerminal OHLCV request failed for token %s", token_address[:8])
 
     if not pair_payload and not candles:
-        raise HTTPException(status_code=502, detail="Live market data is temporarily unavailable from providers.")
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "Live market data is temporarily unavailable from providers.",
+                "providers": provider_diagnostics,
+                "hint": "If providers report 429, wait and retry; if they report 404/422, check the token address or candle timeframe.",
+            },
+        )
 
     closes = [candle["close"] for candle in candles]
     volumes = [candle["volume_usd"] for candle in candles]
