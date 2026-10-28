@@ -117,11 +117,42 @@ async def get_jupiter_quote(input_mint: str, output_mint: str, amount: int) -> d
         pass
     return None
 
+async def _fetch_geckoterminal_price(token_address: str) -> float | None:
+    """Fallback USD mark when DexScreener is rate-limited or has no pair."""
+    url = f"https://api.geckoterminal.com/api/v2/networks/solana/tokens/{token_address}/pools"
+    try:
+        async with httpx.AsyncClient(timeout=8, headers={"accept": "application/json"}) as client:
+            response = await client.get(url, params={"page": "1"})
+            response.raise_for_status()
+            payload = response.json()
+        pools = (payload.get("data") or []) if isinstance(payload, dict) else []
+        ranked = []
+        for pool in pools:
+            if not isinstance(pool, dict):
+                continue
+            attrs = pool.get("attributes") or {}
+            rel = pool.get("relationships") or {}
+            base = ((rel.get("base_token") or {}).get("data") or {}).get("id", "")
+            quote = ((rel.get("quote_token") or {}).get("data") or {}).get("id", "")
+            base_price = _num(attrs.get("base_token_price_usd"))
+            quote_price = _num(attrs.get("quote_token_price_usd"))
+            price = base_price if base.endswith("_" + token_address) else (quote_price if quote.endswith("_" + token_address) else 0)
+            liquidity = _num(attrs.get("reserve_in_usd"))
+            if price > 0:
+                ranked.append((liquidity, price))
+        if ranked:
+            return max(ranked, key=lambda row: row[0])[1]
+    except Exception as exc:
+        logger.debug("GeckoTerminal price fallback failed for %s: %s", token_address, exc)
+    return None
+
 async def get_token_price_usd(token_address: str) -> float | None:
-    # Prefer a USD price source that already normalizes token decimals.
-    # The old Jupiter quote used a fixed raw amount (1_000_000), which is not
-    # one whole token for most Solana mints and could create false price deviations.
+    # Both providers return normalized USD prices; never substitute a stale scan
+    # price for a live observation because that would fake momentum confirmation.
     price = await _fetch_dexscreener_price(token_address)
+    if price is not None and price > 0:
+        return price
+    price = await _fetch_geckoterminal_price(token_address)
     if price is not None and price > 0:
         return price
     logger.warning("No reliable USD price available for %s; skipping paper entry/mark", token_address)
