@@ -49,6 +49,44 @@ def _positive_finite_float(value):
     except (TypeError, ValueError, OverflowError):
         return None
 
+async def _observe_candidate(token: dict) -> dict:
+    """Short paper-only price observation inspired by early-momentum bots.
+
+    Our current feeds do not expose a reliable per-trade wallet stream, so this
+    samples normalized USD prices rather than pretending to count unique buyers.
+    """
+    address = str(token.get("token_address") or "")
+    if not address:
+        return {"passed": False, "reason": "missing_address"}
+    ratio = _positive_finite_float(token.get("buy_sell_ratio_1h")) or _positive_finite_float(token.get("buy_sell_ratio")) or 0.0
+    trades = int(token.get("trade_count_1h") or token.get("trade_count_24h") or 0)
+    if ratio < 1.1:
+        return {"passed": False, "reason": "buy_sell_ratio_below_1_1", "ratio": ratio}
+    if trades < 20:
+        return {"passed": False, "reason": "trade_count_below_20", "trades": trades}
+
+    samples = []
+    for index in range(3):
+        try:
+            found = await asyncio.wait_for(get_token_prices_usd([address]), timeout=8)
+            price = _positive_finite_float(found.get(address)) if isinstance(found, dict) else None
+            if price:
+                samples.append(price)
+        except Exception:
+            pass
+        if index < 2:
+            await asyncio.sleep(7)
+
+    if len(samples) < 2:
+        return {"passed": False, "reason": "observation_price_samples_missing", "samples": len(samples)}
+    change_pct = (samples[-1] / samples[0] - 1) * 100
+    if change_pct < -2.0:
+        return {"passed": False, "reason": "observation_momentum_negative", "observed_change_pct": round(change_pct, 2), "samples": len(samples)}
+    if change_pct > 10.0:
+        return {"passed": False, "reason": "observation_overheated", "observed_change_pct": round(change_pct, 2), "samples": len(samples)}
+    return {"passed": True, "reason": "observation_passed", "observed_change_pct": round(change_pct, 2), "samples": len(samples)}
+
+
 def _daily_loss_exceeded() -> bool:
     try:
         status = get_paper_status()
@@ -170,9 +208,36 @@ async def _loop(stop_event):
                     except asyncio.TimeoutError:
                         logger.warning("Price fetch timed out")
 
+                # Observe only a small, highest-ranked batch to limit provider load.
+                # Observation is concurrent so the 20-second window is shared, not serial.
+                observation_results = {}
+                observation_batch = sorted(
+                    valid_signals, key=lambda row: float(row[0].get("score") or 0), reverse=True
+                )[:5]
+                if observation_batch:
+                    observed = await asyncio.gather(
+                        *[_observe_candidate(row[0]) for row in observation_batch],
+                        return_exceptions=True,
+                    )
+                    for row, outcome in zip(observation_batch, observed):
+                        address = row[1]
+                        if isinstance(outcome, Exception):
+                            observation_results[address] = {"passed": False, "reason": type(outcome).__name__}
+                        else:
+                            observation_results[address] = outcome
+
                 for token, address, symbol, signal_price in valid_signals:
                     if stop_event.is_set():
                         break
+                    observation = observation_results.get(address)
+                    if observation is not None and not observation.get("passed"):
+                        _last_skipped.append({
+                            "symbol": symbol,
+                            "reason": "momentum_observation_rejected",
+                            "detail": observation.get("reason"),
+                            "observed_change_pct": observation.get("observed_change_pct"),
+                        })
+                        continue
                     live_price = prices.get(address)
                     if not live_price or live_price <= 0:
                         _last_skipped.append({"symbol": symbol, "reason": "live_price_unavailable"})
