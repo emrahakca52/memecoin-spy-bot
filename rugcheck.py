@@ -191,7 +191,11 @@ def evaluate_report(report: dict, market_context: dict | None = None) -> dict:
         # remain hard gates. Never report unknown as zero.
         warnings.append("insider_network_data_missing")
     elif insider_count > 2:
-        reasons.append("insider_networks_above_limit")
+        # Treat clustering as a risk signal, not a standalone veto. Other bot
+        # designs rely on launch/developer checks, independent trade observation,
+        # holder concentration, authority revocation and sellability together.
+        # The count remains visible to the AI gate and status diagnostics.
+        warnings.append("insider_networks_above_preferred_limit")
     elif insider_count > 0:
         warnings.append("insider_networks_detected")
 
