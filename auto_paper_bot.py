@@ -79,6 +79,34 @@ async def _observe_candidate(token: dict) -> dict:
     if trades < 20:
         return {"passed": False, "reason": "trade_count_below_20", "trades": trades}
 
+    # Chart-style confirmation from provider's short-window market data.
+    # These are optional data fields: never invent candle/RSI data when unavailable.
+    chart = {"source": "provider_5m_metrics", "available": False}
+    change5m_raw = token.get("price_change_5m_pct")
+    vol5m = _positive_finite_float(token.get("volume_5m_usd"))
+    vol1h = _positive_finite_float(token.get("volume_1h_usd"))
+    change5m = None
+    try:
+        if change5m_raw is not None and math.isfinite(float(change5m_raw)):
+            change5m = float(change5m_raw)
+    except (TypeError, ValueError, OverflowError):
+        pass
+    if change5m is not None:
+        chart["available"] = True
+        chart["price_change_5m_pct"] = round(change5m, 3)
+        if change5m < -0.5:
+            return {"passed": False, "reason": "chart_5m_trend_negative", "chart_confirmation": chart}
+        if change5m > 20:
+            return {"passed": False, "reason": "chart_5m_overheated", "chart_confirmation": chart}
+    if vol5m is not None and vol1h is not None and vol1h > 0:
+        pace_ratio = (vol5m * 12.0) / vol1h
+        chart["available"] = True
+        chart["volume_5m_usd"] = vol5m
+        chart["volume_1h_usd"] = vol1h
+        chart["volume_pace_vs_1h"] = round(pace_ratio, 3)
+        if pace_ratio < 0.25:
+            return {"passed": False, "reason": "chart_volume_fading", "chart_confirmation": chart}
+
     samples = []
     for index in range(3):
         try:
@@ -98,7 +126,7 @@ async def _observe_candidate(token: dict) -> dict:
         return {"passed": False, "reason": "observation_momentum_below_threshold", "observed_change_pct": round(change_pct, 2), "observed_price_usd": samples[-1], "min_change_pct": MOMENTUM_MIN_OBSERVED_CHANGE_PCT, "samples": len(samples)}
     if change_pct > MOMENTUM_MAX_OBSERVED_CHANGE_PCT:
         return {"passed": False, "reason": "observation_overheated", "observed_change_pct": round(change_pct, 2), "observed_price_usd": samples[-1], "max_change_pct": MOMENTUM_MAX_OBSERVED_CHANGE_PCT, "samples": len(samples)}
-    return {"passed": True, "reason": "observation_passed", "observed_change_pct": round(change_pct, 2), "observed_price_usd": samples[-1], "samples": len(samples), "ratio_window": ratio_window, "ratio": ratio, "trades_5m": trades_5m}
+    return {"passed": True, "reason": "observation_passed", "observed_change_pct": round(change_pct, 2), "observed_price_usd": samples[-1], "samples": len(samples), "ratio_window": ratio_window, "ratio": ratio, "trades_5m": trades_5m, "chart_confirmation": chart}
 
 
 def _ai_quota_fallback_allowed(gate: dict) -> bool:
