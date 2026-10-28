@@ -5,6 +5,7 @@ import os
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 
 from signal_engine import get_signal_candidates, get_signal_engine_status
 from wallet_tracker import get_wallet_stats
@@ -50,6 +51,14 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Memecoin Spy Pro", version="1.4.1", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://hoppscotch.io", "https://app.hoppscotch.io"],
+    allow_methods=["POST", "OPTIONS"],
+    allow_headers=["X-Diagnostic-Token", "Content-Type"],
+    allow_credentials=False,
+)
 
 
 @app.get("/")
