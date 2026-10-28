@@ -179,13 +179,34 @@ async def _discover_jupiter(client: httpx.AsyncClient) -> list[dict]:
                 address = candidate.get("token_address")
                 if not address:
                     continue
-                # Keep the richer record if an address occurs in multiple feeds.
+                # Merge duplicate feed records field-by-field. A token can have
+                # liquidity in one feed and transaction/price-change stats in another;
+                # replacing the whole record can discard useful metrics and cause false
+                # rejections. Never synthesize missing price-change data as a real value.
                 previous = all_candidates.get(address)
-                if previous is None or (
-                    candidate.get("liquidity_usd", 0) + candidate.get("volume_24h_usd", 0)
-                    > previous.get("liquidity_usd", 0) + previous.get("volume_24h_usd", 0)
-                ):
+                if previous is None:
                     all_candidates[address] = candidate
+                else:
+                    merged = dict(previous)
+                    for key in ("liquidity_usd", "volume_24h_usd", "buys_24h",
+                                "sells_24h", "trade_count_24h", "market_cap_usd"):
+                        merged[key] = max(_num(previous.get(key)), _num(candidate.get(key)))
+                    # Prefer a valid positive price and ratio from either feed.
+                    if _num(candidate.get("price_usd")) > 0 and _num(previous.get("price_usd")) <= 0:
+                        merged["price_usd"] = candidate["price_usd"]
+                    merged_buys = int(_num(merged.get("buys_24h")))
+                    merged_sells = int(_num(merged.get("sells_24h")))
+                    merged["buy_sell_ratio"] = merged_buys / merged_sells if merged_sells > 0 else max(
+                        _num(previous.get("buy_sell_ratio")), _num(candidate.get("buy_sell_ratio"))
+                    )
+                    if candidate.get("price_change_24h_present") and not previous.get("price_change_24h_present"):
+                        merged["price_change_24h_pct"] = candidate.get("price_change_24h_pct", 0.0)
+                        merged["price_change_24h_present"] = True
+                    if not merged.get("name") and candidate.get("name"):
+                        merged["name"] = candidate["name"]
+                    if not merged.get("symbol") or merged.get("symbol") == "UNKNOWN":
+                        merged["symbol"] = candidate.get("symbol") or merged.get("symbol")
+                    all_candidates[address] = merged
         except Exception as exc:
             feed["error"] = f"{type(exc).__name__}: {str(exc)[:160]}"
         feed_diagnostics.append(feed)
