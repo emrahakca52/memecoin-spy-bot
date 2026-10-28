@@ -44,7 +44,12 @@ async def send_scan_report(
         for item in skipped[-3:]:
             symbol = item.get("symbol") or "Token"
             reason = item.get("reason") or "elenmiş"
-            reasons.append(f"{symbol}: {reason}")
+            detail = str(item.get("detail") or "").strip()
+            status = item.get("http_status")
+            suffix = f" — {detail}" if detail else ""
+            if status is not None:
+                suffix += f" (HTTP {status})"
+            reasons.append(f"{symbol}: {reason}{suffix}"[:260])
         lines.append("Son eleme nedenleri: " + "; ".join(reasons))
     if error:
         lines.append(f"⚠️ Tarama hatası: {error[:180]}")
