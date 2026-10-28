@@ -205,8 +205,30 @@ async def _loop(stop_event):
                 for item in _last_skipped:
                     reason = str(item.get("reason") or "unknown")
                     reason_counts[reason] = reason_counts.get(reason, 0) + 1
+                checks = _last_copyfomo_checks if isinstance(_last_copyfomo_checks, list) else []
+                rugcheck_passed_count = sum(
+                    1 for item in checks
+                    if isinstance(item.get("gate"), dict)
+                    and isinstance(item["gate"].get("rugcheck"), dict)
+                    and item["gate"]["rugcheck"].get("passed") is True
+                )
+                ai_called_count = sum(
+                    1 for item in checks
+                    if isinstance(item.get("gate"), dict)
+                    and isinstance(item["gate"].get("grok"), dict)
+                    and item["gate"]["grok"].get("provider") not in (None, "not_called")
+                )
+                ai_api_success_count = sum(
+                    1 for item in checks
+                    if isinstance(item.get("gate"), dict)
+                    and isinstance(item["gate"].get("grok"), dict)
+                    and item["gate"]["grok"].get("api_ok") is True
+                )
                 _last_scan["processing"] = {
                     "security_approved": scan_approved_count,
+                    "rugcheck_passed": rugcheck_passed_count,
+                    "ai_called": ai_called_count,
+                    "ai_api_success": ai_api_success_count,
                     "paper_positions_opened": scan_opened_count,
                     "skipped_count": len(_last_skipped),
                     "skip_reason_counts": reason_counts,
