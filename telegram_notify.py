@@ -76,3 +76,35 @@ async def send_scan_report(
     except (httpx.HTTPError, ValueError) as exc:
         logger.warning("Telegram scan report failed: %s", exc)
         return {"sent": False, "reason": "send_failed"}
+
+
+async def send_paper_signal_alert(*, symbol: str, address: str, price_usd: float, amount_usd: float) -> dict:
+    """Send a separate Telegram alert only after a paper position is actually opened."""
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    if not token or not chat_id:
+        return {"sent": False, "reason": "not_configured"}
+    lines = [
+        "🚨 MEMECOIN BOT — SANAL SİNYAL",
+        f"Token: {symbol}",
+        f"Fiyat: ${price_usd:.10g}",
+        f"Sanal pozisyon: ${amount_usd:.2f}",
+        f"Mint: {address}",
+        "💵 Mod: PAPER (sanal)",
+        "🔒 Gerçek işlem: KAPALI",
+    ]
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                json={"chat_id": chat_id, "text": "\n".join(lines), "disable_web_page_preview": True},
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if not payload.get("ok"):
+                logger.warning("Telegram signal alert rejected: %s", payload.get("description", "unknown error"))
+                return {"sent": False, "reason": "telegram_rejected"}
+        return {"sent": True}
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.warning("Telegram signal alert failed: %s", exc)
+        return {"sent": False, "reason": "send_failed"}
