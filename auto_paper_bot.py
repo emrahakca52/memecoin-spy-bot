@@ -127,10 +127,13 @@ def _ai_quota_fallback_allowed(gate: dict) -> bool:
 def _daily_loss_exceeded() -> bool:
     try:
         status = get_paper_status()
-        realized = status.get("paper_realized_pnl_usd", 0)
-        return realized <= -MAX_DAILY_LOSS_USD
+        # Use today's realized PnL, not lifetime PnL, so a historical loss
+        # does not permanently disable future paper scans.
+        daily_realized = status.get("paper_daily_realized_pnl_usd", 0)
+        return daily_realized <= -abs(MAX_DAILY_LOSS_USD)
     except Exception:
-        return False
+        logger.exception("Could not evaluate daily paper loss limit; fail closed for this scan.")
+        return True
 
 async def _loop(stop_event):
     global _last_run, _last_started, _last_error, _last_price_update, _last_scan, _last_skipped, _last_copyfomo_checks, _last_momentum_observations, _last_telegram_report
