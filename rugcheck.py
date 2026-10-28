@@ -120,11 +120,11 @@ def evaluate_report(report: dict, market_context: dict | None = None) -> dict:
     # A very sharp 24h move is a stronger manipulation/chasing warning than ordinary
     # low liquidity alone; liquidity is also handled by the market-selection score.
     if volatility >= 80 or liquidity < 9000:
-        profile = {"name": "strict", "max_score_normalised": 20.0, "max_top10_pct": 25.0, "min_lp_pct": 50.0}
+        profile = {"name": "strict", "max_raw_score": 1000.0, "max_score_normalised": 21.0, "max_top10_pct": 25.0, "min_lp_pct": 50.0}
     elif liquidity >= 25000 and volume >= 50000 and volatility <= 25:
-        profile = {"name": "balanced", "max_score_normalised": 30.0, "max_top10_pct": 40.0, "min_lp_pct": 30.0}
+        profile = {"name": "balanced", "max_raw_score": 2500.0, "max_score_normalised": 32.0, "max_top10_pct": 40.0, "min_lp_pct": 30.0}
     else:
-        profile = {"name": "standard", "max_score_normalised": 25.0, "max_top10_pct": 35.0, "min_lp_pct": 40.0}
+        profile = {"name": "standard", "max_raw_score": 1500.0, "max_score_normalised": 25.0, "max_top10_pct": 35.0, "min_lp_pct": 40.0}
 
     risks = report.get("risks") if isinstance(report.get("risks"), list) else []
     # RugCheck score is raw accumulated risk points (often thousands). The normalized
@@ -143,9 +143,11 @@ def evaluate_report(report: dict, market_context: dict | None = None) -> dict:
     missing: list[str] = []
     warnings: list[str] = []
 
-    if score is None:
-        missing.append("rugcheck_score_normalised")
-    elif score > profile["max_score_normalised"]:
+    if raw_score is None and score is None:
+        missing.append("rugcheck_score")
+    if raw_score is not None and raw_score > profile["max_raw_score"]:
+        reasons.append("rugcheck_raw_score_above_dynamic_limit")
+    if score is not None and score > profile["max_score_normalised"]:
         reasons.append("rugcheck_normalised_score_above_dynamic_limit")
 
     if top10 is None:
@@ -219,7 +221,7 @@ def evaluate_report(report: dict, market_context: dict | None = None) -> dict:
             "price_change_24h_pct": change,
             "absolute_price_change_24h_pct": volatility,
         },
-        "score": score, "score_normalised": score, "raw_score": raw_score,
+        "score": raw_score, "score_normalised": score, "raw_score": raw_score,
         "top10_holders_pct": top10, "lp_locked_pct": lp_locked,
         "mint_authority_active": mint_active, "freeze_authority_active": freeze_active,
         "insider_network_count": insider_count, "risk_flags": dangerous,
