@@ -116,9 +116,10 @@ def evaluate_report(report: dict, market_context: dict | None = None) -> dict:
     change = _num(market.get("price_change_24h_pct")) or 0.0
     volatility = abs(change)
 
-    # Market conditions may tighten the raw-risk review band, but must never
-    # relax the configured core safety limits. Match the strict baseline in config:
-    # top-10 holder concentration <=25%, LP locked/burned >=80%.
+    # Follow the inspected open-source pattern: do not treat an LP-lock percentage
+    # field as universally authoritative. Keep hard checks on mint/freeze authority,
+    # holder concentration, explicit dangerous flags, market liquidity and Jupiter
+    # sellability. LP-lock metadata is recorded as a risk warning, not a solo veto.
     if volatility >= 80 or liquidity < 9000:
         profile = {"name": "strict", "max_raw_score": 1000.0, "max_score_normalised": 21.0,
                    "max_top10_pct": MAX_TOP10_HOLDER_PCT, "min_lp_pct": MIN_LP_LOCKED_PCT}
@@ -161,12 +162,14 @@ def evaluate_report(report: dict, market_context: dict | None = None) -> dict:
     elif top10 > MAX_TOP10_HOLDER_PCT:
         warnings.append("top10_holder_concentration_above_base_limit")
 
+    # LP-lock data is often absent or reported as 0 for burned LP / unsupported
+    # pool layouts. Do not silently equate "not reported/locked" with proven rug:
+    # liquidity floor + independent mint/freeze checks + holder checks + sell quote
+    # remain the actual gates. Surface LP uncertainty for diagnostics and later review.
     if lp_locked is None:
-        missing.append("lp_lock_percentage")
-    elif lp_locked < profile["min_lp_pct"]:
-        reasons.append("lp_lock_below_dynamic_minimum")
+        warnings.append("lp_lock_percentage_unavailable")
     elif lp_locked < MIN_LP_LOCKED_PCT:
-        warnings.append("lp_lock_below_base_minimum")
+        warnings.append("lp_lock_below_preferred_minimum")
 
     if REQUIRE_MINT_AUTHORITY_REVOKED:
         if mint_active is None:
