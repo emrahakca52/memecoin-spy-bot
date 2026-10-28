@@ -37,6 +37,7 @@ _last_price_update = None
 _last_scan = None
 _last_skipped = []
 _last_copyfomo_checks = []
+_last_telegram_report = {"sent": False, "reason": "not_sent_yet", "at_utc": None}
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -57,7 +58,7 @@ def _daily_loss_exceeded() -> bool:
         return False
 
 async def _loop(stop_event):
-    global _last_run, _last_started, _last_error, _last_price_update, _last_scan, _last_skipped, _last_copyfomo_checks
+    global _last_run, _last_started, _last_error, _last_price_update, _last_scan, _last_skipped, _last_copyfomo_checks, _last_telegram_report
 
     while not stop_event.is_set():
         _last_started = _utc_now()
@@ -235,7 +236,7 @@ async def _loop(stop_event):
                     "scan_error": scan_error,
                 }
             try:
-                await send_scan_report(
+                telegram_result = await send_scan_report(
                     checked=scan_checked,
                     candidates=scan_candidate_count,
                     approved=scan_approved_count,
@@ -244,7 +245,11 @@ async def _loop(stop_event):
                     error=scan_error,
                     daily_loss_limit=scan_daily_loss_limit,
                 )
-            except Exception:
+                _last_telegram_report = {**(telegram_result if isinstance(telegram_result, dict) else {"sent": False, "reason": "invalid_send_result"}), "at_utc": _utc_now()}
+                if not _last_telegram_report.get("sent"):
+                    logger.warning("Telegram scan report not sent: %s", _last_telegram_report)
+            except Exception as exc:
+                _last_telegram_report = {"sent": False, "reason": type(exc).__name__, "at_utc": _utc_now()}
                 logger.exception("Telegram scan report unexpectedly failed")
             logger.info("Scan cycle finished")
 
@@ -309,6 +314,7 @@ def bot_status():
         "last_price_update": _last_price_update,
         "last_copyfomo_checks": copyfomo_summary,
         "last_skipped": _last_skipped[-8:],
+        "last_telegram_report": _last_telegram_report,
         "copyfomo_gate_enabled": COPYFOMO_GATE_ENABLED,
         "ai_provider": os.getenv("AI_PROVIDER", "grok").strip().lower(),
         "ai_model": (os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip() if os.getenv("AI_PROVIDER", "grok").strip().lower() == "gemini" else GROK_MODEL),
