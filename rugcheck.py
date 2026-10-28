@@ -147,13 +147,15 @@ def evaluate_report(report: dict, market_context: dict | None = None) -> dict:
     missing: list[str] = []
     warnings: list[str] = []
 
+    # Raw RugCheck score scales vary across reports (e.g. small values and
+    # five/six-digit values can both occur), so use the normalized 0-100 score
+    # for the decision when present. Keep raw score for diagnostics only.
+    if score is None:
+        missing.append("rugcheck_normalized_score")
+    elif score > 55.0:
+        reasons.append("rugcheck_normalized_score_above_55")
     if raw_score is None:
-        missing.append("rugcheck_raw_score")
-    elif raw_score > profile["max_raw_score"]:
-        reasons.append("rugcheck_raw_score_above_dynamic_limit")
-    # RugCheck normalized-score interpretation has conflicting examples across
-    # third-party docs and responses. Log it for diagnostics, but never reject
-    # solely on this ambiguous field. Raw score and explicit risk flags are the gate.
+        warnings.append("rugcheck_raw_score_unavailable")
 
     if top10 is None:
         missing.append("top10_holder_concentration")
