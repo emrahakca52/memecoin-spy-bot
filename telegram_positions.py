@@ -26,9 +26,26 @@ def _fmt_price(value):
 
 def _render():
     positions = list(getattr(paper_engine, "_open_positions", {}).values())
+    wallet = paper_engine.get_paper_status()
     invested = 0.0
     current_total = 0.0
-    lines = ["📊 AÇIK POZİSYONLARIM", f"🕒 Güncelleme: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}", ""]
+    lines = [
+        "📊 AÇIK POZİSYONLARIM",
+        f"🕒 Güncelleme: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}",
+        "",
+        "💼 SANAL KASA",
+        f"🏦 Başlangıç kasası: {wallet.get('paper_starting_balance_usd', 0):.2f}$",
+        f"💵 Serbest bakiye: {wallet.get('paper_cash_available_usd', 0):.2f}$",
+        f"🔒 Bağlı sermaye: {wallet.get('paper_cash_committed_usd', 0):.2f}$",
+        f"📈 Günlük gerçekleşmiş K/Z: {wallet.get('paper_daily_realized_pnl_usd', 0):+.2f}$",
+        f"🛑 Günlük zarar limiti: -{wallet.get('paper_daily_loss_limit_usd', 0):.2f}$",
+    ]
+    equity = wallet.get("paper_total_equity_usd")
+    if equity is not None:
+        lines.append(f"💎 Toplam sanal özsermaye: {equity:.2f}$")
+    else:
+        lines.append("⚠️ Toplam özsermaye: fiyat verisi eksik; hesaplanamadı")
+    lines.append("")
     for pos in positions:
         symbol = str(pos.get("token_symbol") or "TOKEN")[:32]
         entry = float(pos.get("entry_price_usd") or 0)
