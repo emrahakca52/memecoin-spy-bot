@@ -77,9 +77,9 @@ def evaluate_report(report: dict, market_context: dict | None = None) -> dict:
     or explicit high/critical risk flags. Missing core safety data remains fail-closed.
     """
     market = market_context if isinstance(market_context, dict) else {}
-    liquidity = _num(market.get("liquidity_usd"), 0.0) or 0.0
-    volume = _num(market.get("volume_24h_usd"), 0.0) or 0.0
-    change = _num(market.get("price_change_24h_pct"), 0.0) or 0.0
+    liquidity = _num(market.get("liquidity_usd")) or 0.0
+    volume = _num(market.get("volume_24h_usd")) or 0.0
+    change = _num(market.get("price_change_24h_pct")) or 0.0
     volatility = abs(change)
 
     # Strong momentum/low liquidity means stricter thresholds; healthier liquidity
