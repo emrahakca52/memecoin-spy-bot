@@ -32,7 +32,7 @@ BIRDEYE_TEST_TOKEN = "So11111111111111111111111111111111111111112"
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     dashboard_stop = asyncio.Event()
-    dashboard_task = asyncio.create_task(positions_dashboard_loop(dashboard_stop))
+    dashboard_task = None
     try:
         result = load_paper_state()
         logger.info("Paper state load result: %s", result)
@@ -45,6 +45,8 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.exception("Paper bot could not be started.")
 
+    # Start the single-message Telegram dashboard only after saved positions load.
+    dashboard_task = asyncio.create_task(positions_dashboard_loop(dashboard_stop))
     yield
 
     dashboard_stop.set()
