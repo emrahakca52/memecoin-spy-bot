@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import httpx
+from config import JUPITER_QUOTE_URL, JUPITER_SLIPPAGE_BPS, USDC_MINT
 from grok import evaluate_token
 from rugcheck import check_token
 
@@ -53,6 +54,65 @@ async def check_onchain_mint_authorities(address: str) -> dict:
                 "error": type(exc).__name__}
 
 
+async def check_jupiter_round_trip(token_address: str) -> dict:
+    """Require a small SOL->token->USDC quote round trip before paper entry.
+
+    This is a route/sellability sanity check, not a guarantee that execution will
+    succeed. It deliberately fails closed if either quote is unavailable.
+    """
+    if not token_address:
+        return {"passed": False, "reasons": ["missing_token_address"]}
+    sol_mint = "So11111111111111111111111111111111111111112"
+    buy_params = {
+        "inputMint": sol_mint,
+        "outputMint": token_address,
+        "amount": "10000000",  # 0.01 SOL in lamports
+        "slippageBps": str(JUPITER_SLIPPAGE_BPS),
+    }
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(12.0, connect=5.0)) as client:
+            buy_response = await client.get(JUPITER_QUOTE_URL, params=buy_params)
+            if buy_response.status_code != 200:
+                return {"passed": False, "reasons": ["jupiter_buy_quote_unavailable"],
+                        "http_status": buy_response.status_code}
+            buy_quote = buy_response.json()
+            out_amount = str(buy_quote.get("outAmount") or "")
+            if not out_amount.isdigit() or int(out_amount) <= 0:
+                return {"passed": False, "reasons": ["jupiter_buy_quote_zero_output"]}
+            sell_params = {
+                "inputMint": token_address,
+                "outputMint": USDC_MINT,
+                "amount": out_amount,
+                "slippageBps": str(JUPITER_SLIPPAGE_BPS),
+            }
+            sell_response = await client.get(JUPITER_QUOTE_URL, params=sell_params)
+            if sell_response.status_code != 200:
+                return {"passed": False, "reasons": ["jupiter_sell_quote_unavailable"],
+                        "http_status": sell_response.status_code}
+            sell_quote = sell_response.json()
+            sell_out = str(sell_quote.get("outAmount") or "")
+            if not sell_out.isdigit() or int(sell_out) <= 0:
+                return {"passed": False, "reasons": ["jupiter_sell_quote_zero_output"]}
+            impact = sell_quote.get("priceImpactPct")
+            try:
+                impact_pct = abs(float(impact)) * 100.0 if impact is not None else None
+            except (TypeError, ValueError):
+                impact_pct = None
+            if impact_pct is not None and impact_pct > 15.0:
+                return {"passed": False, "reasons": ["jupiter_sell_price_impact_above_15pct"],
+                        "sell_price_impact_pct": round(impact_pct, 3)}
+            return {
+                "passed": True, "reasons": [],
+                "buy_out_amount_raw": out_amount,
+                "sell_out_amount_usdc_raw": sell_out,
+                "sell_price_impact_pct": round(impact_pct, 3) if impact_pct is not None else None,
+                "provider": "Jupiter quote API",
+            }
+    except (httpx.HTTPError, ValueError, TypeError, AttributeError) as exc:
+        return {"passed": False, "reasons": ["jupiter_round_trip_check_unavailable"],
+                "error": type(exc).__name__}
+
+
 async def evaluate_candidate(token: dict) -> dict:
     address = str(token.get("token_address") or "")
     symbol = token.get("symbol") or "UNKNOWN"
@@ -83,7 +143,21 @@ async def evaluate_candidate(token: dict) -> dict:
             "rejection_reasons": reasons,
         }
 
-    ai = await evaluate_token(token, {**rug, "onchain_safety": onchain})
+    round_trip = await check_jupiter_round_trip(address)
+    if not round_trip.get("passed"):
+        reasons = round_trip.get("reasons", ["jupiter_round_trip_rejected"])
+        logger.info("Token screening symbol=%s stage=round_trip decision=SKIP ai_called=false reasons=%s",
+                    symbol, ";".join(str(x) for x in reasons[:5]))
+        return {
+            "passed": False, "decision": "SKIP", "stage": "round_trip",
+            "rugcheck": rug,
+            "onchain_safety": onchain,
+            "round_trip": round_trip,
+            "grok": {"provider": "not_called", "decision": "NOT_RUN", "passed": False, "api_ok": False},
+            "rejection_reasons": reasons,
+        }
+
+    ai = await evaluate_token(token, {**rug, "onchain_safety": onchain, "round_trip": round_trip})
     logger.info("Token screening symbol=%s stage=ai provider=%s api_ok=%s decision=%s confidence=%s passed=%s",
                 symbol, ai.get("provider"), ai.get("api_ok"), ai.get("decision"),
                 ai.get("confidence"), ai.get("passed"))
@@ -93,6 +167,7 @@ async def evaluate_candidate(token: dict) -> dict:
         "stage": "ai" if not ai.get("passed") else "approved_for_paper",
         "rugcheck": rug,
         "onchain_safety": onchain,
+        "round_trip": round_trip,
         "grok": ai,
         "rejection_reasons": [] if ai.get("passed") else ai.get("reasons", ["ai_rejected"]),
     }
