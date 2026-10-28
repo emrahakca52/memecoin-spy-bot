@@ -493,6 +493,15 @@ async def get_signal_candidates(
                 if provider == "Jupiter":
                     try:
                         dex_candidates = await _discover_dexscreener(client)
+                        secondary_provider = "DexScreener"
+                        # DexScreener discovery feeds can return HTTP 429. If no
+                        # usable pairs are found, try GeckoTerminal rather than silently
+                        # claiming a successful two-provider scan.
+                        if not dex_candidates:
+                            gecko_candidates = await _discover_geckoterminal(client)
+                            if gecko_candidates:
+                                dex_candidates = gecko_candidates
+                                secondary_provider = "GeckoTerminal"
                         by_address = {
                             str(item.get("token_address")): dict(item)
                             for item in candidates
@@ -524,10 +533,10 @@ async def get_signal_candidates(
                                 merged["name"] = dex_item["name"]
                             if not merged.get("symbol") or merged.get("symbol") == "UNKNOWN":
                                 merged["symbol"] = dex_item.get("symbol") or merged.get("symbol")
-                            merged["market_data_provider"] = "DexScreener"
+                            merged["market_data_provider"] = secondary_provider
                             by_address[address] = merged
                         candidates = list(by_address.values())
-                        provider = "Jupiter + DexScreener"
+                        provider = "Jupiter + " + secondary_provider if dex_candidates else "Jupiter"
                     except Exception as dex_exc:
                         _last_dexscreener_discovery = {
                             **(_last_dexscreener_discovery if isinstance(_last_dexscreener_discovery, dict) else {}),
