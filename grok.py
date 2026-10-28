@@ -16,7 +16,7 @@ async def evaluate_token(token: dict, rugcheck_result: dict) -> dict:
 
     if provider == "gemini":
         api_key = os.getenv("GEMINI_API_KEY", "").strip()
-        model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip()
+        model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
         provider_name = "Gemini"
         if not api_key:
             logger.warning("AI screening skipped provider=Gemini reason=api_key_missing symbol=%s", token.get("symbol"))
