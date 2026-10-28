@@ -120,16 +120,16 @@ def evaluate_report(report: dict, market_context: dict | None = None) -> dict:
     # A very sharp 24h move is a stronger manipulation/chasing warning than ordinary
     # low liquidity alone; liquidity is also handled by the market-selection score.
     if volatility >= 80 or liquidity < 9000:
-        profile = {"name": "strict", "min_score_normalised": 70.0, "max_top10_pct": 25.0, "min_lp_pct": 50.0}
+        profile = {"name": "strict", "max_score_normalised": 20.0, "max_top10_pct": 25.0, "min_lp_pct": 50.0}
     elif liquidity >= 25000 and volume >= 50000 and volatility <= 25:
-        profile = {"name": "balanced", "min_score_normalised": 65.0, "max_top10_pct": 40.0, "min_lp_pct": 30.0}
+        profile = {"name": "balanced", "max_score_normalised": 30.0, "max_top10_pct": 40.0, "min_lp_pct": 30.0}
     else:
-        profile = {"name": "standard", "min_score_normalised": 65.0, "max_top10_pct": 35.0, "min_lp_pct": 40.0}
+        profile = {"name": "standard", "max_score_normalised": 25.0, "max_top10_pct": 35.0, "min_lp_pct": 40.0}
 
     risks = report.get("risks") if isinstance(report.get("risks"), list) else []
     # RugCheck score is raw accumulated risk points (often thousands). The normalized
-    # score is a 0-100 safety score; higher is generally safer. Never compare raw score
-    # against normalized-score thresholds.
+    # score is a 0-100 risk score; lower is safer. Never compare raw score against
+    # normalized-score thresholds.
     raw_score = _num(report.get("score"))
     score = _num(report.get("score_normalised", report.get("scoreNormalised")))
     top10 = _find_pct_holders(report)
@@ -145,8 +145,8 @@ def evaluate_report(report: dict, market_context: dict | None = None) -> dict:
 
     if score is None:
         missing.append("rugcheck_score_normalised")
-    elif score < profile["min_score_normalised"]:
-        reasons.append("rugcheck_normalised_score_below_dynamic_minimum")
+    elif score > profile["max_score_normalised"]:
+        reasons.append("rugcheck_normalised_score_above_dynamic_limit")
 
     if top10 is None:
         missing.append("top10_holder_concentration")
