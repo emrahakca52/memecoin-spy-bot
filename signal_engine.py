@@ -226,8 +226,9 @@ async def _discover_jupiter(client: httpx.AsyncClient) -> list[dict]:
                     all_candidates[address] = candidate
                 else:
                     merged = dict(previous)
-                    for key in ("liquidity_usd", "volume_24h_usd", "buys_24h",
-                                "sells_24h", "trade_count_24h", "market_cap_usd"):
+                    for key in ("liquidity_usd", "volume_24h_usd", "volume_1h_usd",
+                                "volume_5m_usd", "buys_24h", "sells_24h",
+                                "trade_count_24h", "trade_count_1h", "market_cap_usd"):
                         merged[key] = max(_num(previous.get(key)), _num(candidate.get(key)))
                     # Prefer a valid positive price and ratio from either feed.
                     if _num(candidate.get("price_usd")) > 0 and _num(previous.get("price_usd")) <= 0:
@@ -237,6 +238,12 @@ async def _discover_jupiter(client: httpx.AsyncClient) -> list[dict]:
                     merged["buy_sell_ratio"] = max(
                         _num(previous.get("buy_sell_ratio")), _num(candidate.get("buy_sell_ratio"))
                     )
+                    merged["buy_sell_ratio_1h"] = max(
+                        _num(previous.get("buy_sell_ratio_1h")), _num(candidate.get("buy_sell_ratio_1h"))
+                    )
+                    for key in ("price_change_1h_pct", "price_change_5m_pct"):
+                        if not _has_finite_number(previous.get(key)) and _has_finite_number(candidate.get(key)):
+                            merged[key] = candidate[key]
                     if candidate.get("price_change_24h_present") and not previous.get("price_change_24h_present"):
                         merged["price_change_24h_pct"] = candidate.get("price_change_24h_pct", 0.0)
                         merged["price_change_24h_present"] = True
