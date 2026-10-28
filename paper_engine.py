@@ -12,6 +12,7 @@ import psycopg
 
 from config import (
     TAKE_PROFIT_PCT, STOP_LOSS_PCT, TRAILING_STOP_PCT,
+    PARTIAL_TAKE_PROFIT_PCT, PARTIAL_SELL_FRACTION, MAX_HOLD_SECONDS,
     MIN_HOLD_SECONDS, MAX_DAILY_LOSS_USD,
     JUPITER_QUOTE_URL, JUPITER_SLIPPAGE_BPS, USDC_MINT,
 )
@@ -475,16 +476,63 @@ async def update_paper_prices():
         pos["price_mark_status"] = "verified"
         pos.pop("price_safety_warning", None)
         pos["unrealized_pnl_usd"] = _num(pos.get("quantity")) * price - _num(pos.get("invested_usd"))
-        if time.time() - _num(pos.get("opened_at")) < MIN_HOLD_SECONDS:
+        age_seconds = max(0.0, time.time() - _num(pos.get("opened_at")))
+        if age_seconds < MIN_HOLD_SECONDS:
             continue
+
         highest = max(_num(pos.get("highest_price"), entry), price)
         pos["highest_price"] = highest
-        if change > 8 and price <= highest * (1 - TRAILING_STOP_PCT / 100):
-            if _close_position(address, pos, price, "trailing_stop", change): closed += 1
-        elif change >= TAKE_PROFIT_PCT:
-            if _close_position(address, pos, price, "take_profit", change): closed += 1
-        elif change <= STOP_LOSS_PCT:
-            if _close_position(address, pos, price, "stop_loss_5pct" if change <= -5 and STOP_LOSS_PCT <= -5 else "stop_loss", change): closed += 1
+
+        # Priority 1: hard stop. Keep the configured risk cap authoritative.
+        if change <= STOP_LOSS_PCT:
+            if _close_position(address, pos, price, "stop_loss", change):
+                closed += 1
+            continue
+
+        # Inspired by strategy bots that scale out instead of waiting for one
+        # distant target: realize half at the first target, then manage the rest.
+        if change >= PARTIAL_TAKE_PROFIT_PCT and not pos.get("partial_take_profit_done"):
+            fraction = min(0.9, max(0.1, _num(PARTIAL_SELL_FRACTION, 0.5)))
+            sell_proceeds = _num(pos.get("quantity")) * fraction * price
+            try:
+                record_paper_trade(
+                    address, "SELL", sell_proceeds, price,
+                    pos.get("token_symbol", ""), "auto", "partial_take_profit"
+                )
+                pos = _open_positions.get(address)
+                if pos:
+                    pos["partial_take_profit_done"] = True
+                    pos["highest_price"] = max(_num(pos.get("highest_price"), entry), price)
+                    pos["breakeven_stop_active"] = True
+                logger.info("Partial take profit: %s at %.2f%%", address, change)
+            except Exception:
+                logger.exception("Partial take-profit failed for %s", address)
+            if not pos:
+                closed += 1
+                continue
+
+        # Once partial profit is booked, protect the remaining position near entry.
+        if pos.get("breakeven_stop_active") and price <= entry:
+            if _close_position(address, pos, price, "breakeven_stop", change):
+                closed += 1
+            continue
+
+        # Trail the peak after a meaningful move; avoid closing before the first
+        # partial target has had a chance to reduce exposure.
+        if change >= 8 and price <= highest * (1 - TRAILING_STOP_PCT / 100):
+            if _close_position(address, pos, price, "trailing_stop", change):
+                closed += 1
+            continue
+
+        # Time-based exit prevents paper positions from being held indefinitely.
+        if MAX_HOLD_SECONDS > 0 and age_seconds >= MAX_HOLD_SECONDS:
+            if _close_position(address, pos, price, "max_hold_time", change):
+                closed += 1
+            continue
+
+        if change >= TAKE_PROFIT_PCT:
+            if _close_position(address, pos, price, "take_profit_final", change):
+                closed += 1
     _save_paper_state()
     return {"updated": len(addresses), "closed": closed}
 
