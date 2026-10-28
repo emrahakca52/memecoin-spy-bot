@@ -194,9 +194,9 @@ async def _discover_jupiter(client: httpx.AsyncClient) -> list[dict]:
                     # Prefer a valid positive price and ratio from either feed.
                     if _num(candidate.get("price_usd")) > 0 and _num(previous.get("price_usd")) <= 0:
                         merged["price_usd"] = candidate["price_usd"]
-                    merged_buys = int(_num(merged.get("buys_24h")))
-                    merged_sells = int(_num(merged.get("sells_24h")))
-                    merged["buy_sell_ratio"] = merged_buys / merged_sells if merged_sells > 0 else max(
+                    # Keep a ratio actually reported by one feed; do not calculate a
+                    # synthetic ratio from maxima taken from different feed snapshots.
+                    merged["buy_sell_ratio"] = max(
                         _num(previous.get("buy_sell_ratio")), _num(candidate.get("buy_sell_ratio"))
                     )
                     if candidate.get("price_change_24h_present") and not previous.get("price_change_24h_present"):
