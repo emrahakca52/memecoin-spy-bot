@@ -297,6 +297,7 @@ def bot_status():
         ai = gate.get("grok") if isinstance(gate.get("grok"), dict) else {}
         rug = gate.get("rugcheck") if isinstance(gate.get("rugcheck"), dict) else {}
         onchain = gate.get("onchain_safety") if isinstance(gate.get("onchain_safety"), dict) else {}
+        round_trip = gate.get("round_trip") if isinstance(gate.get("round_trip"), dict) else {}
         copyfomo_summary.append({
             "symbol": item.get("symbol"),
             "passed": gate.get("passed"),
@@ -319,6 +320,10 @@ def bot_status():
             "onchain_mint_authority_active": onchain.get("mint_authority_active"),
             "onchain_freeze_authority_active": onchain.get("freeze_authority_active"),
             "onchain_rpc_error": onchain.get("error"),
+            "round_trip_passed": round_trip.get("passed"),
+            "round_trip_reasons": round_trip.get("reasons", []),
+            "round_trip_sell_price_impact_pct": round_trip.get("sell_price_impact_pct"),
+            "round_trip_error": round_trip.get("error"),
             "ai_provider": ai.get("provider", "not_called"),
             "ai_model": ai.get("model"),
             "ai_api_ok": ai.get("api_ok", False),
