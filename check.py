@@ -26,7 +26,7 @@ async def check_onchain_mint_authorities(address: str) -> dict:
     if not address:
         return {"passed": False, "reasons": ["missing_token_address"]}
     payload = {
-        "jsonrpc": "2.0", "id": 1, "method": "getParsedAccountInfo",
+        "jsonrpc": "2.0", "id": 1, "method": "getAccountInfo",
         "params": [address, {"encoding": "jsonParsed", "commitment": "confirmed"}],
     }
     errors = []
