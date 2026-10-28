@@ -46,3 +46,9 @@ GROK_TIMEOUT_SECONDS = int(os.getenv("AI_REQUEST_TIMEOUT_SECONDS", "60"))
 GROK_CONFIDENCE_THRESHOLD = 0.65
 MAX_GROK_CHECKS_PER_SCAN = max(1, min(10, int(os.getenv("MAX_GROK_CHECKS_PER_SCAN", "10"))))
 COPYFOMO_GATE_ENABLED = True
+
+# Momentum entry thresholds; wallet-level buyer counts are not available in current feeds.
+MOMENTUM_MIN_SCORE = float(os.getenv("MOMENTUM_MIN_SCORE", "70"))
+MOMENTUM_MIN_BUY_SELL_RATIO = float(os.getenv("MOMENTUM_MIN_BUY_SELL_RATIO", "1.5"))
+MOMENTUM_MIN_OBSERVED_CHANGE_PCT = float(os.getenv("MOMENTUM_MIN_OBSERVED_CHANGE_PCT", "0"))
+MOMENTUM_MAX_OBSERVED_CHANGE_PCT = float(os.getenv("MOMENTUM_MAX_OBSERVED_CHANGE_PCT", "10"))
