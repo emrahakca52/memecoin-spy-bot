@@ -4,7 +4,7 @@ import logging
 import os
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query
 
 from signal_engine import get_signal_candidates, get_signal_engine_status
 from wallet_tracker import get_wallet_stats
@@ -18,6 +18,7 @@ from paper_engine import (
 )
 from auto_paper_bot import bot_status, start_bot, stop_bot
 from config import MIN_LIQUIDITY_USD, MIN_VOLUME_24H_USD, MIN_BUYS_SELLS_RATIO
+from grok import evaluate_token
 
 logger = logging.getLogger("memecoin_spy")
 
@@ -76,6 +77,58 @@ def health():
 def signal_status():
     """Read-only discovery-provider diagnostics; does not trigger a market-data scan."""
     return get_signal_engine_status()
+
+
+@app.post("/ai/diagnostic")
+async def ai_diagnostic(x_diagnostic_token: str = Header(default="", alias="X-Diagnostic-Token")):
+    """Make one tiny AI API request for diagnostics only; never scans or opens a paper position."""
+    provider = os.getenv("AI_PROVIDER", "grok").strip().lower()
+    if provider != "gemini":
+        raise HTTPException(status_code=409, detail="AI_PROVIDER is not gemini.")
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key or not x_diagnostic_token or x_diagnostic_token != api_key:
+        raise HTTPException(status_code=401, detail="Send the configured Gemini API key in the X-Diagnostic-Token header.")
+    diagnostic_token = {
+        "token_address": "diagnostic-only-no-token",
+        "symbol": "AI_DIAGNOSTIC",
+        "name": "AI API connectivity test",
+        "price_usd": 1.0,
+        "liquidity_usd": 10000.0,
+        "volume_24h_usd": 40000.0,
+        "buys_24h": 20,
+        "sells_24h": 10,
+        "buy_sell_ratio": 2.0,
+        "trade_count_24h": 30,
+        "unique_wallets_24h": 20,
+        "price_change_24h_pct": 0.0,
+        "score": 0.0,
+    }
+    diagnostic_rugcheck = {
+        "provider": "diagnostic_only",
+        "passed": True,
+        "score": 0,
+        "top10_holders_pct": 0.0,
+        "lp_locked_pct": 100.0,
+        "mint_authority_active": False,
+        "freeze_authority_active": False,
+        "insider_network_count": 0,
+        "risk_flags": [],
+        "rejection_reasons": [],
+        "missing_data": [],
+    }
+    result = await evaluate_token(diagnostic_token, diagnostic_rugcheck)
+    return {
+        "diagnostic_only": True,
+        "mode": "paper",
+        "real_trading_enabled": False,
+        "provider": result.get("provider"),
+        "model": result.get("model"),
+        "api_ok": result.get("api_ok", False),
+        "decision": result.get("decision", "SKIP"),
+        "http_status": result.get("http_status"),
+        "reasons": result.get("reasons", []),
+        "note": "This endpoint sends one small AI request and never scans tokens or opens positions.",
+    }
 
 
 @app.get("/signals")
