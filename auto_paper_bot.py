@@ -13,7 +13,7 @@ from config import (
     MAX_GROK_CHECKS_PER_SCAN, GROK_CONFIDENCE_THRESHOLD,
     COPYFOMO_GATE_ENABLED,
 )
-from telegram_notify import send_scan_report
+from telegram_notify import send_scan_report, send_paper_signal_alert
 from paper_engine import (
     get_token_prices_usd,
     open_paper_position,
@@ -194,6 +194,17 @@ async def _loop(stop_event):
                     else:
                         scan_opened_count += 1
                         logger.info("Opened position: %s", symbol)
+                        try:
+                            alert_result = await send_paper_signal_alert(
+                                symbol=symbol,
+                                address=address,
+                                price_usd=live_price,
+                                amount_usd=PAPER_AMOUNT_USD,
+                            )
+                            if not alert_result.get("sent"):
+                                logger.warning("Telegram paper signal alert not sent: %s", alert_result)
+                        except Exception:
+                            logger.exception("Telegram paper signal alert unexpectedly failed for %s", symbol)
 
         except Exception as exc:
             _last_error = f"{type(exc).__name__}: {str(exc)[:180]}"
