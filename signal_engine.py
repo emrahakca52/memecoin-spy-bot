@@ -401,7 +401,7 @@ async def get_signal_candidates(
                             if candidates:
                                 provider = "GeckoTerminal fallback"
                         except Exception as gecko_exc:
-                            _last_geckoterminal_discovery = {
+                            globals()["_last_geckoterminal_discovery"] = {
                                 "error": f"{type(gecko_exc).__name__}: {str(gecko_exc)[:160]}"
                             }
             diagnostics = {
@@ -411,7 +411,7 @@ async def get_signal_candidates(
                 "candidate_count": len(candidates),
                 "jupiter_discovery": dict(_last_jupiter_discovery),
                 "fallback_discovery": dict(_last_dexscreener_discovery),
-                "geckoterminal_discovery": dict(_last_geckoterminal_discovery),
+                "geckoterminal_discovery": dict(globals().get("_last_geckoterminal_discovery", {})),
                 "mode": TRADING_MODE,
             }
             _cache.update({"timestamp": now, "candidates": candidates, "diagnostics": diagnostics})
