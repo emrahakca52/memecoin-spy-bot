@@ -70,7 +70,27 @@ def _authority_status(report: dict, name: str) -> bool | None:
     return bool(str(value).strip() and str(value).strip().lower() not in {"none", "null", "0", "false"})
 
 
-def evaluate_report(report: dict) -> dict:
+def evaluate_report(report: dict, market_context: dict | None = None) -> dict:
+    """Apply market-aware review bands while preserving hard security vetoes.
+
+    Market momentum can tighten the review band, never override active authorities
+    or explicit high/critical risk flags. Missing core safety data remains fail-closed.
+    """
+    market = market_context if isinstance(market_context, dict) else {}
+    liquidity = _num(market.get("liquidity_usd"), 0.0) or 0.0
+    volume = _num(market.get("volume_24h_usd"), 0.0) or 0.0
+    change = _num(market.get("price_change_24h_pct"), 0.0) or 0.0
+    volatility = abs(change)
+
+    # Strong momentum/low liquidity means stricter thresholds; healthier liquidity
+    # and moderate movement allow borderline cases to receive AI review.
+    if volatility >= 50 or liquidity < 12000:
+        profile = {"name": "strict", "max_score": 35.0, "max_top10_pct": 25.0, "min_lp_pct": 80.0}
+    elif liquidity >= 25000 and volume >= 50000 and volatility <= 25:
+        profile = {"name": "balanced", "max_score": 45.0, "max_top10_pct": 35.0, "min_lp_pct": 60.0}
+    else:
+        profile = {"name": "standard", "max_score": 40.0, "max_top10_pct": 30.0, "min_lp_pct": 70.0}
+
     risks = report.get("risks") if isinstance(report.get("risks"), list) else []
     score = _num(report.get("score"))
     top10 = _find_pct_holders(report)
@@ -79,23 +99,50 @@ def evaluate_report(report: dict) -> dict:
     freeze_active = _authority_status(report, "freezeAuthority")
     insider = report.get("insiderNetworks", report.get("insider_networks"))
     insider_count = len(insider) if isinstance(insider, list) else (_num(insider) if insider is not None else None)
+
     reasons: list[str] = []
     missing: list[str] = []
-    if score is None: missing.append("rugcheck_score")
-    elif score > MAX_RUGCHECK_SCORE: reasons.append("rugcheck_score_above_limit")
-    if top10 is None: missing.append("top10_holder_concentration")
-    elif top10 > MAX_TOP10_HOLDER_PCT: reasons.append("top10_holder_concentration_above_limit")
-    if lp_locked is None: missing.append("lp_lock_percentage")
-    elif lp_locked < MIN_LP_LOCKED_PCT: reasons.append("lp_lock_below_minimum")
+    warnings: list[str] = []
+
+    if score is None:
+        missing.append("rugcheck_score")
+    elif score > profile["max_score"]:
+        reasons.append("rugcheck_score_above_dynamic_limit")
+    elif score > MAX_RUGCHECK_SCORE:
+        warnings.append("rugcheck_score_above_base_limit")
+
+    if top10 is None:
+        missing.append("top10_holder_concentration")
+    elif top10 > profile["max_top10_pct"]:
+        reasons.append("top10_holder_concentration_above_dynamic_limit")
+    elif top10 > MAX_TOP10_HOLDER_PCT:
+        warnings.append("top10_holder_concentration_above_base_limit")
+
+    if lp_locked is None:
+        missing.append("lp_lock_percentage")
+    elif lp_locked < profile["min_lp_pct"]:
+        reasons.append("lp_lock_below_dynamic_minimum")
+    elif lp_locked < MIN_LP_LOCKED_PCT:
+        warnings.append("lp_lock_below_base_minimum")
+
     if REQUIRE_MINT_AUTHORITY_REVOKED:
-        if mint_active is None: missing.append("mint_authority_status")
-        elif mint_active: reasons.append("mint_authority_active")
+        if mint_active is None:
+            missing.append("mint_authority_status")
+        elif mint_active:
+            reasons.append("mint_authority_active")
     if REQUIRE_FREEZE_AUTHORITY_REVOKED:
-        if freeze_active is None: missing.append("freeze_authority_status")
-        elif freeze_active: reasons.append("freeze_authority_active")
-    if REQUIRE_ZERO_INSIDER_NETWORKS:
-        if insider_count is None: missing.append("insider_network_data")
-        elif insider_count != 0: reasons.append("insider_networks_detected")
+        if freeze_active is None:
+            missing.append("freeze_authority_status")
+        elif freeze_active:
+            reasons.append("freeze_authority_active")
+
+    # Insider-network data is reviewed as a risk signal, not an automatic veto by itself.
+    # Unknown data is surfaced to the AI review and never represented as zero.
+    if insider_count is None:
+        warnings.append("insider_network_data_missing")
+    elif insider_count > 0:
+        warnings.append("insider_networks_detected")
+
     dangerous = []
     for risk in risks:
         if not isinstance(risk, dict):
@@ -106,16 +153,25 @@ def evaluate_report(report: dict) -> dict:
             dangerous.append(name)
     if dangerous:
         reasons.append("high_risk_flags:" + ",".join(dangerous[:8]))
+
     return {
-        "provider": "RugCheck", "passed": not reasons and not missing,
+        "provider": "RugCheck",
+        "passed": not reasons and not missing,
+        "risk_profile": profile["name"],
+        "dynamic_thresholds": profile,
+        "market_context": {
+            "liquidity_usd": liquidity,
+            "volume_24h_usd": volume,
+            "price_change_24h_pct": change,
+            "absolute_price_change_24h_pct": volatility,
+        },
         "score": score, "top10_holders_pct": top10, "lp_locked_pct": lp_locked,
         "mint_authority_active": mint_active, "freeze_authority_active": freeze_active,
         "insider_network_count": insider_count, "risk_flags": dangerous,
-        "rejection_reasons": reasons, "missing_data": missing,
+        "warnings": warnings, "rejection_reasons": reasons, "missing_data": missing,
     }
 
-
-async def check_token(token_address: str) -> dict:
+async def check_token(token_address: str, market_context: dict | None = None) -> dict:
     if not token_address or len(token_address) < 32:
         return {"provider": "RugCheck", "passed": False, "error": "invalid_token_address"}
     url = f"{BASE_URL}/tokens/{token_address}/report"
@@ -127,6 +183,6 @@ async def check_token(token_address: str) -> dict:
         payload = response.json()
         if not isinstance(payload, dict):
             return {"provider": "RugCheck", "passed": False, "error": "invalid_report_shape"}
-        return evaluate_report(payload)
+        return evaluate_report(payload, market_context)
     except (httpx.HTTPError, ValueError) as exc:
         return {"provider": "RugCheck", "passed": False, "error": type(exc).__name__}
