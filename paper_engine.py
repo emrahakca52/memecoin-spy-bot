@@ -381,18 +381,39 @@ def _price_mark_age_seconds(position):
     return max(0.0, time.time() - opened) if opened > 0 else float("inf")
 
 async def _fetch_dexscreener_price(token_address):
-    try:
-        async with httpx.AsyncClient(timeout=8) as client:
-            response = await client.get(f"https://api.dexscreener.com/tokens/v1/solana/{token_address}")
-            response.raise_for_status()
-            pairs = response.json()
-        if not isinstance(pairs, list) or not pairs:
-            return None
-        best = max(pairs, key=lambda p: _num((p.get("liquidity") or {}).get("usd")))
-        price = _num(best.get("priceUsd"))
-        return price if price > 0 else None
-    except Exception:
-        return None
+    """Fetch a USD mark through both DexScreener response formats before Gecko fallback."""
+    urls = (
+        f"https://api.dexscreener.com/tokens/v1/solana/{token_address}",
+        f"https://api.dexscreener.com/latest/dex/tokens/{token_address}",
+    )
+    async with httpx.AsyncClient(timeout=8) as client:
+        for url in urls:
+            try:
+                response = await client.get(url, headers={"accept": "application/json"})
+                if response.status_code == 429:
+                    logger.warning("DexScreener rate limited price lookup for %s", token_address)
+                    continue
+                response.raise_for_status()
+                payload = response.json()
+                # /tokens/v1 returns a list; /latest/dex/tokens returns {"pairs": [...]}.
+                pairs = payload if isinstance(payload, list) else (payload.get("pairs") or [] if isinstance(payload, dict) else [])
+                if not isinstance(pairs, list) or not pairs:
+                    continue
+                ranked = []
+                for pair in pairs:
+                    if not isinstance(pair, dict):
+                        continue
+                    # Only accept Solana pairs and valid positive USD marks.
+                    chain = str(pair.get("chainId") or "solana").lower()
+                    price = _num(pair.get("priceUsd"))
+                    liquidity = _num((pair.get("liquidity") or {}).get("usd"))
+                    if chain == "solana" and price > 0:
+                        ranked.append((liquidity, price))
+                if ranked:
+                    return max(ranked, key=lambda row: row[0])[1]
+            except Exception as exc:
+                logger.debug("DexScreener price endpoint failed for %s (%s): %s", token_address, url.rsplit("/", 1)[-1], type(exc).__name__)
+    return None
 
 def get_persistence_status():
     return {"connected": bool(_database_url()), "configured": bool(_database_url())}
