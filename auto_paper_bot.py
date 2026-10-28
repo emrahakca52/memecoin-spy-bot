@@ -80,7 +80,6 @@ async def _loop(stop_event):
             if _daily_loss_exceeded():
                 scan_daily_loss_limit = True
                 _last_skipped.append({"reason": "daily_loss_limit_reached"})
-                await asyncio.sleep(POLL_SECONDS)
                 continue
 
             try:
@@ -95,6 +94,7 @@ async def _loop(stop_event):
                 )
             except asyncio.TimeoutError:
                 logger.warning("Signal fetch timed out")
+                scan_error = "signal_fetch_timeout"
                 data = {"signals": [], "checked": 0}
 
             signals = data.get("signals", []) or []
