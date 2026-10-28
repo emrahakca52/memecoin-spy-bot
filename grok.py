@@ -76,11 +76,26 @@ async def evaluate_token(token: dict, rugcheck_result: dict) -> dict:
             "threshold": GROK_CONFIDENCE_THRESHOLD,
         }
     except httpx.HTTPStatusError as exc:
-        logger.warning("AI screening HTTP error provider=%s model=%s symbol=%s status=%s",
-                       provider_name, model, token.get("symbol"), exc.response.status_code)
+        # Keep provider diagnostics short and never log request headers or API keys.
+        try:
+            error_payload = exc.response.json()
+            error_obj = error_payload.get("error", {}) if isinstance(error_payload, dict) else {}
+            provider_message = str(error_obj.get("message", ""))[:240]
+            provider_status = str(error_obj.get("status", ""))[:80]
+        except (ValueError, TypeError):
+            provider_message = ""
+            provider_status = ""
+        logger.warning("AI screening HTTP error provider=%s model=%s symbol=%s status=%s provider_status=%s message=%s",
+                       provider_name, model, token.get("symbol"), exc.response.status_code,
+                       provider_status, provider_message)
+        reasons = [f"ai_http_error:{exc.response.status_code}"]
+        if provider_status:
+            reasons.append(f"provider_status:{provider_status}")
+        if provider_message:
+            reasons.append(f"provider_message:{provider_message}")
         return {"provider": provider_name, "model": model, "decision": "SKIP", "confidence": 0.0,
                 "passed": False, "api_ok": False, "http_status": exc.response.status_code,
-                "reasons": [f"ai_http_error:{exc.response.status_code}"]}
+                "reasons": reasons}
     except (httpx.HTTPError, ValueError, KeyError, TypeError, IndexError, StopIteration) as exc:
         logger.warning("AI screening error provider=%s model=%s symbol=%s error=%s",
                        provider_name, model, token.get("symbol"), type(exc).__name__)
