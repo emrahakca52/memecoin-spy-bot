@@ -13,6 +13,7 @@ from config import (
     MAX_GROK_CHECKS_PER_SCAN, GROK_CONFIDENCE_THRESHOLD,
     COPYFOMO_GATE_ENABLED,
 )
+from telegram_notify import send_scan_report
 from paper_engine import (
     get_token_prices_usd,
     open_paper_position,
@@ -59,6 +60,12 @@ async def _loop(stop_event):
 
     while not stop_event.is_set():
         _last_run = _utc_now()
+        scan_checked = 0
+        scan_candidate_count = 0
+        scan_approved_count = 0
+        scan_opened_count = 0
+        scan_daily_loss_limit = False
+        scan_error = None
         try:
             _last_error = None
             _last_skipped = []
@@ -71,6 +78,7 @@ async def _loop(stop_event):
                 _last_price_update = {"error": "timeout"}
 
             if _daily_loss_exceeded():
+                scan_daily_loss_limit = True
                 _last_skipped.append({"reason": "daily_loss_limit_reached"})
                 await asyncio.sleep(POLL_SECONDS)
                 continue
@@ -90,6 +98,8 @@ async def _loop(stop_event):
                 data = {"signals": [], "checked": 0}
 
             signals = data.get("signals", []) or []
+            scan_checked = int(data.get("checked", 0) or 0)
+            scan_candidate_count = len(signals)
             _last_scan = {
                 "provider": data.get("provider"),
                 "checked": data.get("checked", 0),
@@ -118,6 +128,7 @@ async def _loop(stop_event):
                         _last_skipped.append({"symbol": token.get("symbol"), "reason": "rugcheck_timeout"})
                 _last_copyfomo_checks = checked
 
+            scan_approved_count = len(eligible_signals)
             valid_signals = []
             for token in eligible_signals:
                 address = token.get("token_address")
@@ -159,13 +170,27 @@ async def _loop(stop_event):
                 if result.get("skipped"):
                     _last_skipped.append({"symbol": symbol, "reason": result.get("reason")})
                 else:
+                    scan_opened_count += 1
                     logger.info("Opened position: %s", symbol)
 
         except Exception as exc:
             _last_error = f"{type(exc).__name__}: {str(exc)[:180]}"
+            scan_error = _last_error
             logger.exception("Scan failed")
         finally:
             _last_run = _utc_now()
+            try:
+                await send_scan_report(
+                    checked=scan_checked,
+                    candidates=scan_candidate_count,
+                    approved=scan_approved_count,
+                    opened=scan_opened_count,
+                    skipped=_last_skipped,
+                    error=scan_error,
+                    daily_loss_limit=scan_daily_loss_limit,
+                )
+            except Exception:
+                logger.exception("Telegram scan report unexpectedly failed")
             logger.info("Scan cycle finished")
 
         try:
