@@ -292,15 +292,26 @@ async def stop_bot():
 
 def bot_status():
     copyfomo_summary = []
-    for item in _last_copyfomo_checks[-8:]:
+    for item in _last_copyfomo_checks[-10:]:
         gate = item.get("gate") if isinstance(item.get("gate"), dict) else item
         ai = gate.get("grok") if isinstance(gate.get("grok"), dict) else {}
+        rug = gate.get("rugcheck") if isinstance(gate.get("rugcheck"), dict) else {}
         copyfomo_summary.append({
             "symbol": item.get("symbol"),
             "passed": gate.get("passed"),
             "stage": gate.get("stage"),
             "decision": gate.get("decision"),
             "rejection_reasons": gate.get("rejection_reasons", []),
+            "rugcheck_score": rug.get("score"),
+            "top10_holders_pct": rug.get("top10_holders_pct"),
+            "lp_locked_pct": rug.get("lp_locked_pct"),
+            "mint_authority_active": rug.get("mint_authority_active"),
+            "freeze_authority_active": rug.get("freeze_authority_active"),
+            "insider_network_count": rug.get("insider_network_count"),
+            "risk_flags": rug.get("risk_flags", []),
+            "missing_data": rug.get("missing_data", []),
+            "rugcheck_error": rug.get("error"),
+            "rugcheck_http_status": rug.get("http_status"),
             "ai_provider": ai.get("provider", "not_called"),
             "ai_model": ai.get("model"),
             "ai_api_ok": ai.get("api_ok", False),
