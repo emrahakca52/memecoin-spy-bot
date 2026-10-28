@@ -301,13 +301,19 @@ async def _loop(stop_event):
                             "observed_change_pct": observation.get("observed_change_pct"),
                         })
                         continue
-                    live_price = prices.get(address) or (observation or {}).get("observed_price_usd")
+                    # The observation price is the freshest quote from the same USD-price
+                    # pipeline used during the 20-second momentum window. Prefer it over
+                    # the earlier bulk quote, which may be stale by the time observation ends.
+                    # Do not compare a Jupiter discovery snapshot against a DexScreener/
+                    # GeckoTerminal live quote: cross-provider price differences caused
+                    # false rejections (e.g. a 30.8% discrepancy) even after a valid
+                    # bounded momentum observation. The observation window itself enforces
+                    # the configured -0.5% to +8% movement guard.
+                    live_price = _positive_finite_float((observation or {}).get("observed_price_usd"))
+                    if not live_price:
+                        live_price = _positive_finite_float(prices.get(address))
                     if not live_price or live_price <= 0:
                         _last_skipped.append({"symbol": symbol, "reason": "live_price_unavailable"})
-                        continue
-                    deviation = abs(live_price / signal_price - 1) * 100
-                    if deviation > MAX_ENTRY_PRICE_DEVIATION_PCT:
-                        _last_skipped.append({"symbol": symbol, "reason": "price_deviation", "deviation_pct": round(deviation, 2)})
                         continue
 
                     result = open_paper_position(
