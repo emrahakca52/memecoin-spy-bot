@@ -345,6 +345,7 @@ async def _discover_dexscreener(client: httpx.AsyncClient) -> list[dict]:
         change = pair.get("priceChange") or {}
         buys, sells = int(_num(txns.get("buys"))), int(_num(txns.get("sells")))
         buys1h, sells1h = int(_num(txns1h.get("buys"))), int(_num(txns1h.get("sells")))
+        buys5m, sells5m = int(_num(txns5m.get("buys"))), int(_num(txns5m.get("sells")))
         candidates.append({
             "token_address": address, "symbol": token.get("symbol") or "UNKNOWN",
             "name": token.get("name") or "", "price_usd": _num(pair.get("priceUsd")),
@@ -355,6 +356,9 @@ async def _discover_dexscreener(client: httpx.AsyncClient) -> list[dict]:
             "buys_24h": buys, "sells_24h": sells,
             "buy_sell_ratio": buys / sells if sells > 0 else 0.0,
             "buy_sell_ratio_1h": buys1h / sells1h if sells1h > 0 else 0.0,
+            "buys_5m": buys5m, "sells_5m": sells5m,
+            "buy_sell_ratio_5m": buys5m / sells5m if sells5m > 0 else (float(buys5m) if buys5m > 0 else 0.0),
+            "trade_count_5m": buys5m + sells5m,
             "trade_count_24h": buys + sells, "trade_count_1h": buys1h + sells1h,
             "price_change_24h_pct": _num(change.get("h24")),
             "price_change_1h_pct": _num(change.get("h1")),
@@ -510,7 +514,8 @@ async def get_signal_candidates(
                         market_fields = (
                             "price_usd", "liquidity_usd", "volume_24h_usd",
                             "volume_1h_usd", "volume_5m_usd", "buys_24h", "sells_24h",
-                            "buy_sell_ratio", "buy_sell_ratio_1h", "trade_count_24h",
+                            "buy_sell_ratio", "buy_sell_ratio_1h", "buys_5m", "sells_5m",
+                            "buy_sell_ratio_5m", "trade_count_5m", "trade_count_24h",
                             "trade_count_1h", "price_change_24h_pct",
                             "price_change_1h_pct", "price_change_5m_pct",
                             "price_change_24h_present", "market_cap_usd", "url",
