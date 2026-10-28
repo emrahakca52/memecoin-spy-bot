@@ -127,7 +127,7 @@ async def _loop(stop_event):
                         if stop_event.is_set():
                             break
                         try:
-                            gate = await asyncio.wait_for(evaluate_candidate(token), timeout=20)
+                            gate = await asyncio.wait_for(evaluate_candidate(token), timeout=75)
                             checked.append({"symbol": token.get("symbol"), **gate})
                             if gate.get("passed"):
                                 eligible_signals.append(token)
