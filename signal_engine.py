@@ -168,6 +168,10 @@ def _jupiter_candidates(tokens: Any) -> list[dict]:
         sells1h = int(_first_num(stats1h.get("numSells"), stats1h.get("sells")))
         volume1h = _first_num(stats1h.get("volume"), stats1h.get("volumeUsd"), stats1h.get("totalVolume"))
         volume5m = _first_num(stats5m.get("volume"), stats5m.get("volumeUsd"), stats5m.get("totalVolume"))
+        change1h = (_num(stats1h.get("priceChangePercent")) if _has_finite_number(stats1h.get("priceChangePercent"))
+                    else _num(stats1h.get("priceChange")) * 100.0)
+        change5m = (_num(stats5m.get("priceChangePercent")) if _has_finite_number(stats5m.get("priceChangePercent"))
+                    else _num(stats5m.get("priceChange")) * 100.0)
         candidates.append({
             "token_address": address,
             "symbol": token.get("symbol") or "UNKNOWN",
@@ -184,8 +188,8 @@ def _jupiter_candidates(tokens: Any) -> list[dict]:
             "trade_count_24h": int(_first_num(stats.get("numTraders"), stats.get("tradeCount"), buys + sells)),
             "trade_count_1h": buys1h + sells1h,
             "price_change_24h_pct": price_change_pct,
-            "price_change_1h_pct": _num(stats1h.get("priceChangePercent", stats1h.get("priceChange", 0))),
-            "price_change_5m_pct": _num(stats5m.get("priceChangePercent", stats5m.get("priceChange", 0))),
+            "price_change_1h_pct": change1h,
+            "price_change_5m_pct": change5m,
             "price_change_24h_present": change_present,
             "market_cap_usd": _first_num(token.get("mcap"), token.get("marketCap")),
             "provider": "Jupiter",
