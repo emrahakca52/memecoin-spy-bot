@@ -40,6 +40,11 @@ async def send_scan_report(
     else:
         lines.append("📭 Yeni sinyal yok; uygun aday bulunmadı veya aday güvenlik kontrolünden geçmedi.")
     if skipped:
+        reason_counts = {}
+        for item in skipped:
+            reason = str(item.get("reason") or "elenmiş")
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        lines.append("Eleme sayıları: " + ", ".join(f"{key}={value}" for key, value in sorted(reason_counts.items())))
         reasons = []
         for item in skipped[-3:]:
             symbol = item.get("symbol") or "Token"
