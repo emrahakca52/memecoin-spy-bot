@@ -1,10 +1,13 @@
-"""AI JSON decision gate with optional Gemini free-tier support; fail-closed on errors."""
+"""AI JSON decision gate with optional Gemini support; fail-closed on errors."""
 from __future__ import annotations
 import json
+import logging
 import os
 import httpx
 from config import GROK_API_BASE, GROK_MODEL, GROK_TIMEOUT_SECONDS, GROK_CONFIDENCE_THRESHOLD
 from prompts import SYSTEM_PROMPT, build_user_prompt
+
+logger = logging.getLogger(__name__)
 
 
 async def evaluate_token(token: dict, rugcheck_result: dict) -> dict:
@@ -14,9 +17,11 @@ async def evaluate_token(token: dict, rugcheck_result: dict) -> dict:
     if provider == "gemini":
         api_key = os.getenv("GEMINI_API_KEY", "").strip()
         model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip()
+        provider_name = "Gemini"
         if not api_key:
-            return {"provider": "Gemini", "decision": "SKIP", "confidence": 0.0,
-                    "reasons": ["gemini_api_key_missing"], "passed": False}
+            logger.warning("AI screening skipped provider=Gemini reason=api_key_missing symbol=%s", token.get("symbol"))
+            return {"provider": provider_name, "model": model, "decision": "SKIP", "confidence": 0.0,
+                    "reasons": ["gemini_api_key_missing"], "passed": False, "api_ok": False}
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         body = {
             "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
@@ -24,13 +29,14 @@ async def evaluate_token(token: dict, rugcheck_result: dict) -> dict:
             "generationConfig": {"temperature": 0, "responseMimeType": "application/json"},
         }
         headers = {"x-goog-api-key": api_key, "Content-Type": "application/json"}
-        provider_name = "Gemini"
     else:
         api_key = os.getenv("XAI_API_KEY", "").strip()
         model = GROK_MODEL
+        provider_name = "Grok"
         if not api_key:
-            return {"provider": "Grok", "decision": "SKIP", "confidence": 0.0,
-                    "reasons": ["xai_api_key_missing"], "passed": False}
+            logger.warning("AI screening skipped provider=Grok reason=api_key_missing symbol=%s", token.get("symbol"))
+            return {"provider": provider_name, "model": model, "decision": "SKIP", "confidence": 0.0,
+                    "reasons": ["xai_api_key_missing"], "passed": False, "api_ok": False}
         url = f"{GROK_API_BASE}/chat/completions"
         body = {
             "model": model, "temperature": 0,
@@ -41,8 +47,8 @@ async def evaluate_token(token: dict, rugcheck_result: dict) -> dict:
             "response_format": {"type": "json_object"},
         }
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-        provider_name = "Grok"
 
+    logger.info("AI screening request provider=%s model=%s symbol=%s", provider_name, model, token.get("symbol"))
     try:
         async with httpx.AsyncClient(timeout=GROK_TIMEOUT_SECONDS, headers=headers) as client:
             response = await client.post(url, json=body)
@@ -59,13 +65,24 @@ async def evaluate_token(token: dict, rugcheck_result: dict) -> dict:
         if decision not in {"COPY", "SKIP"} or not 0 <= confidence <= 1:
             raise ValueError("invalid_decision_schema")
         passed = decision == "COPY" and confidence >= GROK_CONFIDENCE_THRESHOLD
+        reasons = parsed.get("reasons", []) if isinstance(parsed.get("reasons", []), list) else ["invalid_reasons"]
+        missing_data = parsed.get("missing_data", []) if isinstance(parsed.get("missing_data", []), list) else []
+        logger.info("AI screening response provider=%s model=%s symbol=%s api_ok=true decision=%s confidence=%.3f passed=%s",
+                    provider_name, model, token.get("symbol"), decision, confidence, passed)
         return {
             "provider": provider_name, "model": model, "decision": decision,
-            "confidence": confidence, "passed": passed,
-            "reasons": parsed.get("reasons", []) if isinstance(parsed.get("reasons", []), list) else ["invalid_reasons"],
-            "missing_data": parsed.get("missing_data", []) if isinstance(parsed.get("missing_data", []), list) else [],
+            "confidence": confidence, "passed": passed, "api_ok": True,
+            "reasons": reasons, "missing_data": missing_data,
             "threshold": GROK_CONFIDENCE_THRESHOLD,
         }
-    except (httpx.HTTPError, ValueError, KeyError, TypeError, IndexError, StopIteration) as exc:
+    except httpx.HTTPStatusError as exc:
+        logger.warning("AI screening HTTP error provider=%s model=%s symbol=%s status=%s",
+                       provider_name, model, token.get("symbol"), exc.response.status_code)
         return {"provider": provider_name, "model": model, "decision": "SKIP", "confidence": 0.0,
-                "passed": False, "reasons": [f"ai_unavailable_or_invalid:{type(exc).__name__}"]}
+                "passed": False, "api_ok": False, "http_status": exc.response.status_code,
+                "reasons": [f"ai_http_error:{exc.response.status_code}"]}
+    except (httpx.HTTPError, ValueError, KeyError, TypeError, IndexError, StopIteration) as exc:
+        logger.warning("AI screening error provider=%s model=%s symbol=%s error=%s",
+                       provider_name, model, token.get("symbol"), type(exc).__name__)
+        return {"provider": provider_name, "model": model, "decision": "SKIP", "confidence": 0.0,
+                "passed": False, "api_ok": False, "reasons": [f"ai_unavailable_or_invalid:{type(exc).__name__}"]}
