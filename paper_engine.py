@@ -117,28 +117,13 @@ async def get_jupiter_quote(input_mint: str, output_mint: str, amount: int) -> d
     return None
 
 async def get_token_price_usd(token_address: str) -> float | None:
-    quote = await get_jupiter_quote(token_address, USDC_MINT, 1_000_000)
-    if quote and "outAmount" in quote:
-        try:
-            out = int(quote["outAmount"])
-            price = out / 1_000_000
-            if price > 0:
-                return price
-        except Exception:
-            pass
-
-    try:
-        async with httpx.AsyncClient(timeout=8) as client:
-            r = await client.get(f"https://api.dexscreener.com/tokens/v1/solana/{token_address}")
-            if r.status_code == 200:
-                pairs = r.json()
-                if isinstance(pairs, list) and pairs:
-                    best = max(pairs, key=lambda p: _num((p.get("liquidity") or {}).get("usd")))
-                    price = _num(best.get("priceUsd"))
-                    if price > 0:
-                        return price
-    except Exception:
-        pass
+    # Prefer a USD price source that already normalizes token decimals.
+    # The old Jupiter quote used a fixed raw amount (1_000_000), which is not
+    # one whole token for most Solana mints and could create false price deviations.
+    price = await _fetch_dexscreener_price(token_address)
+    if price is not None and price > 0:
+        return price
+    logger.warning("No reliable USD price available for %s; skipping paper entry/mark", token_address)
     return None
 
 async def get_token_prices_usd(token_addresses, reference_prices=None):
@@ -150,7 +135,7 @@ async def get_token_prices_usd(token_addresses, reference_prices=None):
     return results
 
 def get_price_diagnostics():
-    return {"provider": "jupiter+dexscreener", "status": "ok"}
+    return {"provider": "DexScreener", "status": "price_lookup_on_demand"}
 
 def record_paper_trade(token_address, side, amount_usd, price_usd, token_symbol="", source="manual", reason=None):
     global _realized_pnl_usd
@@ -315,7 +300,7 @@ def get_paper_status():
         "paper_unrealized_pnl_usd": round(unrealized, 2),
         "paper_realized_pnl_usd": round(_realized_pnl_usd, 2),
         "paper_total_pnl_usd": round(unrealized + _realized_pnl_usd, 2),
-        "provider": "jupiter+dexscreener",
+        "provider": "DexScreener",
     }
 
 def get_paper_trades():
