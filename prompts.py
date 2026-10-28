@@ -20,12 +20,13 @@ def build_user_prompt(token: dict, rugcheck: dict) -> str:
     payload = {
         "task": "Evaluate whether this token may proceed to later checks in a paper-only simulation. Do not override the deterministic RugCheck result.",
         "rules": {
-            "rugcheck_score_max": MAX_RUGCHECK_SCORE,
-            "top10_holders_pct_max": MAX_TOP10_HOLDER_PCT,
-            "lp_locked_pct_min": MIN_LP_LOCKED_PCT,
+            # Use the same market-aware numeric bands that deterministic RugCheck used.
+            # AI is a second reviewer, not a way to bypass any hard rejection.
+            "risk_profile": rugcheck.get("risk_profile", "unknown"),
+            "dynamic_thresholds": rugcheck.get("dynamic_thresholds", {}),
             "mint_authority_must_be_revoked": REQUIRE_MINT_AUTHORITY_REVOKED,
             "freeze_authority_must_be_revoked": REQUIRE_FREEZE_AUTHORITY_REVOKED,
-            "insider_networks_must_equal_zero": REQUIRE_ZERO_INSIDER_NETWORKS,
+            "insider_networks_are_risk_signal_not_automatic_veto": True,
             "confidence_min": GROK_CONFIDENCE_THRESHOLD,
         },
         "token_market_data": {
