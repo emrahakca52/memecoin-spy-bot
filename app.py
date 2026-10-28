@@ -1,3 +1,4 @@
+import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import logging
@@ -20,6 +21,7 @@ from paper_engine import (
 from auto_paper_bot import bot_status, start_bot, stop_bot
 from config import MIN_LIQUIDITY_USD, MIN_VOLUME_24H_USD, MIN_BUYS_SELLS_RATIO
 from grok import evaluate_token
+from telegram_positions import positions_dashboard_loop
 
 logger = logging.getLogger("memecoin_spy")
 
@@ -29,6 +31,8 @@ BIRDEYE_TEST_TOKEN = "So11111111111111111111111111111111111111112"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    dashboard_stop = asyncio.Event()
+    dashboard_task = asyncio.create_task(positions_dashboard_loop(dashboard_stop))
     try:
         result = load_paper_state()
         logger.info("Paper state load result: %s", result)
@@ -42,6 +46,14 @@ async def lifespan(app: FastAPI):
         logger.exception("Paper bot could not be started.")
 
     yield
+
+    dashboard_stop.set()
+    try:
+        await asyncio.wait_for(dashboard_task, timeout=5)
+    except asyncio.TimeoutError:
+        dashboard_task.cancel()
+    except Exception:
+        logger.exception("Telegram positions dashboard shutdown error.")
 
     try:
         result = await stop_bot()
