@@ -24,17 +24,49 @@ def _find_pct_holders(report: dict) -> float | None:
     holders = report.get("topHolders") or report.get("top_holders")
     if not isinstance(holders, list) or len(holders) < 1:
         return None
-    vals = []
-    for item in holders[:10]:
+
+    # Exclude pool/locker custody accounts only when RugCheck explicitly labels them.
+    known = report.get("knownAccounts") or report.get("known_accounts") or {}
+    if not isinstance(known, dict):
+        known = {}
+    excluded_types = {"AMM", "LOCKER", "BURN", "BURNED", "BONDING_CURVE", "POOL", "LP"}
+    locker_addresses = set()
+    lockers = report.get("lockers") or report.get("lpLockers") or report.get("lp_lockers") or {}
+    if isinstance(lockers, dict):
+        for key, locker in lockers.items():
+            if isinstance(key, str):
+                locker_addresses.add(key)
+            if isinstance(locker, dict):
+                for field in ("owner", "tokenAccount", "token_account"):
+                    value = locker.get(field)
+                    if isinstance(value, str) and value:
+                        locker_addresses.add(value)
+
+    eligible = []
+    for item in holders:
         if not isinstance(item, dict):
-            return None
+            continue
+        addresses = [item.get("address"), item.get("owner")]
+        is_excluded = any(isinstance(a, str) and a in locker_addresses for a in addresses)
+        for address in addresses:
+            account = known.get(address) if isinstance(address, str) else None
+            if isinstance(account, dict):
+                account_type = str(account.get("type", "")).upper().replace("-", "_").replace(" ", "_")
+                if account_type in excluded_types:
+                    is_excluded = True
+        if not is_excluded:
+            eligible.append(item)
+
+    if not eligible:
+        return None
+    vals = []
+    for item in eligible[:10]:
         pct = _num(item.get("pct", item.get("percentage")))
         if pct is None:
-            # Some APIs expose fractional ownership; accept only explicit pct values.
             return None
         vals.append(pct)
     total = sum(vals)
-    # Some providers represent pct as a 0..1 fraction; normalize only when clear.
+    # RugCheck pct values are normally 0..100. Normalize only clear fractional data.
     return total * 100 if total <= 1.0 else total
 
 
@@ -147,9 +179,9 @@ def evaluate_report(report: dict, market_context: dict | None = None) -> dict:
     if insider_count is None:
         warnings.append("insider_network_data_missing")
     elif insider_count > 0:
+        # Linked wallets are a warning, not a standalone veto. Concentration is
+        # evaluated separately against the selected profile's dynamic threshold.
         warnings.append("insider_networks_detected")
-        if top10 is not None and top10 > 25:
-            reasons.append("insider_networks_with_high_holder_concentration")
 
     dangerous = []
     market_managed_flags = []
