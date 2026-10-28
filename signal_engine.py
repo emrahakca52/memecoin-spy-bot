@@ -445,6 +445,8 @@ async def get_signal_candidates(
         "low_buy_sell_ratio": 0,
         "too_few_trades": 0,
         "price_change_out_of_range": 0,
+        "price_change_above_positive_limit": 0,
+        "price_change_below_negative_limit": 0,
         "invalid_price": 0,
     }
     for candidate in candidates:
@@ -464,7 +466,11 @@ async def get_signal_candidates(
             rejected["low_buy_sell_ratio"] += 1
         if trades < MIN_TRADES_24H:
             rejected["too_few_trades"] += 1
-        if abs(change) > MAX_PRICE_CHANGE_24H_PCT or change < -MAX_NEGATIVE_PRICE_CHANGE_24H_PCT:
+        if change > MAX_PRICE_CHANGE_24H_PCT:
+            rejected["price_change_above_positive_limit"] += 1
+            rejected["price_change_out_of_range"] += 1
+        elif change < -MAX_NEGATIVE_PRICE_CHANGE_24H_PCT:
+            rejected["price_change_below_negative_limit"] += 1
             rejected["price_change_out_of_range"] += 1
         if price <= 0:
             rejected["invalid_price"] += 1
