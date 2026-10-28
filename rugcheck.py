@@ -179,15 +179,13 @@ def evaluate_report(report: dict, market_context: dict | None = None) -> dict:
         elif freeze_active:
             reasons.append("freeze_authority_active")
 
-    # config requires zero detected insider networks. Missing data fails closed:
-    # an unknown insider result must not silently pass a security gate that requires zero.
-    if REQUIRE_ZERO_INSIDER_NETWORKS:
-        if insider_count is None:
-            missing.append("insider_network_data")
-        elif insider_count > 0:
-            reasons.append("insider_networks_detected")
-    elif insider_count is None:
-        warnings.append("insider_network_data_missing")
+    # Balanced policy: a small detected insider cluster is a warning, not an
+    # automatic veto; a larger cluster is rejected. Missing data remains unknown
+    # and is surfaced explicitly rather than being treated as zero.
+    if insider_count is None:
+        missing.append("insider_network_data")
+    elif insider_count > 2:
+        reasons.append("insider_networks_above_limit")
     elif insider_count > 0:
         warnings.append("insider_networks_detected")
 
