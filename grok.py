@@ -52,6 +52,17 @@ async def evaluate_token(token: dict, rugcheck_result: dict) -> dict:
     try:
         async with httpx.AsyncClient(timeout=GROK_TIMEOUT_SECONDS, headers=headers) as client:
             response = await client.post(url, json=body)
+            # Gemini may temporarily return 503 when a model is at capacity.
+            # Try one alternate stable Flash model; never relax any safety decision.
+            if provider == "gemini" and response.status_code == 503:
+                fallback_model = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.6-flash").strip()
+                if fallback_model and fallback_model != model:
+                    logger.warning("Gemini primary model unavailable; trying fallback model=%s", fallback_model)
+                    fallback_url = f"https://generativelanguage.googleapis.com/v1beta/models/{fallback_model}:generateContent"
+                    fallback_response = await client.post(fallback_url, json=body)
+                    if fallback_response.status_code != 503:
+                        response = fallback_response
+                        model = fallback_model
         response.raise_for_status()
         payload = response.json()
         if provider == "gemini":
