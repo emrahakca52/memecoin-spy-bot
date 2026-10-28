@@ -82,14 +82,15 @@ def evaluate_report(report: dict, market_context: dict | None = None) -> dict:
     change = _num(market.get("price_change_24h_pct")) or 0.0
     volatility = abs(change)
 
-    # Strong momentum/low liquidity means stricter thresholds; healthier liquidity
-    # and moderate movement allow borderline cases to receive AI review.
-    if volatility >= 50 or liquidity < 12000:
-        profile = {"name": "strict", "max_score": 35.0, "max_top10_pct": 25.0, "min_lp_pct": 80.0}
+    # Security thresholds adapt to market conditions, but never waive hard vetoes.
+    # A very sharp 24h move is a stronger manipulation/chasing warning than ordinary
+    # low liquidity alone; liquidity is also handled by the market-selection score.
+    if volatility >= 80 or liquidity < 9000:
+        profile = {"name": "strict", "max_score": 35.0, "max_top10_pct": 25.0, "min_lp_pct": 50.0}
     elif liquidity >= 25000 and volume >= 50000 and volatility <= 25:
-        profile = {"name": "balanced", "max_score": 45.0, "max_top10_pct": 35.0, "min_lp_pct": 60.0}
+        profile = {"name": "balanced", "max_score": 45.0, "max_top10_pct": 40.0, "min_lp_pct": 30.0}
     else:
-        profile = {"name": "standard", "max_score": 40.0, "max_top10_pct": 30.0, "min_lp_pct": 70.0}
+        profile = {"name": "standard", "max_score": 40.0, "max_top10_pct": 35.0, "min_lp_pct": 40.0}
 
     risks = report.get("risks") if isinstance(report.get("risks"), list) else []
     score = _num(report.get("score"))
@@ -136,12 +137,15 @@ def evaluate_report(report: dict, market_context: dict | None = None) -> dict:
         elif freeze_active:
             reasons.append("freeze_authority_active")
 
-    # Insider-network data is reviewed as a risk signal, not an automatic veto by itself.
-    # Unknown data is surfaced to the AI review and never represented as zero.
+    # Insider-network data is a risk signal, not an automatic veto by itself.
+    # Strong concentration plus detected insider links is materially riskier than either
+    # signal alone; the AI gets both the warning and the underlying numeric concentration.
     if insider_count is None:
         warnings.append("insider_network_data_missing")
     elif insider_count > 0:
         warnings.append("insider_networks_detected")
+        if top10 is not None and top10 > 25:
+            reasons.append("insider_networks_with_high_holder_concentration")
 
     dangerous = []
     market_managed_flags = []
