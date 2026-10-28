@@ -144,13 +144,27 @@ def evaluate_report(report: dict, market_context: dict | None = None) -> dict:
         warnings.append("insider_networks_detected")
 
     dangerous = []
+    market_managed_flags = []
     for risk in risks:
         if not isinstance(risk, dict):
             continue
         level = str(risk.get("level", "")).lower()
         name = str(risk.get("name", "unknown_risk"))
+        normalized_name = name.lower().replace("_", " ").replace("-", " ")
+        # These risks already have explicit market-aware numeric thresholds above.
+        # Do not let a generic RugCheck label silently re-impose the old fixed limit.
+        is_market_managed = any(term in normalized_name for term in (
+            "top 10 holder", "top10 holder", "holder concentration",
+            "high ownership", "ownership concentration", "lp lock",
+            "liquidity lock", "lp unlocked",
+        ))
         if level in {"danger", "critical", "high"}:
-            dangerous.append(name)
+            if is_market_managed:
+                market_managed_flags.append(name)
+            else:
+                dangerous.append(name)
+    if market_managed_flags:
+        warnings.append("market_managed_risk_flags:" + ",".join(market_managed_flags[:8]))
     if dangerous:
         reasons.append("high_risk_flags:" + ",".join(dangerous[:8]))
 
