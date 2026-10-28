@@ -4,7 +4,7 @@ import os
 from typing import Any
 import httpx
 from config import (
-    MAX_RUGCHECK_SCORE, MAX_TOP10_HOLDER_PCT, MIN_LP_LOCKED_PCT,
+    MAX_TOP10_HOLDER_PCT, MIN_LP_LOCKED_PCT,
     REQUIRE_MINT_AUTHORITY_REVOKED, REQUIRE_FREEZE_AUTHORITY_REVOKED,
     REQUIRE_ZERO_INSIDER_NETWORKS,
 )
@@ -53,7 +53,9 @@ def _lp_locked_pct(report: dict) -> float | None:
                 val = _num(lp.get("lpLockedPct", lp.get("lockedPct", lp.get("locked_pct"))))
                 if val is not None:
                     vals.append(val * 100 if 0 <= val <= 1 else val)
-    return max(vals) if vals else None
+    # If only per-market values are available, use the most conservative reported value.
+    # Taking max() could let one locked minor pool hide an unlocked primary pool.
+    return min(vals) if vals else None
 
 
 def _authority_status(report: dict, name: str) -> bool | None:
@@ -86,14 +88,18 @@ def evaluate_report(report: dict, market_context: dict | None = None) -> dict:
     # A very sharp 24h move is a stronger manipulation/chasing warning than ordinary
     # low liquidity alone; liquidity is also handled by the market-selection score.
     if volatility >= 80 or liquidity < 9000:
-        profile = {"name": "strict", "max_score": 35.0, "max_top10_pct": 25.0, "min_lp_pct": 50.0}
+        profile = {"name": "strict", "min_score_normalised": 70.0, "max_top10_pct": 25.0, "min_lp_pct": 50.0}
     elif liquidity >= 25000 and volume >= 50000 and volatility <= 25:
-        profile = {"name": "balanced", "max_score": 45.0, "max_top10_pct": 40.0, "min_lp_pct": 30.0}
+        profile = {"name": "balanced", "min_score_normalised": 65.0, "max_top10_pct": 40.0, "min_lp_pct": 30.0}
     else:
-        profile = {"name": "standard", "max_score": 40.0, "max_top10_pct": 35.0, "min_lp_pct": 40.0}
+        profile = {"name": "standard", "min_score_normalised": 65.0, "max_top10_pct": 35.0, "min_lp_pct": 40.0}
 
     risks = report.get("risks") if isinstance(report.get("risks"), list) else []
-    score = _num(report.get("score"))
+    # RugCheck score is raw accumulated risk points (often thousands). The normalized
+    # score is a 0-100 safety score; higher is generally safer. Never compare raw score
+    # against normalized-score thresholds.
+    raw_score = _num(report.get("score"))
+    score = _num(report.get("score_normalised", report.get("scoreNormalised")))
     top10 = _find_pct_holders(report)
     lp_locked = _lp_locked_pct(report)
     mint_active = _authority_status(report, "mintAuthority")
@@ -106,11 +112,9 @@ def evaluate_report(report: dict, market_context: dict | None = None) -> dict:
     warnings: list[str] = []
 
     if score is None:
-        missing.append("rugcheck_score")
-    elif score > profile["max_score"]:
-        reasons.append("rugcheck_score_above_dynamic_limit")
-    elif score > MAX_RUGCHECK_SCORE:
-        warnings.append("rugcheck_score_above_base_limit")
+        missing.append("rugcheck_score_normalised")
+    elif score < profile["min_score_normalised"]:
+        reasons.append("rugcheck_normalised_score_below_dynamic_minimum")
 
     if top10 is None:
         missing.append("top10_holder_concentration")
@@ -183,7 +187,8 @@ def evaluate_report(report: dict, market_context: dict | None = None) -> dict:
             "price_change_24h_pct": change,
             "absolute_price_change_24h_pct": volatility,
         },
-        "score": score, "top10_holders_pct": top10, "lp_locked_pct": lp_locked,
+        "score": score, "score_normalised": score, "raw_score": raw_score,
+        "top10_holders_pct": top10, "lp_locked_pct": lp_locked,
         "mint_authority_active": mint_active, "freeze_authority_active": freeze_active,
         "insider_network_count": insider_count, "risk_flags": dangerous,
         "warnings": warnings, "rejection_reasons": reasons, "missing_data": missing,
