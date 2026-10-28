@@ -13,7 +13,7 @@ import psycopg
 from config import (
     TAKE_PROFIT_PCT, STOP_LOSS_PCT, TRAILING_STOP_PCT,
     PARTIAL_TAKE_PROFIT_PCT, PARTIAL_SELL_FRACTION, MAX_HOLD_SECONDS,
-    MIN_HOLD_SECONDS, MAX_DAILY_LOSS_USD,
+    MIN_HOLD_SECONDS, MAX_DAILY_LOSS_USD, MAX_OPEN_POSITIONS,
     JUPITER_QUOTE_URL, JUPITER_SLIPPAGE_BPS, USDC_MINT,
 )
 
@@ -32,6 +32,9 @@ def _num(value, default=0.0):
         return n if math.isfinite(n) else default
     except (TypeError, ValueError, OverflowError):
         return default
+
+# Paper-only starting capital; adjustable in Render environment variables.
+_paper_starting_balance_usd = max(0.0, _num(os.getenv("PAPER_STARTING_BALANCE_USD", "500"), 500.0))
 
 async def send_telegram(message: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -74,6 +77,7 @@ def _save_paper_state():
             "open_positions": _open_positions,
             "paper_trades": _paper_trades,
             "realized_pnl_usd": _realized_pnl_usd,
+            "starting_balance_usd": _paper_starting_balance_usd,
         }, default=str)
         with _connect_database() as conn:
             _ensure_state_table(conn)
@@ -432,6 +436,7 @@ def load_paper_state():
         if not isinstance(trades, list): trades = []
         _open_positions = positions
         _paper_trades = trades
+        _paper_starting_balance_usd = max(0.0, _num(state.get("starting_balance_usd", os.getenv("PAPER_STARTING_BALANCE_USD", "500")), 500.0))
         accounting = _reported_realized_pnl(trades)
         quarantined_ids = {id(t) for t in []}
         quarantined_keys = {(str(t.get("token_address","")), str(t.get("token_symbol","")), str(t.get("timestamp","")), str(t.get("realized_pnl_usd",""))) for t in accounting["quarantined_sell_records"]}
@@ -456,7 +461,36 @@ def load_paper_state():
         _database_status["load_error"] = f"{type(exc).__name__}: {str(exc)[:160]}"
         return {"ok": False, "loaded": False}
 
+def _daily_realized_pnl_usd(now=None):
+    """Today's non-quarantined realized paper PnL, using UTC day boundaries."""
+    now = now or datetime.now(timezone.utc)
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    return round(sum(
+        _num(t.get("realized_pnl_usd")) for t in _paper_trades
+        if isinstance(t, dict) and str(t.get("side", "")).upper() == "SELL"
+        and not t.get("accounting_quarantined") and "realized_pnl_usd" in t
+        and _num(t.get("timestamp")) >= start
+    ), 4)
+
+
+def _paper_available_cash_usd():
+    committed = sum(_num(p.get("invested_usd")) for p in _open_positions.values())
+    return round(_paper_starting_balance_usd + _realized_pnl_usd - committed, 6)
+
+
 def record_paper_trade(token_address, side, amount_usd, price_usd, token_symbol="", source="manual", reason=None):
+    normalized_side = str(side).upper()
+    amount = _num(amount_usd, -1.0)
+    if normalized_side == "BUY":
+        if amount <= 0:
+            raise ValueError("Invalid paper order amount")
+        if token_address not in _open_positions and len(_open_positions) >= MAX_OPEN_POSITIONS:
+            raise ValueError("Paper wallet risk limit: maximum open positions reached")
+        if _daily_realized_pnl_usd() <= -abs(MAX_DAILY_LOSS_USD):
+            raise ValueError("Paper wallet risk limit: daily realized loss limit reached; new entries paused")
+        available = _paper_available_cash_usd()
+        if amount > available + 1e-8:
+            raise ValueError(f"Insufficient paper cash: requested ${amount:.2f}, available ${max(0.0, available):.2f}")
     pos_before = _open_positions.get(token_address)
     entry_cost = _num((pos_before or {}).get("estimated_entry_cost_usd"))
     result = _ORIGINAL_RECORD_PAPER_TRADE(token_address, side, amount_usd, price_usd, token_symbol, source, reason)
@@ -601,6 +635,8 @@ def get_paper_status():
         for t in sell_rows if not t.get("accounting_quarantined")
     )
     total_incomplete = stale_count > 0 or bool(accounting["quarantined_sell_records"])
+    cash_available = _paper_available_cash_usd()
+    total_equity = None if stale_count > 0 else cash_available + current
     status = {
         "mode": "paper", "real_trading_enabled": False, "open_positions": rows,
         "open_position_count": len(rows), "paper_invested_usd": round(invested, 2),
@@ -617,5 +653,12 @@ def get_paper_status():
         "paper_estimated_net_pnl_incomplete": legacy_cost_missing,
         "paper_estimated_net_total_pnl_usd": None if legacy_cost_missing else round(partial_net + unrealized, 2),
         "paper_estimated_net_total_pnl_partial_usd": round(partial_net + unrealized, 2),
+        "paper_starting_balance_usd": round(_paper_starting_balance_usd, 2),
+        "paper_cash_available_usd": round(cash_available, 2),
+        "paper_cash_committed_usd": round(invested, 2),
+        "paper_total_equity_usd": None if total_equity is None else round(total_equity, 2),
+        "paper_daily_realized_pnl_usd": _daily_realized_pnl_usd(),
+        "paper_daily_loss_limit_usd": round(abs(MAX_DAILY_LOSS_USD), 2),
+        "paper_max_open_positions": MAX_OPEN_POSITIONS,
     }
     return status
