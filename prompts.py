@@ -31,8 +31,11 @@ def build_user_prompt(token: dict, rugcheck: dict) -> str:
         "token_market_data": {
             k: token.get(k) for k in (
                 "token_address", "symbol", "name", "price_usd", "liquidity_usd",
-                "volume_24h_usd", "buys_24h", "sells_24h", "buy_sell_ratio",
-                "trade_count_24h", "unique_wallets_24h", "price_change_24h_pct", "score"
+                "volume_24h_usd", "volume_1h_usd", "volume_5m_usd",
+                "buys_24h", "sells_24h", "buy_sell_ratio", "buy_sell_ratio_1h",
+                "trade_count_24h", "trade_count_1h", "unique_wallets_24h",
+                "price_change_24h_pct", "price_change_1h_pct", "price_change_5m_pct",
+                "score", "score_components"
             )
         },
         "rugcheck_report": rugcheck,
