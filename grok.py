@@ -50,19 +50,35 @@ async def evaluate_token(token: dict, rugcheck_result: dict) -> dict:
 
     logger.info("AI screening request provider=%s model=%s symbol=%s", provider_name, model, token.get("symbol"))
     try:
-        async with httpx.AsyncClient(timeout=GROK_TIMEOUT_SECONDS, headers=headers) as client:
-            response = await client.post(url, json=body)
-            # Gemini may temporarily return 503 when a model is at capacity.
-            # Try one alternate stable Flash model; never relax any safety decision.
-            if provider == "gemini" and response.status_code == 503:
-                fallback_model = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.6-flash").strip()
-                if fallback_model and fallback_model != model:
-                    logger.warning("Gemini primary model unavailable; trying fallback model=%s", fallback_model)
-                    fallback_url = f"https://generativelanguage.googleapis.com/v1beta/models/{fallback_model}:generateContent"
-                    fallback_response = await client.post(fallback_url, json=body)
-                    if fallback_response.status_code != 503:
-                        response = fallback_response
-                        model = fallback_model
+        # Gemini can return transient 429/5xx responses during capacity spikes.
+        # Keep total retries bounded and preserve fail-closed behavior.
+        if provider == "gemini":
+            fallback_model = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.6-flash").strip()
+            fallback_model_2 = os.getenv("GEMINI_FALLBACK_MODEL_2", "gemini-3.5-flash-lite").strip()
+            model_chain = []
+            for candidate_model in (model, fallback_model, fallback_model_2):
+                if candidate_model and candidate_model not in model_chain:
+                    model_chain.append(candidate_model)
+            # Retry the primary once, then try two alternative supported Flash models.
+            attempts = [(model_chain[0], 0), (model_chain[0], 1)] + [(m, 0) for m in model_chain[1:]]
+            async with httpx.AsyncClient(timeout=min(float(GROK_TIMEOUT_SECONDS), 15.0), headers=headers) as client:
+                response = None
+                for attempt_index, (attempt_model, retry_index) in enumerate(attempts):
+                    attempt_url = f"https://generativelanguage.googleapis.com/v1beta/models/{attempt_model}:generateContent"
+                    if attempt_index:
+                        await __import__("asyncio").sleep(min(2 ** attempt_index, 8))
+                    logger.info("Gemini request attempt=%s/%s model=%s symbol=%s",
+                                attempt_index + 1, len(attempts), attempt_model, token.get("symbol"))
+                    response = await client.post(attempt_url, json=body)
+                    model = attempt_model
+                    if response.status_code not in {408, 429, 500, 502, 503, 504}:
+                        break
+                    if attempt_index == len(attempts) - 1:
+                        break
+                    logger.warning("Gemini transient HTTP %s; will retry/fallback", response.status_code)
+        else:
+            async with httpx.AsyncClient(timeout=GROK_TIMEOUT_SECONDS, headers=headers) as client:
+                response = await client.post(url, json=body)
         response.raise_for_status()
         payload = response.json()
         if provider == "gemini":
