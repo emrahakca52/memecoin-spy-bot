@@ -29,6 +29,9 @@ _last_jupiter_request = 0.0
 _cache = {"timestamp": 0.0, "candidates": [], "diagnostics": {}}
 _last_dexscreener_discovery = {}
 _last_geckoterminal_discovery = {}
+# Respect public-provider rate limits across scans instead of retrying every 180s.
+_provider_cooldowns = {"dexscreener": 0.0, "geckoterminal": 0.0}
+PROVIDER_429_COOLDOWN_SECONDS = max(60, int(os.getenv("PROVIDER_429_COOLDOWN_SECONDS", "300")))
 
 
 def _num(value: Any, default: float = 0.0) -> float:
@@ -282,8 +285,20 @@ async def _discover_dexscreener(client: httpx.AsyncClient) -> list[dict]:
     # Each discovery feed is optional: one unavailable feed must not disable fallback.
     for url in source_urls:
         feed = {"feed": url.rsplit("/", 1)[-1], "item_count": 0, "solana_tokens": 0, "error": None}
+        cooldown_remaining = _provider_cooldowns["dexscreener"] - time.monotonic()
+        if cooldown_remaining > 0:
+            feed["error"] = f"provider_cooldown_active:{int(cooldown_remaining)}s"
+            feed_diagnostics.append(feed)
+            break
         try:
             response = await client.get(url)
+            if response.status_code == 429:
+                retry_after = _num(response.headers.get("Retry-After"))
+                cooldown = max(PROVIDER_429_COOLDOWN_SECONDS, min(retry_after, 1800.0))
+                _provider_cooldowns["dexscreener"] = time.monotonic() + cooldown
+                feed["error"] = f"HTTP 429 rate limit; cooldown {int(cooldown)}s"
+                feed_diagnostics.append(feed)
+                break
             response.raise_for_status()
             items = response.json()
         except Exception as exc:
@@ -379,12 +394,24 @@ async def _discover_geckoterminal(client: httpx.AsyncClient) -> list[dict]:
     for endpoint in ("trending_pools", "new_pools"):
         url = f"https://api.geckoterminal.com/api/v2/networks/solana/{endpoint}"
         feed = {"feed": endpoint, "pool_count": 0, "error": None}
+        cooldown_remaining = _provider_cooldowns["geckoterminal"] - time.monotonic()
+        if cooldown_remaining > 0:
+            feed["error"] = f"provider_cooldown_active:{int(cooldown_remaining)}s"
+            diagnostics["feeds"].append(feed)
+            break
         try:
             response = await client.get(
                 url,
                 params={"include": "base_token"},
                 headers={"Accept": "application/json;version=20230203"},
             )
+            if response.status_code == 429:
+                retry_after = _num(response.headers.get("Retry-After"))
+                cooldown = max(PROVIDER_429_COOLDOWN_SECONDS, min(retry_after, 1800.0))
+                _provider_cooldowns["geckoterminal"] = time.monotonic() + cooldown
+                feed["error"] = f"HTTP 429 rate limit; cooldown {int(cooldown)}s"
+                diagnostics["feeds"].append(feed)
+                break
             response.raise_for_status()
             payload = response.json()
         except Exception as exc:
