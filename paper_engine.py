@@ -270,6 +270,12 @@ def open_paper_position(token_address, token_symbol="", amount_usd=10.0, price_u
 
 def _close_position(address, position, price, reason, change_pct):
     global _realized_pnl_usd
+    # Idempotency guard: concurrent price-update cycles may hold the same
+    # position reference across awaited provider calls. Only the cycle that
+    # still owns the currently-open position may book the exit.
+    if _open_positions.get(address) is not position:
+        logger.warning("Ignoring duplicate/stale close attempt for %s (%s)", address, reason)
+        return False
     qty = _num(position.get("quantity"))
     invested = _num(position.get("invested_usd"))
     if qty <= 0 or price <= 0:
