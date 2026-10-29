@@ -108,7 +108,7 @@ class ExtremeQuoteExitGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(paper_engine._paper_trades), 1)
         trade = paper_engine._paper_trades[0]
         self.assertEqual(trade["side"], "SELL")
-        self.assertEqual(trade["reason"], "stop_loss_5pct")
+        self.assertEqual(trade["reason"], "stop_loss")
         self.assertAlmostEqual(trade["price_usd"], 0.00102)
         self.assertAlmostEqual(trade["realized_pnl_usd"], -9.898)
 
