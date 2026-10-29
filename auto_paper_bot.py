@@ -40,6 +40,9 @@ _last_skipped = []
 _last_copyfomo_checks = []
 _last_momentum_observations = []
 _last_telegram_report = {"sent": False, "reason": "not_sent_yet", "at_utc": None}
+_scan_in_progress = False
+_scan_started_monotonic = None
+_last_scan_duration_seconds = None
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -164,10 +167,12 @@ def _daily_loss_exceeded() -> bool:
         return True
 
 async def _loop(stop_event):
-    global _last_run, _last_started, _last_error, _last_price_update, _last_scan, _last_skipped, _last_copyfomo_checks, _last_momentum_observations, _last_telegram_report
+    global _last_run, _last_started, _last_error, _last_price_update, _last_scan, _last_skipped, _last_copyfomo_checks, _last_momentum_observations, _last_telegram_report, _scan_in_progress, _scan_started_monotonic, _last_scan_duration_seconds
 
     while not stop_event.is_set():
         _last_started = _utc_now()
+        _scan_started_monotonic = asyncio.get_running_loop().time()
+        _scan_in_progress = True
         scan_checked = 0
         scan_candidate_count = 0
         scan_approved_count = 0
@@ -377,6 +382,10 @@ async def _loop(stop_event):
             logger.exception("Scan failed")
         finally:
             _last_run = _utc_now()
+            if _scan_started_monotonic is not None:
+                _last_scan_duration_seconds = round(max(0.0, asyncio.get_running_loop().time() - _scan_started_monotonic), 2)
+            _scan_in_progress = False
+            _scan_started_monotonic = None
             if isinstance(_last_scan, dict):
                 reason_counts = {}
                 for item in _last_skipped:
@@ -509,6 +518,8 @@ def bot_status():
         "stop_loss_pct": STOP_LOSS_PCT,
         "last_run_utc": _last_run,
         "last_started_utc": _last_started,
+        "scan_in_progress": _scan_in_progress,
+        "last_scan_duration_seconds": _last_scan_duration_seconds,
         "last_error": _last_error,
         "last_scan": _last_scan,
         "last_price_update": _last_price_update,
