@@ -452,6 +452,26 @@ async def market_chart(
     except (httpx.HTTPError, ValueError, TypeError) as exc:
         provider_diagnostics["jupiter_price"] = {"error": type(exc).__name__}
 
+    # Metadata fallback for DexScreener rate limits.
+    birdeye_overview = None
+    birdeye_key = os.getenv("BIRDEYE_API_KEY", "").strip()
+    if not pair_payload and birdeye_key:
+        try:
+            async with httpx.AsyncClient(timeout=timeout, headers={"X-API-KEY": birdeye_key, "x-chain": "solana", "accept": "application/json"}) as overview_client:
+                overview_response = await overview_client.get("https://public-api.birdeye.so/defi/token_overview", params={"address": token_address})
+            overview_response.raise_for_status()
+            overview_payload = overview_response.json()
+            overview_data = overview_payload.get("data") if isinstance(overview_payload, dict) else None
+            if isinstance(overview_data, dict):
+                birdeye_overview = overview_data
+            provider_diagnostics["birdeye_token_overview"] = {"status": overview_response.status_code, "has_data": isinstance(overview_data, dict)}
+        except (httpx.HTTPError, ValueError, TypeError) as exc:
+            diag = {"error": type(exc).__name__}
+            if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None:
+                diag["status"] = exc.response.status_code
+                diag["response_excerpt"] = exc.response.text[:200]
+            provider_diagnostics["birdeye_token_overview"] = diag
+
     if not pair_payload and not candles and not jupiter_price_data:
         raise HTTPException(
             status_code=502,
@@ -492,19 +512,23 @@ async def market_chart(
         signals.append("EMA9 is below EMA21")
 
     pair = pair_payload or {}
-    liquidity = _chart_num((pair.get("liquidity") or {}).get("usd"))
-    volume24 = _chart_num(((pair.get("volume") or {}).get("h24")))
+    overview = birdeye_overview or {}
+    liquidity = _chart_num((pair.get("liquidity") or {}).get("usd")) or _chart_num(overview.get("liquidity"))
+    volume24 = _chart_num(((pair.get("volume") or {}).get("h24"))) or _chart_num(overview.get("v24hUSD", overview.get("volume_24h_usd")))
+    symbol = (pair.get("baseToken") or {}).get("symbol") or overview.get("symbol")
+    name = (pair.get("baseToken") or {}).get("name") or overview.get("name")
+    overview_price_change = _chart_num(overview.get("priceChange24hPercent", overview.get("price_change_24h_percent")))
     return {
         "token_address": token_address,
-        "symbol": (pair.get("baseToken") or {}).get("symbol"),
-        "name": (pair.get("baseToken") or {}).get("name"),
+        "symbol": symbol,
+        "name": name,
         "mode": "paper",
         "real_trading_enabled": False,
         "as_of_utc": datetime.now(timezone.utc).isoformat(),
         "price_usd": current_price or None,
         "price_change_5m_pct": _chart_num((pair.get("priceChange") or {}).get("m5")) if pair else None,
         "price_change_1h_pct": _chart_num((pair.get("priceChange") or {}).get("h1")) if pair else None,
-        "price_change_24h_pct": (_chart_num((pair.get("priceChange") or {}).get("h24")) if pair else (_chart_num(jupiter_price_data.get("priceChange24h")) if jupiter_price_data else None)),
+        "price_change_24h_pct": (_chart_num((pair.get("priceChange") or {}).get("h24")) if pair else (overview_price_change if birdeye_overview else (_chart_num(jupiter_price_data.get("priceChange24h")) if jupiter_price_data else None))),
         "liquidity_usd": liquidity or None,
         "volume_24h_usd": volume24 or None,
         "candle_source": candle_source,
