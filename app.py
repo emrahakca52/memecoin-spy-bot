@@ -302,6 +302,24 @@ async def market_chart(
             provider_diagnostics["geckoterminal_pools"] = pool_error
             logger.warning("GeckoTerminal pool discovery failed for token %s: %s", token_address[:8], pool_error)
 
+        # If pool discovery is rate-limited, reuse the DexScreener pair address
+        # as a direct GeckoTerminal pool candidate when available.
+        if pair_payload:
+            pair_address = pair_payload.get("pairAddress")
+            if pair_address and not any(
+                ((item.get("attributes") or {}).get("address") == pair_address)
+                for item in ranked_pools
+            ):
+                base_address = str((pair_payload.get("baseToken") or {}).get("address") or "")
+                quote_address = str((pair_payload.get("quoteToken") or {}).get("address") or "")
+                ranked_pools.append({
+                    "attributes": {"address": pair_address, "reserve_in_usd": _chart_num((pair_payload.get("liquidity") or {}).get("usd"))},
+                    "relationships": {
+                        "base_token": {"data": {"id": "solana_" + base_address}},
+                        "quote_token": {"data": {"id": "solana_" + quote_address}},
+                    },
+                })
+
         candles = []
         candle_source = None
         ohlcv_attempts = []
@@ -354,6 +372,53 @@ async def market_chart(
                 ohlcv_attempts.append({"pool": pool_address, "token_side": token_side, "error": type(exc).__name__})
                 logger.warning("GeckoTerminal OHLCV request failed for token %s", token_address[:8])
         provider_diagnostics["geckoterminal_ohlcv"] = {"attempts": ohlcv_attempts, "candles_returned": len(candles)}
+
+        # Birdeye is a second real OHLCV source when its API key is configured.
+        # Never synthesize candles from current-price snapshots.
+        birdeye_key = os.getenv("BIRDEYE_API_KEY", "").strip()
+        if not candles and birdeye_key:
+            seconds_per_candle = {"minute": 60, "hour": 3600, "day": 86400}[timeframe] * aggregate
+            now_unix = int(datetime.now(timezone.utc).timestamp())
+            birdeye_type = f"{aggregate}m" if timeframe == "minute" else f"{aggregate}H" if timeframe == "hour" else f"{aggregate}D"
+            try:
+                response = await client.get(
+                    "https://public-api.birdeye.so/defi/ohlcv",
+                    params={"address": token_address, "type": birdeye_type, "time_from": now_unix - limit * seconds_per_candle, "time_to": now_unix},
+                    headers={"X-API-KEY": birdeye_key, "x-chain": "solana", "accept": "application/json"},
+                )
+                birdeye_diag = {"status": response.status_code, "type": birdeye_type}
+                response.raise_for_status()
+                payload = response.json()
+                raw_items = ((payload.get("data") or {}).get("items") or []) if isinstance(payload, dict) else []
+                parsed_candles = []
+                for item in raw_items if isinstance(raw_items, list) else []:
+                    if not isinstance(item, dict):
+                        continue
+                    timestamp = int(_chart_num(item.get("unixTime", item.get("time", -1)), -1))
+                    o = _chart_num(item.get("o", item.get("open")))
+                    h = _chart_num(item.get("h", item.get("high")))
+                    low = _chart_num(item.get("l", item.get("low")))
+                    close = _chart_num(item.get("c", item.get("close")))
+                    volume = _chart_num(item.get("v", item.get("volumeUsd", item.get("volume"))))
+                    if timestamp >= 0 and min(o, h, low, close) > 0:
+                        parsed_candles.append({
+                            "timestamp": datetime.fromtimestamp(timestamp, timezone.utc).isoformat(),
+                            "timestamp_unix": timestamp, "open": o, "high": h,
+                            "low": low, "close": close, "volume_usd": max(0.0, volume),
+                        })
+                if parsed_candles:
+                    parsed_candles.sort(key=lambda candle: candle["timestamp_unix"])
+                    candles = parsed_candles[-limit:]
+                    candle_source = "Birdeye OHLCV"
+                birdeye_diag["candles_returned"] = len(parsed_candles)
+                provider_diagnostics["birdeye_ohlcv"] = birdeye_diag
+            except (httpx.HTTPError, ValueError, TypeError, OverflowError) as exc:
+                birdeye_diag = {"error": type(exc).__name__, "type": birdeye_type}
+                if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None:
+                    birdeye_diag["status"] = exc.response.status_code
+                    birdeye_diag["response_excerpt"] = exc.response.text[:200]
+                provider_diagnostics["birdeye_ohlcv"] = birdeye_diag
+                logger.warning("Birdeye OHLCV request failed for token %s: %s", token_address[:8], birdeye_diag)
 
     # Final price-only fallback: Jupiter Price API v3. It does not provide candles,
     # so return the live USD mark with candle/indicator fields explicitly unavailable.
