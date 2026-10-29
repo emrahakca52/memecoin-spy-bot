@@ -1,7 +1,10 @@
 import math
 import unittest
 
-from app import (\n    _CHART_PROVIDER_COOLDOWNS, _chart_num, _chart_provider_cooldown_remaining,\n    _chart_set_provider_cooldown, _ema, _rsi,\n)
+from app import (
+    _CHART_PROVIDER_COOLDOWNS, _chart_num, _chart_provider_cooldown_remaining,
+    _chart_set_provider_cooldown, _ema, _rsi,
+)
 
 
 class ChartIndicatorRegressionTests(unittest.TestCase):
@@ -11,7 +14,15 @@ class ChartIndicatorRegressionTests(unittest.TestCase):
         self.assertEqual(_chart_num("not-a-number", 7.0), 7.0)
         self.assertEqual(_chart_num("12.5"), 12.5)
 
-    def test_rate_limit_cooldown_uses_bounded_retry_after(self):\n        _CHART_PROVIDER_COOLDOWNS.clear()\n        seconds = _chart_set_provider_cooldown("test", "120", now=100.0)\n        self.assertEqual(seconds, 120.0)\n        self.assertEqual(_chart_provider_cooldown_remaining("test", now=110.0), 110.0)\n        self.assertEqual(_chart_set_provider_cooldown("test", "999999", now=100.0), 1800.0)\n        self.assertEqual(_chart_set_provider_cooldown("test", "0", now=100.0), 60.0)\n\n    def test_ema_requires_enough_points_and_returns_finite_value(self):
+    def test_rate_limit_cooldown_uses_bounded_retry_after(self):
+        _CHART_PROVIDER_COOLDOWNS.clear()
+        seconds = _chart_set_provider_cooldown("test", "120", now=100.0)
+        self.assertEqual(seconds, 120.0)
+        self.assertEqual(_chart_provider_cooldown_remaining("test", now=110.0), 110.0)
+        self.assertEqual(_chart_set_provider_cooldown("test", "999999", now=100.0), 1800.0)
+        self.assertEqual(_chart_set_provider_cooldown("test", "0", now=100.0), 60.0)
+
+    def test_ema_requires_enough_points_and_returns_finite_value(self):
         self.assertIsNone(_ema([1.0, 2.0], 3))
         result = _ema([1.0, 2.0, 3.0, 4.0, 5.0], 3)
         self.assertIsNotNone(result)
