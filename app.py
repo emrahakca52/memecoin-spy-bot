@@ -11,7 +11,7 @@ from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from signal_engine import get_signal_candidates, get_signal_engine_status
-from wallet_tracker import get_wallet_stats
+from wallet_tracker import get_wallet_stats, get_wallet_token_activity
 from paper_engine import (
     get_paper_status as paper_status,
     get_paper_trades as list_paper_trades,
@@ -154,6 +154,23 @@ async def ai_diagnostic(x_diagnostic_token: str = Header(default="", alias="X-Di
         "reasons": result.get("reasons", []),
         "note": "This endpoint sends one small AI request and never scans tokens or opens positions.",
     }
+
+
+@app.get("/wallet/activity/{wallet_address}")
+async def wallet_activity(
+    wallet_address: str,
+    limit: int = Query(10, ge=1, le=20),
+):
+    """Read-only recent SPL token balance changes for a public wallet."""
+    try:
+        return await get_wallet_token_activity(wallet_address, limit=limit)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Solana RPC providers are temporarily unavailable.",
+        ) from exc
 
 
 @app.get("/signals")
