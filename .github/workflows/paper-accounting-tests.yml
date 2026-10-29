@@ -26,4 +26,4 @@ jobs:
           DATABASE_URL: ""
         run: python -m unittest discover -s tests -v
       - name: Check Python syntax
-        run: python -m py_compile paper_engine.py app.py auto_paper_bot.py telegram_notify.py
+        run: python -m py_compile app.py auto_paper_bot.py check.py config.py grok.py paper_engine.py rugcheck.py signal_engine.py telegram_notify.py wallet_tracker.py
