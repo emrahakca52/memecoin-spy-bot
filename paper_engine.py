@@ -276,6 +276,10 @@ def _close_position(address, position, price, reason, change_pct):
         return False
     proceeds = qty * price
     pnl = proceeds - invested
+    fee_pct = max(0.0, _num(PAPER_FEE_PCT_PER_SIDE))
+    slip_pct = max(0.0, _num(PAPER_SLIPPAGE_PCT_PER_SIDE))
+    exit_cost = proceeds * (fee_pct + slip_pct) / 100.0
+    entry_cost = _num(position.get("estimated_entry_cost_usd"))
     trade = {
         "token_address": address,
         "token_symbol": position.get("token_symbol"),
@@ -285,6 +289,10 @@ def _close_position(address, position, price, reason, change_pct):
         "source": "auto",
         "reason": reason,
         "realized_pnl_usd": round(pnl, 4),
+        "estimated_entry_cost_allocated_usd": round(entry_cost, 6),
+        "estimated_exit_cost_usd": round(exit_cost, 6),
+        "estimated_transaction_cost_usd": round(entry_cost + exit_cost, 6),
+        "net_realized_pnl_usd": round(pnl - entry_cost - exit_cost, 6),
         "change_pct": round(change_pct, 2),
         "timestamp": time.time(),
     }
@@ -370,8 +378,8 @@ def list_paper_trades():
 
 # --- Safety, accounting reconciliation, and conservative paper valuation ---
 _database_status = {}
-PAPER_FEE_PCT_PER_SIDE = float(os.getenv("PAPER_FEE_PCT_PER_SIDE", "0"))
-PAPER_SLIPPAGE_PCT_PER_SIDE = float(os.getenv("PAPER_SLIPPAGE_PCT_PER_SIDE", "0"))
+PAPER_FEE_PCT_PER_SIDE = max(0.0, _num(os.getenv("PAPER_FEE_PCT_PER_SIDE", "0.25"), 0.25))
+PAPER_SLIPPAGE_PCT_PER_SIDE = max(0.0, _num(os.getenv("PAPER_SLIPPAGE_PCT_PER_SIDE", "0.50"), 0.50))
 STALE_PRICE_THRESHOLD_SECONDS = max(60, int(os.getenv("STALE_PRICE_THRESHOLD_SECONDS", "900")))
 MAX_STOP_LOSS_OVERSHOOT_PCT = min(10.0, max(5.0, _num(os.getenv("MAX_STOP_LOSS_OVERSHOOT_PCT", 8.0), 8.0)))
 MAX_TAKE_PROFIT_OVERSHOOT_PCT = min(50.0, max(10.0, _num(os.getenv("MAX_TAKE_PROFIT_OVERSHOOT_PCT", 25.0), 25.0)))
@@ -533,21 +541,30 @@ def record_paper_trade(token_address, side, amount_usd, price_usd, token_symbol=
             raise ValueError(f"Insufficient paper cash: requested ${amount:.2f}, available ${max(0.0, available):.2f}")
     pos_before = _open_positions.get(token_address)
     entry_cost = _num((pos_before or {}).get("estimated_entry_cost_usd"))
+    # Allocate entry costs only to the fraction actually sold; partial exits must
+    # not charge the same entry cost repeatedly.
+    qty_before = _num((pos_before or {}).get("quantity"))
+    sell_qty_before = min(qty_before, amount / _num(price_usd)) if normalized_side == "SELL" and _num(price_usd) > 0 else 0.0
+    entry_cost_allocated = entry_cost * (sell_qty_before / qty_before) if qty_before > 0 else 0.0
     result = _ORIGINAL_RECORD_PAPER_TRADE(token_address, side, amount_usd, price_usd, token_symbol, source, reason)
     trade = result.get("trade", {})
     fee_pct = max(0.0, _num(PAPER_FEE_PCT_PER_SIDE))
     slip_pct = max(0.0, _num(PAPER_SLIPPAGE_PCT_PER_SIDE))
     cost_pct = (fee_pct + slip_pct) / 100.0
-    if str(side).upper() == "BUY":
+    if normalized_side == "BUY":
         pos = _open_positions.get(token_address)
         if pos is not None:
             pos["estimated_entry_cost_usd"] = round(_num(pos.get("estimated_entry_cost_usd")) + _num(amount_usd) * cost_pct, 6)
-    elif str(side).upper() == "SELL":
-        proceeds = _num(amount_usd)
+    elif normalized_side == "SELL":
+        proceeds = _num(trade.get("amount_usd", amount_usd))
         exit_cost = proceeds * cost_pct
+        trade["estimated_entry_cost_allocated_usd"] = round(entry_cost_allocated, 6)
         trade["estimated_exit_cost_usd"] = round(exit_cost, 6)
-        trade["estimated_transaction_cost_usd"] = round(exit_cost + entry_cost, 6)
-        trade["net_realized_pnl_usd"] = round(_num(trade.get("realized_pnl_usd")) - exit_cost - entry_cost, 6)
+        trade["estimated_transaction_cost_usd"] = round(exit_cost + entry_cost_allocated, 6)
+        trade["net_realized_pnl_usd"] = round(_num(trade.get("realized_pnl_usd")) - exit_cost - entry_cost_allocated, 6)
+        remaining_pos = _open_positions.get(token_address)
+        if remaining_pos is not None:
+            remaining_pos["estimated_entry_cost_usd"] = round(max(0.0, entry_cost - entry_cost_allocated), 6)
     _save_paper_state()
     return result
 
