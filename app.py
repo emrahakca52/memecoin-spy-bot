@@ -337,11 +337,11 @@ async def market_chart(
         jupiter_api_key = os.getenv("JUPITER_API_KEY", "").strip()
         if jupiter_api_key:
             jupiter_headers["x-api-key"] = jupiter_api_key
-        response = await client.get(
-            "https://api.jup.ag/price/v3",
-            params={"ids": token_address},
-            headers=jupiter_headers,
-        )
+        async with httpx.AsyncClient(timeout=timeout, headers=jupiter_headers) as jupiter_client:
+            response = await jupiter_client.get(
+                "https://api.jup.ag/price/v3",
+                params={"ids": token_address},
+            )
         provider_diagnostics["jupiter_price"] = {"status": response.status_code}
         response.raise_for_status()
         price_payload = response.json()
