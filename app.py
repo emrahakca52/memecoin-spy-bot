@@ -276,8 +276,7 @@ async def market_chart(
                 logger.exception("Unexpected DexScreener chart error")
 
         # GeckoTerminal supplies actual OHLCV candles; do not fabricate candles from snapshots.
-        pool_payload = None
-        pool_address = None
+        ranked_pools = []
         try:
             response = await client.get(
                 f"https://api.geckoterminal.com/api/v2/networks/solana/tokens/{token_address}/pools",
@@ -286,48 +285,68 @@ async def market_chart(
             provider_diagnostics["geckoterminal_pools"] = {"status": response.status_code}
             response.raise_for_status()
             pools_data = response.json().get("data", [])
-            if pools_data:
-                ranked_pools = sorted(
-                    [item for item in pools_data if isinstance(item, dict)],
-                    key=lambda item: _chart_num((item.get("attributes") or {}).get("reserve_in_usd")),
-                    reverse=True,
-                )
-                if ranked_pools:
-                    pool_address = (ranked_pools[0].get("attributes") or {}).get("address")
+            ranked_pools = sorted(
+                [item for item in pools_data if isinstance(item, dict)],
+                key=lambda item: _chart_num((item.get("attributes") or {}).get("reserve_in_usd")),
+                reverse=True,
+            )[:3]
+            provider_diagnostics["geckoterminal_pools"]["pools_found"] = len(pools_data)
         except (httpx.HTTPError, ValueError) as exc:
             provider_diagnostics["geckoterminal_pools"] = {"error": type(exc).__name__}
             logger.warning("GeckoTerminal pool discovery failed for token %s", token_address[:8])
 
         candles = []
         candle_source = None
-        if pool_address:
+        ohlcv_attempts = []
+        # Try up to three liquid pools. Select base/quote according to the actual
+        # token relationship, instead of always asking for the pool's base token.
+        for pool in ranked_pools:
+            attrs = pool.get("attributes") or {}
+            pool_address = attrs.get("address")
+            relationships = pool.get("relationships") or {}
+            base_id = str((((relationships.get("base_token") or {}).get("data") or {}).get("id")) or "")
+            quote_id = str((((relationships.get("quote_token") or {}).get("data") or {}).get("id")) or "")
+            if base_id.endswith("_" + token_address):
+                token_side = "base"
+            elif quote_id.endswith("_" + token_address):
+                token_side = "quote"
+            else:
+                token_side = "base"
+            if not pool_address:
+                continue
             try:
                 response = await client.get(
                     f"https://api.geckoterminal.com/api/v2/networks/solana/pools/{pool_address}/ohlcv/{timeframe}",
-                    params={"aggregate": aggregate, "limit": limit, "currency": "usd", "token": "base"},
+                    params={"aggregate": aggregate, "limit": limit, "currency": "usd", "token": token_side},
                 )
-                provider_diagnostics["geckoterminal_ohlcv"] = {"status": response.status_code}
+                attempt = {"pool": pool_address, "token_side": token_side, "status": response.status_code}
+                ohlcv_attempts.append(attempt)
                 response.raise_for_status()
                 payload = response.json()
                 ohlcv = ((payload.get("data") or {}).get("attributes") or {}).get("ohlcv_list", [])
+                parsed_candles = []
                 for row in ohlcv if isinstance(ohlcv, list) else []:
                     if not isinstance(row, list) or len(row) < 6:
                         continue
                     timestamp = int(_chart_num(row[0], -1))
                     o, h, low, close, volume = map(_chart_num, row[1:6])
                     if timestamp >= 0 and min(o, h, low, close) > 0:
-                        candles.append({
+                        parsed_candles.append({
                             "timestamp": datetime.fromtimestamp(timestamp, timezone.utc).isoformat(),
                             "timestamp_unix": timestamp,
                             "open": o, "high": h, "low": low, "close": close,
                             "volume_usd": max(0.0, volume),
                         })
-                candles.sort(key=lambda candle: candle["timestamp_unix"])
-                if candles:
+                if parsed_candles:
+                    candles = parsed_candles
+                    candles.sort(key=lambda candle: candle["timestamp_unix"])
                     candle_source = "GeckoTerminal OHLCV"
+                    break
+                attempt["candles_returned"] = 0
             except (httpx.HTTPError, ValueError, TypeError, OverflowError) as exc:
-                provider_diagnostics["geckoterminal_ohlcv"] = {"error": type(exc).__name__}
+                ohlcv_attempts.append({"pool": pool_address, "token_side": token_side, "error": type(exc).__name__})
                 logger.warning("GeckoTerminal OHLCV request failed for token %s", token_address[:8])
+        provider_diagnostics["geckoterminal_ohlcv"] = {"attempts": ohlcv_attempts, "candles_returned": len(candles)}
 
     # Final price-only fallback: Jupiter Price API v3. It does not provide candles,
     # so return the live USD mark with candle/indicator fields explicitly unavailable.
@@ -422,6 +441,7 @@ async def market_chart(
             "signals": signals,
         },
         "chart_data_warning": None if candles else "Price snapshot may be available, but real OHLCV candles are currently unavailable. No synthetic candles were generated.",
+        "provider_diagnostics": provider_diagnostics,
     }
 
 
