@@ -329,19 +329,43 @@ async def market_chart(
                 provider_diagnostics["geckoterminal_ohlcv"] = {"error": type(exc).__name__}
                 logger.warning("GeckoTerminal OHLCV request failed for token %s", token_address[:8])
 
-    if not pair_payload and not candles:
+    # Final price-only fallback: Jupiter Price API v3. It does not provide candles,
+    # so return the live USD mark with candle/indicator fields explicitly unavailable.
+    jupiter_price_data = None
+    try:
+        jupiter_headers = {"accept": "application/json", "user-agent": "MemecoinSpyPro/1.0"}
+        jupiter_api_key = os.getenv("JUPITER_API_KEY", "").strip()
+        if jupiter_api_key:
+            jupiter_headers["x-api-key"] = jupiter_api_key
+        response = await client.get(
+            "https://api.jup.ag/price/v3",
+            params={"ids": token_address},
+            headers=jupiter_headers,
+        )
+        provider_diagnostics["jupiter_price"] = {"status": response.status_code}
+        response.raise_for_status()
+        price_payload = response.json()
+        item = price_payload.get(token_address, {}) if isinstance(price_payload, dict) else {}
+        if isinstance(item, dict) and _chart_num(item.get("usdPrice")) > 0:
+            jupiter_price_data = item
+    except (httpx.HTTPError, ValueError, TypeError) as exc:
+        provider_diagnostics["jupiter_price"] = {"error": type(exc).__name__}
+
+    if not pair_payload and not candles and not jupiter_price_data:
         raise HTTPException(
             status_code=502,
             detail={
-                "message": "Live market data is temporarily unavailable from providers.",
+                "message": "Live market data is temporarily unavailable from all price providers.",
                 "providers": provider_diagnostics,
-                "hint": "If providers report 429, wait and retry; if they report 404/422, check the token address or candle timeframe.",
+                "hint": "Check provider HTTP statuses; 429 means rate limiting, while a missing Jupiter price can mean no reliable recent market price.",
             },
         )
 
     closes = [candle["close"] for candle in candles]
     volumes = [candle["volume_usd"] for candle in candles]
     current_price = _chart_num((pair_payload or {}).get("priceUsd"))
+    if current_price <= 0 and jupiter_price_data:
+        current_price = _chart_num(jupiter_price_data.get("usdPrice"))
     if current_price <= 0 and closes:
         current_price = closes[-1]
     avg_volume = sum(volumes[-20:]) / len(volumes[-20:]) if volumes else None
@@ -379,7 +403,7 @@ async def market_chart(
         "price_usd": current_price or None,
         "price_change_5m_pct": _chart_num((pair.get("priceChange") or {}).get("m5")) if pair else None,
         "price_change_1h_pct": _chart_num((pair.get("priceChange") or {}).get("h1")) if pair else None,
-        "price_change_24h_pct": _chart_num((pair.get("priceChange") or {}).get("h24")) if pair else None,
+        "price_change_24h_pct": (_chart_num((pair.get("priceChange") or {}).get("h24")) if pair else (_chart_num(jupiter_price_data.get("priceChange24h")) if jupiter_price_data else None)),
         "liquidity_usd": liquidity or None,
         "volume_24h_usd": volume24 or None,
         "candle_source": candle_source,
