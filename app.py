@@ -5,6 +5,7 @@ import logging
 import math
 import os
 import re
+import time
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Query
@@ -191,6 +192,28 @@ async def signals(
         raise HTTPException(status_code=502, detail="Could not reach market data provider.") from exc
 
 
+# Process-local cooldowns prevent repeated requests from hammering providers after HTTP 429.
+_CHART_PROVIDER_COOLDOWNS = {}
+
+
+def _chart_provider_cooldown_remaining(provider, now=None):
+    now = time.monotonic() if now is None else now
+    return max(0.0, _CHART_PROVIDER_COOLDOWNS.get(provider, 0.0) - now)
+
+
+def _chart_set_provider_cooldown(provider, retry_after=None, now=None):
+    now = time.monotonic() if now is None else now
+    try:
+        seconds = float(retry_after)
+    except (TypeError, ValueError, OverflowError):
+        seconds = 60.0
+    if not math.isfinite(seconds) or seconds <= 0:
+        seconds = 60.0
+    seconds = min(1800.0, max(5.0, seconds))
+    _CHART_PROVIDER_COOLDOWNS[provider] = now + seconds
+    return seconds
+
+
 def _chart_num(value, default=0.0):
     try:
         number = float(value)
@@ -247,10 +270,15 @@ async def market_chart(
             f"https://api.dexscreener.com/tokens/v1/solana/{token_address}",
             f"https://api.dexscreener.com/latest/dex/tokens/{token_address}",
         ):
+            cooldown = _chart_provider_cooldown_remaining("dexscreener")
+            if cooldown > 0:
+                provider_diagnostics["dexscreener"].append({"skipped": "rate_limit_cooldown", "retry_in_seconds": round(cooldown, 1)})
+                break
             try:
                 response = await client.get(url)
                 if response.status_code == 429:
-                    provider_diagnostics["dexscreener"].append({"status": 429, "endpoint": url.rsplit("/", 1)[-1]})
+                    seconds = _chart_set_provider_cooldown("dexscreener", response.headers.get("retry-after"))
+                    provider_diagnostics["dexscreener"].append({"status": 429, "endpoint": url.rsplit("/", 1)[-1], "cooldown_seconds": seconds})
                     continue
                 response.raise_for_status()
                 payload = response.json()
@@ -278,13 +306,24 @@ async def market_chart(
         # GeckoTerminal supplies actual OHLCV candles; do not fabricate candles from snapshots.
         ranked_pools = []
         try:
-            response = await client.get(
-                f"https://api.geckoterminal.com/api/v2/networks/solana/tokens/{token_address}/pools",
-                params={"page": 1},
-            )
-            provider_diagnostics["geckoterminal_pools"] = {"status": response.status_code}
-            response.raise_for_status()
-            pools_data = response.json().get("data", [])
+            pool_cooldown = _chart_provider_cooldown_remaining("geckoterminal")
+            if pool_cooldown > 0:
+                provider_diagnostics["geckoterminal_pools"] = {"skipped": "rate_limit_cooldown", "retry_in_seconds": round(pool_cooldown, 1)}
+                response = None
+            else:
+                response = await client.get(
+                    f"https://api.geckoterminal.com/api/v2/networks/solana/tokens/{token_address}/pools",
+                    params={"page": 1},
+                )
+            if response is None:
+                pools_data = []
+            else:
+                provider_diagnostics["geckoterminal_pools"] = {"status": response.status_code}
+                if response.status_code == 429:
+                    cooldown_seconds = _chart_set_provider_cooldown("geckoterminal", response.headers.get("retry-after"))
+                    provider_diagnostics["geckoterminal_pools"]["cooldown_seconds"] = cooldown_seconds
+                response.raise_for_status()
+                pools_data = response.json().get("data", [])
             ranked_pools = sorted(
                 [item for item in pools_data if isinstance(item, dict)],
                 key=lambda item: _chart_num((item.get("attributes") or {}).get("reserve_in_usd")),
