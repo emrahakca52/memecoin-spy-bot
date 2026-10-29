@@ -61,12 +61,12 @@ async def evaluate_token(token: dict, rugcheck_result: dict) -> dict:
                     model_chain.append(candidate_model)
             # Retry the primary once, then try two alternative supported Flash models.
             attempts = [(model_chain[0], 0), (model_chain[0], 1)] + [(m, 0) for m in model_chain[1:]]
-            async with httpx.AsyncClient(timeout=min(float(GROK_TIMEOUT_SECONDS), 15.0), headers=headers) as client:
+            async with httpx.AsyncClient(timeout=min(float(GROK_TIMEOUT_SECONDS), 12.0), headers=headers) as client:
                 response = None
                 for attempt_index, (attempt_model, retry_index) in enumerate(attempts):
                     attempt_url = f"https://generativelanguage.googleapis.com/v1beta/models/{attempt_model}:generateContent"
                     if attempt_index:
-                        await __import__("asyncio").sleep(min(2 ** attempt_index, 8))
+                        await __import__("asyncio").sleep(min(2 ** attempt_index, 4))
                     logger.info("Gemini request attempt=%s/%s model=%s symbol=%s",
                                 attempt_index + 1, len(attempts), attempt_model, token.get("symbol"))
                     response = await client.post(attempt_url, json=body)
