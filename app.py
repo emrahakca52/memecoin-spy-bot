@@ -399,7 +399,8 @@ async def market_chart(
                     h = _chart_num(item.get("h", item.get("high")))
                     low = _chart_num(item.get("l", item.get("low")))
                     close = _chart_num(item.get("c", item.get("close")))
-                    volume = _chart_num(item.get("v", item.get("volumeUsd", item.get("volume"))))
+                    # OHLCV volume must be USD-denominated for the response schema.
+                    volume = _chart_num(item.get("vUsd", item.get("volumeUsd", item.get("volume_usd"))))
                     if timestamp >= 0 and min(o, h, low, close) > 0:
                         parsed_candles.append({
                             "timestamp": datetime.fromtimestamp(timestamp, timezone.utc).isoformat(),
