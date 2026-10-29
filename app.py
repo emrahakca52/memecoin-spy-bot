@@ -292,8 +292,15 @@ async def market_chart(
             )[:3]
             provider_diagnostics["geckoterminal_pools"]["pools_found"] = len(pools_data)
         except (httpx.HTTPError, ValueError) as exc:
-            provider_diagnostics["geckoterminal_pools"] = {"error": type(exc).__name__}
-            logger.warning("GeckoTerminal pool discovery failed for token %s", token_address[:8])
+            pool_error = {"error": type(exc).__name__}
+            if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None:
+                pool_error["status"] = exc.response.status_code
+                pool_error["response_excerpt"] = exc.response.text[:240]
+                pool_error["retry_after"] = exc.response.headers.get("retry-after")
+            elif isinstance(exc, httpx.RequestError):
+                pool_error["message"] = str(exc)[:240]
+            provider_diagnostics["geckoterminal_pools"] = pool_error
+            logger.warning("GeckoTerminal pool discovery failed for token %s: %s", token_address[:8], pool_error)
 
         candles = []
         candle_source = None
