@@ -181,6 +181,52 @@ class PaperExecutionCostTests(unittest.TestCase):
         self.assertAlmostEqual(sell["estimated_transaction_cost_usd"], 0.063)
 
 
+class PartialExitCostAllocationTests(unittest.TestCase):
+    def setUp(self):
+        self.positions = paper_engine._open_positions
+        self.trades = paper_engine._paper_trades
+        self.realized = paper_engine._realized_pnl_usd
+        paper_engine._open_positions = {}
+        paper_engine._paper_trades = []
+        paper_engine._realized_pnl_usd = 0.0
+
+    def tearDown(self):
+        paper_engine._open_positions = self.positions
+        paper_engine._paper_trades = self.trades
+        paper_engine._realized_pnl_usd = self.realized
+
+    def test_partial_sell_allocates_only_proportional_entry_cost(self):
+        with (
+            patch.object(paper_engine, "_save_paper_state", return_value=True),
+            patch.object(paper_engine, "PAPER_FEE_PCT_PER_SIDE", 0.25),
+            patch.object(paper_engine, "PAPER_SLIPPAGE_PCT_PER_SIDE", 0.50),
+        ):
+            paper_engine.open_paper_position("partial-token", "PART", 10.0, 1.0)
+            paper_engine.record_paper_trade("partial-token", "SELL", 6.0, 1.2, "PART")
+        trade = paper_engine._paper_trades[-1]
+        self.assertAlmostEqual(trade["estimated_entry_cost_allocated_usd"], 0.0375)
+        self.assertAlmostEqual(trade["estimated_exit_cost_usd"], 0.045)
+        self.assertAlmostEqual(trade["net_realized_pnl_usd"], 0.9175)
+        self.assertAlmostEqual(paper_engine._open_positions["partial-token"]["estimated_entry_cost_usd"], 0.0375)
+
+    def test_automatic_exit_records_estimated_net_pnl(self):
+        pos = {
+            "token_symbol": "AUTO", "quantity": 10.0, "invested_usd": 10.0,
+            "estimated_entry_cost_usd": 0.075,
+        }
+        with (
+            patch.object(paper_engine, "_save_paper_state", return_value=True),
+            patch.object(paper_engine, "PAPER_FEE_PCT_PER_SIDE", 0.25),
+            patch.object(paper_engine, "PAPER_SLIPPAGE_PCT_PER_SIDE", 0.50),
+        ):
+            closed = paper_engine._close_position("auto-token", pos, 1.1, "take_profit", 10.0)
+        self.assertTrue(closed)
+        trade = paper_engine._paper_trades[-1]
+        self.assertAlmostEqual(trade["realized_pnl_usd"], 1.0)
+        self.assertAlmostEqual(trade["estimated_exit_cost_usd"], 0.0825)
+        self.assertAlmostEqual(trade["net_realized_pnl_usd"], 0.8425)
+
+
 class StalePriceMarkTests(unittest.TestCase):
     def test_stale_mark_is_excluded_from_current_valuation(self):
         original_positions = paper_engine._open_positions
