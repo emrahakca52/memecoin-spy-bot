@@ -365,6 +365,10 @@ async def market_chart(
         # Try up to three liquid pools. Select base/quote according to the actual
         # token relationship, instead of always asking for the pool's base token.
         for pool in ranked_pools:
+            pool_cooldown = _chart_provider_cooldown_remaining("geckoterminal")
+            if pool_cooldown > 0:
+                ohlcv_attempts.append({"skipped": "rate_limit_cooldown", "retry_in_seconds": round(pool_cooldown, 1)})
+                break
             attrs = pool.get("attributes") or {}
             pool_address = attrs.get("address")
             relationships = pool.get("relationships") or {}
@@ -385,6 +389,8 @@ async def market_chart(
                 )
                 attempt = {"pool": pool_address, "token_side": token_side, "status": response.status_code}
                 ohlcv_attempts.append(attempt)
+                if response.status_code == 429:
+                    attempt["cooldown_seconds"] = _chart_set_provider_cooldown("geckoterminal", response.headers.get("retry-after"))
                 response.raise_for_status()
                 payload = response.json()
                 ohlcv = ((payload.get("data") or {}).get("attributes") or {}).get("ohlcv_list", [])
