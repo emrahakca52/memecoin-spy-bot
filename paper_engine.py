@@ -150,15 +150,34 @@ async def _fetch_geckoterminal_price(token_address: str) -> float | None:
         logger.debug("GeckoTerminal price fallback failed for %s: %s", token_address, exc)
     return None
 
+async def _fetch_jupiter_price(token_address: str) -> float | None:
+    """Third-party fallback: Jupiter Price API v3, returning only fresh positive USD marks."""
+    url = "https://api.jup.ag/price/v3"
+    headers = {"accept": "application/json", "user-agent": "MemecoinSpyPro/1.0"}
+    api_key = os.getenv("JUPITER_API_KEY", "").strip()
+    if api_key:
+        headers["x-api-key"] = api_key
+    try:
+        async with httpx.AsyncClient(timeout=8, headers=headers) as client:
+            response = await client.get(url, params={"ids": token_address})
+            response.raise_for_status()
+            payload = response.json()
+        item = payload.get(token_address, {}) if isinstance(payload, dict) else {}
+        price = _num(item.get("usdPrice")) if isinstance(item, dict) else 0.0
+        if price > 0:
+            return price
+    except Exception as exc:
+        logger.debug("Jupiter price fallback failed for %s: %s", token_address, type(exc).__name__)
+    return None
+
+
 async def get_token_price_usd(token_address: str) -> float | None:
-    # Both providers return normalized USD prices; never substitute a stale scan
-    # price for a live observation because that would fake momentum confirmation.
-    price = await _fetch_dexscreener_price(token_address)
-    if price is not None and price > 0:
-        return price
-    price = await _fetch_geckoterminal_price(token_address)
-    if price is not None and price > 0:
-        return price
+    # Use independent providers in sequence; never substitute a stale scan price
+    # for a live observation because that would fake momentum confirmation.
+    for provider in (_fetch_dexscreener_price, _fetch_geckoterminal_price, _fetch_jupiter_price):
+        price = await provider(token_address)
+        if price is not None and price > 0:
+            return price
     logger.warning("No reliable USD price available for %s; skipping paper entry/mark", token_address)
     return None
 
