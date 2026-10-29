@@ -380,10 +380,19 @@ async def market_chart(
             seconds_per_candle = {"minute": 60, "hour": 3600, "day": 86400}[timeframe] * aggregate
             now_unix = int(datetime.now(timezone.utc).timestamp())
             birdeye_type = f"{aggregate}m" if timeframe == "minute" else f"{aggregate}H" if timeframe == "hour" else f"{aggregate}D"
+            # Birdeye v3 uses 1m/5m/15m, 1H/2H/etc, and 1D/3D interval labels.
             try:
                 response = await client.get(
-                    "https://public-api.birdeye.so/defi/ohlcv",
-                    params={"address": token_address, "type": birdeye_type, "time_from": now_unix - limit * seconds_per_candle, "time_to": now_unix},
+                    "https://public-api.birdeye.so/defi/v3/ohlcv",
+                    params={
+                        "address": token_address,
+                        "type": birdeye_type,
+                        "currency": "usd",
+                        "time_from": now_unix - limit * seconds_per_candle,
+                        "time_to": now_unix,
+                        "mode": "range",
+                        "padding": "false",
+                    },
                     headers={"X-API-KEY": birdeye_key, "x-chain": "solana", "accept": "application/json"},
                 )
                 birdeye_diag = {"status": response.status_code, "type": birdeye_type}
@@ -394,13 +403,13 @@ async def market_chart(
                 for item in raw_items if isinstance(raw_items, list) else []:
                     if not isinstance(item, dict):
                         continue
-                    timestamp = int(_chart_num(item.get("unixTime", item.get("time", -1)), -1))
+                    timestamp = int(_chart_num(item.get("unix_time", item.get("unixTime", item.get("time", -1))), -1))
                     o = _chart_num(item.get("o", item.get("open")))
                     h = _chart_num(item.get("h", item.get("high")))
                     low = _chart_num(item.get("l", item.get("low")))
                     close = _chart_num(item.get("c", item.get("close")))
                     # OHLCV volume must be USD-denominated for the response schema.
-                    volume = _chart_num(item.get("vUsd", item.get("volumeUsd", item.get("volume_usd"))))
+                    volume = _chart_num(item.get("v_usd", item.get("vUsd", item.get("volumeUsd", item.get("volume_usd")))))
                     if timestamp >= 0 and min(o, h, low, close) > 0:
                         parsed_candles.append({
                             "timestamp": datetime.fromtimestamp(timestamp, timezone.utc).isoformat(),
