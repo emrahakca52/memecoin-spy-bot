@@ -398,8 +398,8 @@ async def _loop(stop_event):
                 _last_scan_duration_seconds = round(max(0.0, asyncio.get_running_loop().time() - _scan_started_monotonic), 2)
             _scan_in_progress = False
             _scan_started_monotonic = None
+            reason_counts = {}
             if isinstance(_last_scan, dict):
-                reason_counts = {}
                 for item in _last_skipped:
                     reason = str(item.get("reason") or "unknown")
                     reason_counts[reason] = reason_counts.get(reason, 0) + 1
