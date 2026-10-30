@@ -26,7 +26,10 @@ CACHE_SECONDS = int(os.getenv("SIGNAL_CACHE_SECONDS", "150"))
 _lock = asyncio.Lock()
 _jupiter_lock = asyncio.Lock()
 _last_jupiter_request = 0.0
+_jupiter_cooldown_until = 0.0
 _cache = {"timestamp": 0.0, "candidates": [], "diagnostics": {}}
+JUPITER_429_COOLDOWN_SECONDS = max(60, int(os.getenv("JUPITER_429_COOLDOWN_SECONDS", "300")))
+JUPITER_MAX_RETRIES = max(0, min(2, int(os.getenv("JUPITER_MAX_RETRIES", "1"))))
 _last_dexscreener_discovery = {}
 _last_geckoterminal_discovery = {}
 # Respect public-provider rate limits across scans instead of retrying every 180s.
@@ -106,17 +109,31 @@ def _candidate_score(candidate: dict, min_liq: float, min_vol: float) -> tuple[f
 
 
 async def _jupiter_get(client: httpx.AsyncClient, path: str, params: dict | None = None):
-    """Respect keyless Jupiter's documented 0.5 requests/second rate limit."""
-    global _last_jupiter_request
+    """Rate-limit Jupiter calls, honor Retry-After, and back off on transient errors."""
+    global _last_jupiter_request, _jupiter_cooldown_until
     async with _jupiter_lock:
-        wait = JUPITER_MIN_INTERVAL_SECONDS - (time.monotonic() - _last_jupiter_request)
-        if wait > 0:
-            await asyncio.sleep(wait)
+        now = time.monotonic()
+        if now < _jupiter_cooldown_until:
+            remaining = int(_jupiter_cooldown_until - now)
+            raise RuntimeError(f"Jupiter provider cooldown active:{remaining}s")
         headers = {"x-api-key": JUPITER_API_KEY} if JUPITER_API_KEY else {}
-        response = await client.get(f"{JUPITER_BASE_URL}{path}", params=params, headers=headers)
-        _last_jupiter_request = time.monotonic()
-        response.raise_for_status()
-        return response.json()
+        for attempt in range(JUPITER_MAX_RETRIES + 1):
+            wait = JUPITER_MIN_INTERVAL_SECONDS - (time.monotonic() - _last_jupiter_request)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            response = await client.get(f"{JUPITER_BASE_URL}{path}", params=params, headers=headers)
+            _last_jupiter_request = time.monotonic()
+            if response.status_code == 429:
+                retry_after = _num(response.headers.get("Retry-After"))
+                cooldown = max(JUPITER_429_COOLDOWN_SECONDS, min(retry_after, 1800.0))
+                _jupiter_cooldown_until = time.monotonic() + cooldown
+                raise RuntimeError(f"Jupiter HTTP 429; cooldown {int(cooldown)}s")
+            if response.status_code in (500, 502, 503, 504) and attempt < JUPITER_MAX_RETRIES:
+                await asyncio.sleep(min(8.0, 2.0 ** attempt))
+                continue
+            response.raise_for_status()
+            return response.json()
+        raise RuntimeError("Jupiter request retries exhausted")
 
 
 def _jupiter_candidates(tokens: Any) -> list[dict]:
@@ -216,6 +233,10 @@ async def _discover_jupiter(client: httpx.AsyncClient) -> list[dict]:
     feed_diagnostics = []
     for path, label in endpoints:
         feed = {"feed": label, "count": 0, "error": None}
+        if time.monotonic() < _jupiter_cooldown_until:
+            feed["error"] = f"provider_cooldown_active:{int(_jupiter_cooldown_until - time.monotonic())}s"
+            feed_diagnostics.append(feed)
+            break
         try:
             data = await _jupiter_get(client, path)
             parsed = _jupiter_candidates(data)
