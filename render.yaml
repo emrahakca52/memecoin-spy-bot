@@ -1,9 +1,7 @@
 services:
   - type: web
-    name: memecoin-spy-bot
+    name: xauusd-signal-bot
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    startCommand: uvicorn xauusd_bot.main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
-    # Configure secrets and DATABASE_URL in Render's dashboard.
-    # Do not define a new database here; preserve the existing database.
