@@ -1,5 +1,6 @@
 import os
 import time
+import asyncio
 import logging
 from datetime import datetime, timezone
 
@@ -73,7 +74,7 @@ def run():
                     if direction in ("BUY", "SELL"):
                         signals.append((symbol, result))
                         if _last_direction.get(symbol) != direction:
-                            sent = send_telegram(result, symbol, "MT5 broker feed")
+                            sent = asyncio.run(send_telegram(result, symbol, "MT5 broker feed"))
                             if sent:
                                 _last_direction[symbol] = direction
                     else:
