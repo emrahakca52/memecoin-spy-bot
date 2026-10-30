@@ -211,9 +211,11 @@ class PartialExitCostAllocationTests(unittest.TestCase):
 
     def test_automatic_exit_records_estimated_net_pnl(self):
         pos = {
+            "token_address": "auto-token",
             "token_symbol": "AUTO", "quantity": 10.0, "invested_usd": 10.0,
             "estimated_entry_cost_usd": 0.075,
         }
+        paper_engine._open_positions["auto-token"] = pos
         with (
             patch.object(paper_engine, "_save_paper_state", return_value=True),
             patch.object(paper_engine, "PAPER_FEE_PCT_PER_SIDE", 0.25),
@@ -225,6 +227,22 @@ class PartialExitCostAllocationTests(unittest.TestCase):
         self.assertAlmostEqual(trade["realized_pnl_usd"], 1.0)
         self.assertAlmostEqual(trade["estimated_exit_cost_usd"], 0.0825)
         self.assertAlmostEqual(trade["net_realized_pnl_usd"], 0.8425)
+
+    def test_stale_position_cannot_be_closed_twice(self):
+        pos = {
+            "token_address": "duplicate-token",
+            "token_symbol": "DUP", "quantity": 10.0, "invested_usd": 10.0,
+            "estimated_entry_cost_usd": 0.075,
+        }
+        paper_engine._open_positions["duplicate-token"] = pos
+        with patch.object(paper_engine, "_save_paper_state", return_value=True):
+            first = paper_engine._close_position("duplicate-token", pos, 0.9, "stop_loss", -10.0)
+            second = paper_engine._close_position("duplicate-token", pos, 0.9, "stop_loss", -10.0)
+
+        self.assertTrue(first)
+        self.assertFalse(second)
+        self.assertEqual(len(paper_engine._paper_trades), 1)
+        self.assertAlmostEqual(paper_engine._realized_pnl_usd, -1.0)
 
 
 class StalePriceMarkTests(unittest.TestCase):
