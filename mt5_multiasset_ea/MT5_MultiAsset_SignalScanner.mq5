@@ -7,7 +7,7 @@
 #property description "Scans broker symbols and sends manual-trading zones. Never places orders."
 
 input int    ScanEverySeconds = 300;
-input int    MaxSymbolsPerScan = 250;
+input int    MaxSymbolsPerScan = 0; // 0 = scan all broker symbols
 input int    FastEMA = 20;
 input int    SlowEMA = 50;
 input int    RSIPeriod = 14;
@@ -160,7 +160,16 @@ void AnalyzeSymbol(const string symbol)
       "\nM5 RSI: "+DoubleToString(rsi,1)+" | Puan: "+IntegerToString(score)+
       "\nNot: Analiz sinyalidir; emir acilmaz. Spread ve haberleri kontrol et.";
    Print(msg);
-   if(EnablePush) SendNotification(msg);
+   if(EnablePush)
+   {
+      string push="MT5 | "+symbol+" "+side+
+         " | Giris "+PriceText(symbol,entry-zone)+"-"+PriceText(symbol,entry+zone)+
+         " | SL "+PriceText(symbol,sl)+
+         " | TP1 "+PriceText(symbol,tp1)+
+         " | TP2 "+PriceText(symbol,tp2)+
+         " | Puan "+IntegerToString(score);
+      SendNotification(push); // Keep push text short for MT5 notification limits.
+   }
    if(EnableTelegram) SendTelegram(msg);
    RememberSignal(symbol,direction);
 }
@@ -168,7 +177,7 @@ void AnalyzeSymbol(const string symbol)
 void ScanAllSymbols()
 {
    int total=SymbolsTotal(false);
-   int limit=MathMin(total,MaxSymbolsPerScan);
+   int limit=total;\n   if(MaxSymbolsPerScan>0) limit=MathMin(total,MaxSymbolsPerScan);
    int scanned=0;
    for(int i=0;i<total && scanned<limit;i++)
    {
@@ -178,12 +187,12 @@ void ScanAllSymbols()
       scanned++;
    }
    Print("Tarama tamamlandi. Terminal sembol sayisi=",total,
-         " | Bu tur taranan=",scanned);
+         " | Bu tur taranan=",scanned,\n         " | Limit=",(MaxSymbolsPerScan==0 ? "TUMU" : IntegerToString(MaxSymbolsPerScan)));
 }
 
 int OnInit()
 {
-   if(ScanEverySeconds<30 || MaxSymbolsPerScan<1)
+   if(ScanEverySeconds<30 || MaxSymbolsPerScan<0)
       return INIT_PARAMETERS_INCORRECT;
    EventSetTimer(ScanEverySeconds);
    Print("MT5 Multi-Asset Signal Scanner basladi. Emir gonderme ozelligi yok.");
