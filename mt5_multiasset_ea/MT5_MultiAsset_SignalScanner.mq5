@@ -13,6 +13,7 @@ input int    SlowEMA = 50;
 input int    RSIPeriod = 14;
 input int    ATRPeriod = 14;
 input double MinATRPoints = 0;
+input double MaxSpreadToATR = 0.25; // Skip symbols whose spread exceeds 25% of M5 ATR; 0 disables
 input bool   EnablePush = true;
 input bool   EnableTelegram = false;
 input string TelegramBotToken = "";
@@ -125,6 +126,8 @@ void AnalyzeSymbol(const string symbol)
 
    double point=SymbolInfoDouble(symbol,SYMBOL_POINT);
    if(point<=0 || (MinATRPoints>0 && atr/point<MinATRPoints)) return;
+   double spread=tick.ask-tick.bid;
+   if(MaxSpreadToATR>0 && spread>atr*MaxSpreadToATR) return;
 
    int buyScore=0,sellScore=0;
    if(f>s) buyScore++; else if(f<s) sellScore++;
@@ -194,10 +197,10 @@ void ScanAllSymbols()
 
 int OnInit()
 {
-   if(ScanEverySeconds<30 || MaxSymbolsPerScan<0)
+   if(ScanEverySeconds<30 || MaxSymbolsPerScan<0 || FastEMA<2 || SlowEMA<=FastEMA ||\n      RSIPeriod<2 || ATRPeriod<2 || MinimumSignalScore<1 || MinimumSignalScore>4 || MaxSpreadToATR<0)
       return INIT_PARAMETERS_INCORRECT;
    EventSetTimer(ScanEverySeconds);
-   Print("MT5 Multi-Asset Signal Scanner basladi. Emir gonderme ozelligi yok.");
+   Print("MT5 Multi-Asset Signal Scanner basladi. Emir gonderme ozelligi yok.");\n   Print("Ayarlar: tarama=",ScanEverySeconds," sn, sembol limiti=",\n         (MaxSymbolsPerScan==0 ? "TUMU" : IntegerToString(MaxSymbolsPerScan)),\n         ", maksimum spread/ATR=",DoubleToString(MaxSpreadToATR,2));
    ScanAllSymbols();
    return INIT_SUCCEEDED;
 }
