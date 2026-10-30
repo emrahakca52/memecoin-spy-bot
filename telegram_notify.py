@@ -108,3 +108,41 @@ async def send_paper_signal_alert(*, symbol: str, address: str, price_usd: float
     except (httpx.HTTPError, ValueError) as exc:
         logger.warning("Telegram signal alert failed: %s", exc)
         return {"sent": False, "reason": "send_failed"}
+
+
+async def send_hourly_filter_report(*, counts: dict, scans: int, started_at: str) -> dict:
+    """Send one hourly rejection summary; counts are aggregated by the bot."""
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    if not token or not chat_id:
+        return {"sent": False, "reason": "not_configured"}
+    ranked = sorted(
+        ((str(name), int(value)) for name, value in (counts or {}).items()),
+        key=lambda item: (-item[1], item[0]),
+    )
+    lines = [
+        "MEMECOIN BOT — SAATLIK ELEME RAPORU",
+        f"Donem baslangici (UTC): {started_at}",
+        f"Tamamlanan tarama: {int(scans)}",
+    ]
+    if ranked:
+        lines.append(f"En cok eleyen filtre: {ranked[0][0]} ({ranked[0][1]} token)")
+        lines.append("Tum eleme nedenleri:")
+        lines.extend(f"- {name}: {count}" for name, count in ranked[:10])
+    else:
+        lines.append("Bu donemde filtre tarafinda kayitli eleme yok.")
+    lines.append("Not: Yuksek eleme sayisi tek basina filtrenin fazla katı oldugunu kanitlamaz.")
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                json={"chat_id": chat_id, "text": "\\n".join(lines), "disable_web_page_preview": True},
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if not payload.get("ok"):
+                return {"sent": False, "reason": "telegram_rejected"}
+        return {"sent": True}
+    except (httpx.HTTPError, ValueError):
+        logger.exception("Hourly filter report failed")
+        return {"sent": False, "reason": "send_failed"}
