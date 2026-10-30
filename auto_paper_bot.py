@@ -52,6 +52,53 @@ _hourly_period_started = datetime.now(timezone.utc)
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
+def _agent_desk(token: dict) -> dict:
+    """Read-only multi-agent summary; never approves or bypasses safety gates."""
+    def metric(*keys):
+        for key in keys:
+            try:
+                value = token.get(key)
+                if value is not None and value != "":
+                    number = float(value)
+                    if math.isfinite(number): return number
+            except (TypeError, ValueError, OverflowError):
+                pass
+        return None
+    missing, risks = [], []
+    volume = metric("volume_24h_usd")
+    ratio = metric("buy_sell_ratio_5m", "buy_sell_ratio_1h", "buy_sell_ratio")
+    score = metric("score")
+    block_buyers = metric("creation_block_buyer_count", "block0_buyer_count", "creation_block_buyers")
+    curve = metric("bonding_curve_pct", "curve_pct", "curve_progress_pct")
+    top10 = metric("top10_holder_pct", "top10_holders_pct")
+    dev = metric("dev_holder_pct", "developer_holder_pct", "dev_holding_pct")
+    sell_pressure = metric("top_holder_sell_pressure_pct", "graduation_sell_pressure_pct")
+    if volume is None: missing.append("24h_volume")
+    if ratio is None: missing.append("buy_sell_ratio")
+    elif ratio < 1: risks.append("sell_pressure")
+    if block_buyers is None: missing.append("creation_block_buyers")
+    elif block_buyers > 3: risks.append("creation_block_bundle_risk")
+    if curve is None: missing.append("bonding_curve_progress"); zone = "UNVERIFIED"
+    else:
+        curve = max(0.0, min(100.0, curve))
+        zone = "0-15_sniper" if curve < 15 else "15-50_discovery" if curve < 50 else "50-85_momentum" if curve < 85 else "85-100_graduation_risk"
+    if top10 is None: missing.append("top10_holder_concentration")
+    elif top10 > 22: risks.append("top10_above_22pct")
+    if dev is None: missing.append("developer_holding")
+    elif dev > 4: risks.append("developer_above_4pct")
+    if sell_pressure is None: missing.append("graduation_sell_pressure")
+    return {"decision": "WATCH" if missing else "RISK_REVIEW" if risks else "ANALYSIS_READY",
+            "paper_approval": False, "curve_zone": zone, "curve_pct": curve,
+            "creation_block_buyers": block_buyers, "top10_holder_pct": top10,
+            "dev_holder_pct": dev, "risk_flags": risks, "missing_data": missing,
+            "verified_metrics": sum(v is not None for v in (volume, ratio, score, block_buyers, curve, top10, dev, sell_pressure)),
+            "agents": {"scout": "OBSERVED" if volume is not None or score is not None else "UNVERIFIED",
+                       "sniper": "UNVERIFIED" if block_buyers is None else "RISK" if block_buyers > 3 else "PASS",
+                       "curve": "UNVERIFIED" if curve is None else "OBSERVED",
+                       "rug_guard": "UNVERIFIED" if top10 is None and dev is None else "OBSERVED",
+                       "graduate": "UNVERIFIED" if sell_pressure is None else "OBSERVED"},
+            "note": "Read-only. RugCheck, on-chain and Jupiter checks remain mandatory."}
+
 def _positive_finite_float(value):
     try:
         parsed = float(value)
@@ -251,8 +298,9 @@ async def _loop(stop_event):
                         if stop_event.is_set():
                             break
                         try:
+                            desk = _agent_desk(token)
                             gate = await asyncio.wait_for(evaluate_candidate(token), timeout=75)
-                            checked.append({"symbol": token.get("symbol"), **gate})
+                            checked.append({"symbol": token.get("symbol"), "agent_desk": desk, **gate})
                             if gate.get("passed"):
                                 eligible_signals.append(token)
                             elif _ai_quota_fallback_allowed(gate):
@@ -261,7 +309,7 @@ async def _loop(stop_event):
                                 gate["paper_fallback"] = "ai_quota_hard_checks_only"
                                 gate["passed"] = True
                                 gate["decision"] = "PAPER_ONLY_FALLBACK"
-                                checked[-1] = {"symbol": token.get("symbol"), **gate}
+                                checked[-1] = {"symbol": token.get("symbol"), "agent_desk": desk, **gate}
                                 eligible_signals.append(token)
                                 logger.warning(
                                     "AI quota fallback allowed for PAPER candidate %s after RugCheck, on-chain and Jupiter checks passed",
