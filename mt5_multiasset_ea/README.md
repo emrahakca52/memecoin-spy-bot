@@ -7,7 +7,7 @@ This Expert Advisor reads market data from the connected broker's MetaTrader 5 t
 - Reads M5 and H1 broker price history.
 - Checks EMA 20/50 alignment, RSI(14), recent candle direction and ATR(14).
 - Produces an indicative entry zone, stop level and two target levels.
-- Prints signals in the MT5 Experts log.
+- Prints full signal details in the MT5 Experts log.\n- Sends a shortened MT5 push alert; Telegram receives the full message when enabled.
 - Optionally sends MT5 push notifications or Telegram messages.
 
 ## Important limitations
@@ -22,7 +22,7 @@ This Expert Advisor reads market data from the connected broker's MetaTrader 5 t
 2. Open MQL5/Experts/.
 3. Copy MT5_MultiAsset_SignalScanner.mq5 there.
 4. Open MetaEditor, compile the file, then attach the EA to one chart.
-5. Keep the terminal connected to your broker. The EA scans the terminal symbol catalogue every 5 minutes by default.
+5. Keep the terminal connected to your broker. The EA scans the full terminal symbol catalogue every 5 minutes by default. Set `MaxSymbolsPerScan` to a positive number only if you want to cap the scan.
 
 ## Telegram alerts (optional)
 1. Create a Telegram bot and obtain its bot token and chat ID.
@@ -35,7 +35,7 @@ Enable push notifications in MT5 desktop and configure your MetaQuotes ID in ter
 
 ## Default settings
 - Scan interval: 300 seconds
-- Maximum symbols per scan: 250
+- Maximum symbols per scan: all broker symbols by default (`0`); set a positive number to cap the scan
 - Signal threshold: 4 points
 - Entry zone: current quote +/- 0.15 ATR
 - Stop: 1.5 ATR
