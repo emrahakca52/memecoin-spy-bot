@@ -136,7 +136,7 @@ async def send_hourly_filter_report(*, counts: dict, scans: int, started_at: str
         async with httpx.AsyncClient(timeout=10) as client:
             response = await client.post(
                 f"https://api.telegram.org/bot{token}/sendMessage",
-                json={"chat_id": chat_id, "text": "\\n".join(lines), "disable_web_page_preview": True},
+                json={"chat_id": chat_id, "text": "\n".join(lines), "disable_web_page_preview": True},
             )
             response.raise_for_status()
             payload = response.json()
