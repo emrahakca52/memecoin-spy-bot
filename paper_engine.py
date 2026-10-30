@@ -222,7 +222,10 @@ def record_paper_trade(token_address, side, amount_usd, price_usd, token_symbol=
                 "current_price_usd": price_usd,
                 "highest_price": price_usd,
                 "invested_usd": amount_usd,
+                "initial_invested_usd": amount_usd,
                 "quantity": qty,
+                "stop_reference_price": price_usd,
+                "averaging_done": False,
                 "opened_at": time.time(),
             }
         else:
@@ -573,7 +576,7 @@ def record_paper_trade(token_address, side, amount_usd, price_usd, token_symbol=
             raise ValueError("Invalid paper order amount")
         if token_address not in _open_positions and len(_open_positions) >= MAX_OPEN_POSITIONS:
             raise ValueError("Paper wallet risk limit: maximum open positions reached")
-        if _daily_realized_pnl_usd() <= -abs(MAX_DAILY_LOSS_USD):
+        if MAX_DAILY_LOSS_USD > 0 and _daily_realized_pnl_usd() <= -abs(MAX_DAILY_LOSS_USD):
             raise ValueError("Paper wallet risk limit: daily realized loss limit reached; new entries paused")
         available = _paper_available_cash_usd()
         if amount > available + 1e-8:
@@ -623,6 +626,38 @@ async def update_paper_prices():
         if entry <= 0: continue
         change = (price / entry - 1) * 100.0
         current = _num(pos.get("current_price_usd"))
+        # Track the drawdown low; allow one small paper add only after a
+        # confirmed 2% rebound from that low, never while price is still falling.
+        if not pos.get("averaging_done") and change <= -8.0:
+            low = _num(pos.get("averaging_low_price"), price)
+            pos["averaging_low_price"] = min(low, price)
+        averaging_low = _num(pos.get("averaging_low_price"))
+        if (
+            not pos.get("averaging_done")
+            and averaging_low > 0
+            and price >= averaging_low * 1.02
+            and change > -12.0
+        ):
+            add_amount = min(4.0, _num(pos.get("initial_invested_usd"), 8.0) * 0.5)
+            try:
+                record_paper_trade(
+                    address, "BUY", add_amount, price,
+                    pos.get("token_symbol", ""), "auto", "controlled_cost_averaging"
+                )
+                pos = _open_positions.get(address)
+                if pos:
+                    pos["stop_reference_price"] = _num(pos.get("stop_reference_price"), entry)
+                    pos["averaging_done"] = True
+                    pos["averaging_price_usd"] = price
+                    pos["averaging_low_price"] = averaging_low
+                    _save_paper_state()
+                    logger.info("One-time paper cost average: %s at %.2f", address, price)
+                    entry = _num(pos.get("entry_price_usd"), entry)
+                    change = (price / entry - 1.0) * 100.0
+            except Exception as exc:
+                logger.info("Cost averaging skipped for %s: %s", address, str(exc)[:160])
+                pos["averaging_done"] = True
+                _save_paper_state()
         # A move exceeding 50% in one refresh is untrusted until a second source confirms it.
         if current > 0 and abs(change) > 50:
             verify = await _fetch_dexscreener_price(address)
@@ -644,8 +679,10 @@ async def update_paper_prices():
         highest = max(_num(pos.get("highest_price"), entry), price)
         pos["highest_price"] = highest
 
-        # Priority 1: hard stop. Keep the configured risk cap authoritative.
-        if change <= STOP_LOSS_PCT:
+        # Priority 1: hard stop. Cost averaging never moves this original stop.
+        stop_reference = _num(pos.get("stop_reference_price"), entry)
+        stop_change = (price / stop_reference - 1.0) * 100.0 if stop_reference > 0 else change
+        if stop_change <= STOP_LOSS_PCT:
             if _close_position(address, pos, price, "stop_loss", change):
                 closed += 1
             continue
