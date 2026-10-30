@@ -34,7 +34,24 @@ _last_dexscreener_discovery = {}
 _last_geckoterminal_discovery = {}
 # Respect public-provider rate limits across scans instead of retrying every 180s.
 _provider_cooldowns = {"dexscreener": 0.0, "geckoterminal": 0.0}
-PROVIDER_429_COOLDOWN_SECONDS = max(60, int(os.getenv("PROVIDER_429_COOLDOWN_SECONDS", "300")))
+PROVIDER_429_COOLDOWN_SECONDS = max(120, int(os.getenv("PROVIDER_429_COOLDOWN_SECONDS", "600")))
+PROVIDER_MIN_INTERVAL_SECONDS = max(0.5, float(os.getenv("PROVIDER_MIN_INTERVAL_SECONDS", "1.5")))
+_provider_last_request = {"dexscreener": 0.0, "geckoterminal": 0.0}
+
+
+async def _provider_wait(name: str) -> None:
+    """Serialize requests to public discovery providers and avoid burst traffic."""
+    elapsed = time.monotonic() - _provider_last_request.get(name, 0.0)
+    if elapsed < PROVIDER_MIN_INTERVAL_SECONDS:
+        await asyncio.sleep(PROVIDER_MIN_INTERVAL_SECONDS - elapsed)
+    _provider_last_request[name] = time.monotonic()
+
+
+def _provider_cooldown(name: str, response: httpx.Response) -> int:
+    retry_after = _num(response.headers.get("Retry-After"))
+    cooldown = max(PROVIDER_429_COOLDOWN_SECONDS, min(retry_after, 1800.0))
+    _provider_cooldowns[name] = time.monotonic() + cooldown
+    return int(cooldown)
 
 
 def _num(value: Any, default: float = 0.0) -> float:
@@ -312,12 +329,11 @@ async def _discover_dexscreener(client: httpx.AsyncClient) -> list[dict]:
             feed_diagnostics.append(feed)
             break
         try:
+            await _provider_wait("dexscreener")
             response = await client.get(url)
             if response.status_code == 429:
-                retry_after = _num(response.headers.get("Retry-After"))
-                cooldown = max(PROVIDER_429_COOLDOWN_SECONDS, min(retry_after, 1800.0))
-                _provider_cooldowns["dexscreener"] = time.monotonic() + cooldown
-                feed["error"] = f"HTTP 429 rate limit; cooldown {int(cooldown)}s"
+                cooldown = _provider_cooldown("dexscreener", response)
+                feed["error"] = f"HTTP 429 rate limit; cooldown {cooldown}s"
                 feed_diagnostics.append(feed)
                 break
             response.raise_for_status()
@@ -352,9 +368,14 @@ async def _discover_dexscreener(client: httpx.AsyncClient) -> list[dict]:
     # DexScreener's token endpoint accepts comma-separated addresses in batches.
     for offset in range(0, len(addresses), 30):
         batch = addresses[offset:offset + 30]
+        await _provider_wait("dexscreener")
         response = await client.get(
             "https://api.dexscreener.com/tokens/v1/solana/" + ",".join(batch)
         )
+        if response.status_code == 429:
+            cooldown = _provider_cooldown("dexscreener", response)
+            _last_dexscreener_discovery["pairs_error"] = f"HTTP 429 rate limit; cooldown {cooldown}s"
+            break
         response.raise_for_status()
         pairs = response.json()
         if not isinstance(pairs, list):
@@ -421,16 +442,15 @@ async def _discover_geckoterminal(client: httpx.AsyncClient) -> list[dict]:
             diagnostics["feeds"].append(feed)
             break
         try:
+            await _provider_wait("geckoterminal")
             response = await client.get(
                 url,
                 params={"include": "base_token"},
                 headers={"Accept": "application/json;version=20230203"},
             )
             if response.status_code == 429:
-                retry_after = _num(response.headers.get("Retry-After"))
-                cooldown = max(PROVIDER_429_COOLDOWN_SECONDS, min(retry_after, 1800.0))
-                _provider_cooldowns["geckoterminal"] = time.monotonic() + cooldown
-                feed["error"] = f"HTTP 429 rate limit; cooldown {int(cooldown)}s"
+                cooldown = _provider_cooldown("geckoterminal", response)
+                feed["error"] = f"HTTP 429 rate limit; cooldown {cooldown}s"
                 diagnostics["feeds"].append(feed)
                 break
             response.raise_for_status()
