@@ -29,11 +29,11 @@ REQUIRE_ZERO_INSIDER_NETWORKS = False
 
 # Exit
 TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "60"))
-PARTIAL_TAKE_PROFIT_PCT = float(os.getenv("PARTIAL_TAKE_PROFIT_PCT", "25"))
+PARTIAL_TAKE_PROFIT_PCT = float(os.getenv("PARTIAL_TAKE_PROFIT_PCT", "15"))
 PARTIAL_SELL_FRACTION = float(os.getenv("PARTIAL_SELL_FRACTION", "0.5"))
 MAX_HOLD_SECONDS = int(os.getenv("MAX_HOLD_SECONDS", "0"))
-STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "-28"))
-TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", "22"))
+STOP_LOSS_PCT = max(-12.0, float(os.getenv("STOP_LOSS_PCT", "-12")))
+TRAILING_STOP_PCT = min(12.0, max(5.0, float(os.getenv("TRAILING_STOP_PCT", "10"))))
 
 # Jupiter
 JUPITER_QUOTE_URL = os.getenv("JUPITER_QUOTE_URL", "https://api.jup.ag/swap/v1/quote").rstrip("/")
