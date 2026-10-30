@@ -685,12 +685,12 @@ async def update_paper_prices():
                 closed += 1
             continue
 
-        # Time-based exit prevents paper positions from being held indefinitely.
-        if MAX_HOLD_SECONDS > 0 and age_seconds >= MAX_HOLD_SECONDS:
-            if _close_position(address, pos, price, "max_hold_time", change):
-                closed += 1
-            continue
-
+        # A timer alone must never force a sale. Memecoins can remain volatile
+        # beyond the observation window; closing solely because time elapsed
+        # repeatedly cut winners and crystallized small/temporary drawdowns.
+        # MAX_HOLD_SECONDS is retained for backward-compatible configuration
+        # and telemetry, but exits are driven by stop, breakeven, trailing stop,
+        # and take-profit conditions only.
         if change >= TAKE_PROFIT_PCT:
             if _close_position(address, pos, price, "take_profit_final", change):
                 closed += 1
