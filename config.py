@@ -5,12 +5,12 @@ MODE = "paper"
 REAL_TRADING_ENABLED = False
 
 # Pause new paper BUYs while preserving price updates and exit management.
-PAPER_ENTRIES_ENABLED = False  # Keep new BUYs paused until the revised paper strategy is validated.
+PAPER_ENTRIES_ENABLED = True  # Enable paper BUYs for controlled testing.
 
 # Risk
 PAPER_AMOUNT_USD = float(os.getenv("PAPER_AMOUNT_PER_POSITION_USD", "8"))
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "6"))
-MAX_DAILY_LOSS_USD = float(os.getenv("MAX_DAILY_LOSS_USD", "24"))
+MAX_DAILY_LOSS_USD = 0  # 0 disables the daily aggregate loss cap in PAPER mode.
 MIN_HOLD_SECONDS = int(os.getenv("MIN_HOLD_SECONDS", "90"))
 
 # Market filters
