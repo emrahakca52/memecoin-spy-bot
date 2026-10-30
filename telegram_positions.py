@@ -2,6 +2,7 @@
 import asyncio
 import logging
 import os
+import time
 from datetime import datetime, timezone
 
 import httpx
@@ -9,7 +10,9 @@ import paper_engine
 
 logger = logging.getLogger("memecoin_spy.telegram_positions")
 REFRESH_SECONDS = max(15, int(os.getenv("TELEGRAM_POSITIONS_REFRESH_SECONDS", "15")))
+REPORT_INTERVAL_SECONDS = max(60, int(os.getenv("TELEGRAM_REPORT_INTERVAL_SECONDS", "180")))
 _message_id = None
+_last_message_update = 0.0
 
 
 def _fmt_price(value):
@@ -38,6 +41,9 @@ def _render():
         f"💵 Serbest bakiye: {wallet.get('paper_cash_available_usd', 0):.2f}$",
         f"🔒 Bağlı sermaye: {wallet.get('paper_cash_committed_usd', 0):.2f}$",
         f"📈 Günlük gerçekleşmiş K/Z: {wallet.get('paper_daily_realized_pnl_usd', 0):+.2f}$",
+        f"🧾 Toplam gerçekleşmiş K/Z: {wallet.get('paper_realized_pnl_usd', 0):+.2f}$",
+        f"📊 Toplam brüt K/Z: {wallet.get('paper_total_pnl_usd', 0):+.2f}$" if wallet.get("paper_total_pnl_usd") is not None else "📊 Toplam brüt K/Z: veri eksik",
+        f"💸 Tahmini net toplam K/Z: {wallet.get('paper_estimated_net_total_pnl_usd', 0):+.2f}$" if wallet.get("paper_estimated_net_total_pnl_usd") is not None else "💸 Tahmini net toplam K/Z: maliyet verisi eksik",
         f"🛑 Günlük zarar limiti: -{wallet.get('paper_daily_loss_limit_usd', 0):.2f}$",
     ]
     equity = wallet.get("paper_total_equity_usd")
@@ -76,13 +82,16 @@ def _render():
 
 
 async def refresh_open_positions_dashboard():
-    global _message_id
+    global _message_id, _last_message_update
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
     if not token or not chat_id:
         logger.info("Telegram position dashboard disabled: credentials not configured")
         return {"sent": False, "reason": "not_configured"}
     api = f"https://api.telegram.org/bot{token}"
+    now = time.monotonic()
+    if _message_id is not None and now - _last_message_update < REPORT_INTERVAL_SECONDS:
+        return {"sent": True, "updated": False, "reason": "report_interval"}
     async with httpx.AsyncClient(timeout=12) as client:
         text = _render()
         if _message_id is not None:
@@ -92,6 +101,7 @@ async def refresh_open_positions_dashboard():
             })
             payload = response.json()
             if payload.get("ok"):
+                _last_message_update = time.monotonic()
                 return {"sent": True, "updated": True, "message_id": _message_id}
             description = str(payload.get("description", "")).lower()
             if "message is not modified" in description:
@@ -105,6 +115,7 @@ async def refresh_open_positions_dashboard():
         if not payload.get("ok"):
             raise RuntimeError(payload.get("description", "Telegram sendMessage failed"))
         _message_id = payload["result"]["message_id"]
+        _last_message_update = time.monotonic()
         return {"sent": True, "updated": False, "message_id": _message_id}
 
 
