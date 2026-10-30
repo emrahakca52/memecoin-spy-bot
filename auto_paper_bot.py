@@ -187,12 +187,6 @@ async def _loop(stop_event):
             _last_momentum_observations = []
             logger.info("Scan cycle started")
 
-            try:
-                _last_price_update = await asyncio.wait_for(update_paper_prices(), timeout=30)
-            except asyncio.TimeoutError:
-                logger.warning("Price update timed out")
-                _last_price_update = {"error": "timeout"}
-
             if not PAPER_ENTRIES_ENABLED:
                 scan_daily_loss_limit = True
                 _last_skipped.append({"reason": "new_entries_paused"})
