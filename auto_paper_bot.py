@@ -11,7 +11,7 @@ from config import (
     MIN_LIQUIDITY_USD, MIN_VOLUME_24H_USD, MIN_BUYS_SELLS_RATIO,
     TAKE_PROFIT_PCT, STOP_LOSS_PCT, MAX_DAILY_LOSS_USD,
     MAX_GROK_CHECKS_PER_SCAN, GROK_CONFIDENCE_THRESHOLD,
-    COPYFOMO_GATE_ENABLED, MOMENTUM_MIN_SCORE, MOMENTUM_MIN_BUY_SELL_RATIO,
+    COPYFOMO_GATE_ENABLED, PAPER_ENTRIES_ENABLED, MOMENTUM_MIN_SCORE, MOMENTUM_MIN_BUY_SELL_RATIO,
     MOMENTUM_MIN_OBSERVED_CHANGE_PCT, MOMENTUM_MAX_OBSERVED_CHANGE_PCT,
 )
 from telegram_notify import send_scan_report, send_paper_signal_alert
@@ -191,7 +191,17 @@ async def _loop(stop_event):
                 logger.warning("Price update timed out")
                 _last_price_update = {"error": "timeout"}
 
-            if _daily_loss_exceeded():
+            if not PAPER_ENTRIES_ENABLED:
+                scan_daily_loss_limit = True
+                _last_skipped.append({"reason": "new_entries_paused"})
+                _last_scan = {
+                    "provider": "paused",
+                    "checked": 0,
+                    "candidate_count": 0,
+                    "filter_diagnostics": {},
+                    "signal_diagnostics": {"reason": "new_entries_paused"},
+                }
+            elif _daily_loss_exceeded():
                 scan_daily_loss_limit = True
                 _last_skipped.append({"reason": "daily_loss_limit_reached"})
                 _last_scan = {
@@ -513,6 +523,7 @@ def bot_status():
         "real_trading_enabled": False,
         "poll_interval_seconds": POLL_SECONDS,
         "paper_amount_per_position_usd": PAPER_AMOUNT_USD,
+        "paper_entries_enabled": PAPER_ENTRIES_ENABLED,
         "max_open_positions": MAX_OPEN_POSITIONS,
         "take_profit_pct": TAKE_PROFIT_PCT,
         "stop_loss_pct": STOP_LOSS_PCT,
