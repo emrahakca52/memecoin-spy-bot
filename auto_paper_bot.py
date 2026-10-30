@@ -158,6 +158,9 @@ def _ai_quota_fallback_allowed(gate: dict) -> bool:
 
 
 def _daily_loss_exceeded() -> bool:
+    # A zero/non-positive limit disables the aggregate daily cap in PAPER mode.
+    if MAX_DAILY_LOSS_USD <= 0:
+        return False
     try:
         status = get_paper_status()
         # Use today's realized PnL, not lifetime PnL, so a historical loss
