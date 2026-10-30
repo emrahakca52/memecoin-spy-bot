@@ -5,7 +5,7 @@ MODE = "paper"
 REAL_TRADING_ENABLED = False
 
 # Pause new paper BUYs while preserving price updates and exit management.
-PAPER_ENTRIES_ENABLED = os.getenv("PAPER_ENTRIES_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+PAPER_ENTRIES_ENABLED = False  # Keep new BUYs paused until the revised paper strategy is validated.
 
 # Risk
 PAPER_AMOUNT_USD = float(os.getenv("PAPER_AMOUNT_PER_POSITION_USD", "8"))
