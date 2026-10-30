@@ -609,6 +609,7 @@ def bot_status():
             "ai_confidence": ai.get("confidence"),
             "ai_reasons": ai.get("reasons", []),
             "ai_http_status": ai.get("http_status"),
+            "agent_desk": gate.get("agent_desk") if isinstance(gate.get("agent_desk"), dict) else None,
         })
     return {
         "mode": "paper",
