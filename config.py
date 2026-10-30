@@ -11,9 +11,9 @@ MAX_DAILY_LOSS_USD = float(os.getenv("MAX_DAILY_LOSS_USD", "24"))
 MIN_HOLD_SECONDS = int(os.getenv("MIN_HOLD_SECONDS", "90"))
 
 # Market filters
-MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "8000"))
-MIN_VOLUME_24H_USD = float(os.getenv("MIN_VOLUME_24H_USD", "30000"))
-MIN_BUYS_SELLS_RATIO = float(os.getenv("MIN_BUYS_SELLS_RATIO", "1.1"))
+MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "25000"))
+MIN_VOLUME_24H_USD = float(os.getenv("MIN_VOLUME_24H_USD", "50000"))
+MIN_BUYS_SELLS_RATIO = float(os.getenv("MIN_BUYS_SELLS_RATIO", "1.2"))
 MIN_TRADES_24H = int(os.getenv("MIN_TRADES_24H", "20"))
 
 # Rug protection: keep fail-closed checks enabled.
@@ -28,7 +28,7 @@ REQUIRE_ZERO_INSIDER_NETWORKS = False
 TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "60"))
 PARTIAL_TAKE_PROFIT_PCT = float(os.getenv("PARTIAL_TAKE_PROFIT_PCT", "25"))
 PARTIAL_SELL_FRACTION = float(os.getenv("PARTIAL_SELL_FRACTION", "0.5"))
-MAX_HOLD_SECONDS = int(os.getenv("MAX_HOLD_SECONDS", "1200"))
+MAX_HOLD_SECONDS = int(os.getenv("MAX_HOLD_SECONDS", "0"))
 STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "-28"))
 TRAILING_STOP_PCT = float(os.getenv("TRAILING_STOP_PCT", "22"))
 
@@ -49,7 +49,7 @@ COPYFOMO_GATE_ENABLED = True
 
 # Momentum entry thresholds; wallet-level buyer counts are not available in current feeds.
 # PAPER-only tuning: reduce false negatives while keeping hard safety gates unchanged.
-MOMENTUM_MIN_SCORE = float(os.getenv("MOMENTUM_MIN_SCORE", "40"))
+MOMENTUM_MIN_SCORE = float(os.getenv("MOMENTUM_MIN_SCORE", "55"))
 MOMENTUM_MIN_BUY_SELL_RATIO = float(os.getenv("MOMENTUM_MIN_BUY_SELL_RATIO", "1.0"))
 MOMENTUM_MIN_OBSERVED_CHANGE_PCT = float(os.getenv("MOMENTUM_MIN_OBSERVED_CHANGE_PCT", "-0.5"))
 MOMENTUM_MAX_OBSERVED_CHANGE_PCT = float(os.getenv("MOMENTUM_MAX_OBSERVED_CHANGE_PCT", "8"))
