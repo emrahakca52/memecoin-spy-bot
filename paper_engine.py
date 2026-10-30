@@ -491,6 +491,39 @@ def load_paper_state():
         _open_positions = positions
         _paper_trades = trades
         _paper_starting_balance_usd = max(0.0, _num(state.get("starting_balance_usd", os.getenv("PAPER_STARTING_BALANCE_USD", "500")), 500.0))
+
+        # Backfill estimated round-trip costs for legacy SELL rows. Older versions
+        # recorded gross realized PnL but did not persist fee/slippage fields.
+        # The SELL proceeds and gross PnL imply the allocated entry cost basis:
+        # cost_basis = proceeds - gross_pnl. Preserve all original trade fields
+        # and gross PnL; explicitly label the reconstructed costs as estimates.
+        cost_rate = (
+            max(0.0, _num(PAPER_FEE_PCT_PER_SIDE))
+            + max(0.0, _num(PAPER_SLIPPAGE_PCT_PER_SIDE))
+        ) / 100.0
+        migrated_cost_rows = 0
+        for trade in trades:
+            if not isinstance(trade, dict) or str(trade.get("side", "")).upper() != "SELL":
+                continue
+            if "estimated_transaction_cost_usd" in trade:
+                continue
+            if "realized_pnl_usd" not in trade or not math.isfinite(_num(trade.get("realized_pnl_usd"), float("nan"))):
+                continue
+            proceeds = _num(trade.get("amount_usd"), -1.0)
+            gross_pnl = _num(trade.get("realized_pnl_usd"), float("nan"))
+            cost_basis = proceeds - gross_pnl
+            if proceeds < 0 or cost_basis < 0 or not math.isfinite(cost_basis):
+                continue
+            entry_cost = cost_basis * cost_rate
+            exit_cost = proceeds * cost_rate
+            trade["estimated_entry_cost_allocated_usd"] = round(entry_cost, 6)
+            trade["estimated_exit_cost_usd"] = round(exit_cost, 6)
+            trade["estimated_transaction_cost_usd"] = round(entry_cost + exit_cost, 6)
+            trade["net_realized_pnl_usd"] = round(gross_pnl - entry_cost - exit_cost, 6)
+            trade["cost_estimate_method"] = "legacy_gross_pnl_implied_cost_basis"
+            trade["costs_are_estimated"] = True
+            migrated_cost_rows += 1
+
         accounting = _reported_realized_pnl(trades)
         quarantined_ids = {id(t) for t in []}
         quarantined_keys = {(str(t.get("token_address","")), str(t.get("token_symbol","")), str(t.get("timestamp","")), str(t.get("realized_pnl_usd",""))) for t in accounting["quarantined_sell_records"]}
