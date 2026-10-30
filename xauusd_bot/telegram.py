@@ -6,8 +6,8 @@ async def send_telegram(signal, symbol, source):
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
         return False
-    text = (
-        f"XAUUSD {signal['direction']}\n"
+    message = (
+        f"{symbol} | {signal['direction']}\n"
         f"Kaynak: {source}\n"
         f"Giriş referansı: {signal['entry']}\n"
         f"Stop Loss: {signal['stop_loss']}\n"
@@ -18,6 +18,6 @@ async def send_telegram(signal, symbol, source):
     )
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     async with httpx.AsyncClient(timeout=15) as client:
-        response = await client.post(url, json={"chat_id": chat_id, "text": text})
+        response = await client.post(url, json={"chat_id": chat_id, "text": message})
         response.raise_for_status()
         return bool(response.json().get("ok"))
