@@ -31,6 +31,8 @@ MAX_ENTRY_PRICE_DEVIATION_PCT = 10.0
 
 _task = None
 _stop_event = None
+_position_monitor_task = None
+POSITION_MONITOR_SECONDS = max(10, int(os.getenv("PAPER_POSITION_MONITOR_SECONDS", "30")))
 _last_run = None
 _last_started = None
 _last_error = None
@@ -454,16 +456,35 @@ async def _loop(stop_event):
         except asyncio.TimeoutError:
             pass
 
+async def _position_monitor_loop(stop_event):
+    """Refresh open paper positions independently of the slower discovery scan."""
+    global _last_price_update
+    while not stop_event.is_set():
+        try:
+            _last_price_update = await asyncio.wait_for(update_paper_prices(), timeout=25)
+        except asyncio.TimeoutError:
+            _last_price_update = {"error": "position_monitor_timeout"}
+            logger.warning("Position monitor timed out")
+        except Exception as exc:
+            _last_price_update = {"error": type(exc).__name__}
+            logger.exception("Position monitor failed")
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=POSITION_MONITOR_SECONDS)
+        except asyncio.TimeoutError:
+            pass
+
+
 async def start_bot():
-    global _task, _stop_event
+    global _task, _stop_event, _position_monitor_task
     if _task is not None and not _task.done():
         return bot_status()
     _stop_event = asyncio.Event()
+    _position_monitor_task = asyncio.create_task(_position_monitor_loop(_stop_event))
     _task = asyncio.create_task(_loop(_stop_event))
     return bot_status()
 
 async def stop_bot():
-    global _task, _stop_event
+    global _task, _stop_event, _position_monitor_task
     if _stop_event:
         _stop_event.set()
     if _task:
@@ -471,7 +492,13 @@ async def stop_bot():
             await asyncio.wait_for(_task, timeout=5)
         except asyncio.TimeoutError:
             _task.cancel()
+    if _position_monitor_task:
+        try:
+            await asyncio.wait_for(_position_monitor_task, timeout=5)
+        except asyncio.TimeoutError:
+            _position_monitor_task.cancel()
     _task = None
+    _position_monitor_task = None
     _stop_event = None
     return bot_status()
 
@@ -522,6 +549,8 @@ def bot_status():
         "running": _task is not None and not _task.done(),
         "real_trading_enabled": False,
         "poll_interval_seconds": POLL_SECONDS,
+        "position_monitor_interval_seconds": POSITION_MONITOR_SECONDS,
+        "position_monitor_running": _position_monitor_task is not None and not _position_monitor_task.done(),
         "paper_amount_per_position_usd": PAPER_AMOUNT_USD,
         "paper_entries_enabled": PAPER_ENTRIES_ENABLED,
         "max_open_positions": MAX_OPEN_POSITIONS,
