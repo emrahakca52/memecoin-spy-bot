@@ -177,7 +177,8 @@ void AnalyzeSymbol(const string symbol)
 void ScanAllSymbols()
 {
    int total=SymbolsTotal(false);
-   int limit=total;\n   if(MaxSymbolsPerScan>0) limit=MathMin(total,MaxSymbolsPerScan);
+   int limit=total;
+   if(MaxSymbolsPerScan>0) limit=MathMin(total,MaxSymbolsPerScan);
    int scanned=0;
    for(int i=0;i<total && scanned<limit;i++)
    {
@@ -187,7 +188,8 @@ void ScanAllSymbols()
       scanned++;
    }
    Print("Tarama tamamlandi. Terminal sembol sayisi=",total,
-         " | Bu tur taranan=",scanned,\n         " | Limit=",(MaxSymbolsPerScan==0 ? "TUMU" : IntegerToString(MaxSymbolsPerScan)));
+         " | Bu tur taranan=",scanned,
+         " | Limit=",(MaxSymbolsPerScan==0 ? "TUMU" : IntegerToString(MaxSymbolsPerScan)));
 }
 
 int OnInit()
