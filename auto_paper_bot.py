@@ -14,7 +14,7 @@ from config import (
     COPYFOMO_GATE_ENABLED, PAPER_ENTRIES_ENABLED, MOMENTUM_MIN_SCORE, MOMENTUM_MIN_BUY_SELL_RATIO,
     MOMENTUM_MIN_OBSERVED_CHANGE_PCT, MOMENTUM_MAX_OBSERVED_CHANGE_PCT,
 )
-from telegram_notify import send_scan_report, send_paper_signal_alert
+from telegram_notify import send_scan_report, send_paper_signal_alert, send_hourly_filter_report
 from paper_engine import (
     get_token_prices_usd,
     open_paper_position,
@@ -45,6 +45,9 @@ _last_telegram_report = {"sent": False, "reason": "not_sent_yet", "at_utc": None
 _scan_in_progress = False
 _scan_started_monotonic = None
 _last_scan_duration_seconds = None
+_hourly_rejection_counts = {}
+_hourly_scan_count = 0
+_hourly_period_started = datetime.now(timezone.utc)
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -430,6 +433,24 @@ async def _loop(stop_event):
                     "daily_loss_limit": scan_daily_loss_limit,
                     "scan_error": scan_error,
                 }
+            # Aggregate rejection reasons across scan cycles; report once per hour.
+            global _hourly_rejection_counts, _hourly_scan_count, _hourly_period_started
+            _hourly_scan_count += 1
+            for reason, count in reason_counts.items():
+                _hourly_rejection_counts[reason] = _hourly_rejection_counts.get(reason, 0) + count
+            elapsed = (datetime.now(timezone.utc) - _hourly_period_started).total_seconds()
+            if elapsed >= 3600:
+                try:
+                    await send_hourly_filter_report(
+                        counts=dict(_hourly_rejection_counts),
+                        scans=_hourly_scan_count,
+                        started_at=_hourly_period_started.isoformat(),
+                    )
+                except Exception:
+                    logger.exception("Hourly filter report unexpectedly failed")
+                _hourly_rejection_counts = {}
+                _hourly_scan_count = 0
+                _hourly_period_started = datetime.now(timezone.utc)
             try:
                 telegram_result = await send_scan_report(
                     checked=scan_checked,
