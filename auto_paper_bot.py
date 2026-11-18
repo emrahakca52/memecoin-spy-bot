@@ -192,6 +192,8 @@ def _ai_quota_fallback_allowed(gate: dict) -> bool:
     blocking every otherwise-verified paper candidate, without weakening hard
     token-safety checks or enabling real trading.
     """
+    if os.getenv("ALLOW_AI_QUOTA_PAPER_FALLBACK", "false").strip().lower() not in {"1", "true", "yes"}:
+        return False
     if not isinstance(gate, dict) or gate.get("passed"):
         return False
     rug = gate.get("rugcheck") if isinstance(gate.get("rugcheck"), dict) else {}
