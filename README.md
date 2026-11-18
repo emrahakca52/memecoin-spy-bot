@@ -7,6 +7,20 @@
 - On application startup, `app.py` loads saved paper state and starts the paper-only scanner. Use `POST /paper-bot/stop` to stop the scanner; `POST /paper-bot/start` starts it again.
 - Simulated P/L is not real investment performance and does not guarantee future results.
 
+## AI desk hardening
+
+The paper scanner now adds an independent Solana RPC holder-concentration check after RugCheck and mint/freeze authority verification:
+
+- Checks up to 20 largest token accounts (configurable from 10 to 30).
+- Resolves token-account owners and excludes program-owned curve, pool and vault accounts.
+- Aggregates multiple token accounts belonging to the same wallet.
+- Rejects when one real wallet exceeds 5% or the top 10 real wallets exceed 25%.
+- Missing or inconsistent RPC holder data is a rejection, never an approval.
+- AI quota/rate-limit fallback is disabled by default. If explicitly needed for paper-only diagnostics, set `ALLOW_AI_QUOTA_PAPER_FALLBACK=true`; this does not enable real trading.
+- A default $25 daily realized-loss brake is enabled for the default $500 paper account. Override with `MAX_DAILY_LOSS_USD` if the paper starting balance is changed.
+
+Optional tuning variables: `ONCHAIN_MAX_TOP_WALLET_PCT`, `ONCHAIN_MAX_TOP10_WALLET_PCT`, and `ONCHAIN_HOLDER_ACCOUNTS_CHECKED`.
+
 ## Render configuration
 
 - Build command: `pip install -r requirements.txt`

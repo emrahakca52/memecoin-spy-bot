@@ -10,7 +10,7 @@ PAPER_ENTRIES_ENABLED = True  # Enable paper BUYs for controlled testing.
 # Risk
 PAPER_AMOUNT_USD = float(os.getenv("PAPER_AMOUNT_PER_POSITION_USD", "8"))
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "6"))
-MAX_DAILY_LOSS_USD = 0  # 0 disables the daily aggregate loss cap in PAPER mode.
+MAX_DAILY_LOSS_USD = float(os.getenv("MAX_DAILY_LOSS_USD", "25"))  # paper-only daily brake; 5% of default $500 paper capital.
 MIN_HOLD_SECONDS = int(os.getenv("MIN_HOLD_SECONDS", "90"))
 
 # Market filters
@@ -26,6 +26,11 @@ MIN_LP_LOCKED_PCT = float(os.getenv("MIN_LP_LOCKED_PCT", "50"))
 REQUIRE_MINT_AUTHORITY_REVOKED = True
 REQUIRE_FREEZE_AUTHORITY_REVOKED = True
 REQUIRE_ZERO_INSIDER_NETWORKS = False
+
+# Independent Solana RPC holder check. Program-owned curve/pool/vault accounts are excluded.
+ONCHAIN_MAX_TOP_WALLET_PCT = float(os.getenv("ONCHAIN_MAX_TOP_WALLET_PCT", "5"))
+ONCHAIN_MAX_TOP10_WALLET_PCT = float(os.getenv("ONCHAIN_MAX_TOP10_WALLET_PCT", "25"))
+ONCHAIN_HOLDER_ACCOUNTS_CHECKED = max(10, min(30, int(os.getenv("ONCHAIN_HOLDER_ACCOUNTS_CHECKED", "20"))))
 
 # Exit
 TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "60"))
