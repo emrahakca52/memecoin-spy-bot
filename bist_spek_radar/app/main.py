@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 
 from .paper import status as paper_status, trade as paper_trade
 from .scanner import configured_symbols, scan_symbols
+from .historical import analyze_history, backtest_universe
 
 app = FastAPI(title="BIST Spek Radar", version="0.1.0",
               description="BIST anomaly screening and paper portfolio only")
@@ -28,7 +29,7 @@ def universe():
 @app.get("/api/scan")
 def scan():
     return {"mode":"RESEARCH_ONLY","source":"Yahoo Finance; indicative/delayed, not exchange real-time",
-            "results":scan_symbols()}
+            "results":scan_symbols()}\n\n@app.get("/api/history/{symbol}")\ndef history(symbol: str):\n    if not symbol.replace(".", "").isalnum() or len(symbol) > 12:\n        raise HTTPException(status_code=400, detail="Geçersiz hisse kodu")\n    return analyze_history(symbol)\n\n@app.get("/api/backtest")\ndef backtest(period: str = "2y", limit: int = 40):\n    if period not in {"1y", "2y", "5y", "max"}:\n        raise HTTPException(status_code=400, detail="period 1y, 2y, 5y veya max olabilir")\n    symbols = configured_symbols()\n    return backtest_universe(symbols, period=period, limit=max(1, min(limit, 100)))
 
 @app.get("/api/paper")
 def paper():
