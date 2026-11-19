@@ -3,11 +3,14 @@ from datetime import datetime,timezone
 import asyncio
 import os
 import time
-from fastapi import FastAPI,HTTPException,Query,Header\nfrom pydantic import BaseModel,Field\nimport hmac
+from fastapi import FastAPI,HTTPException,Query,Header
+from pydantic import BaseModel,Field
+import hmac
 from memecoin_v2.scanner import Scanner,candidate_to_dict
 from memecoin_v2.settings import Settings
 from wallet_tracker import get_wallet_token_activity
-from telegram_notify import send_scan_report\nfrom memecoin_v2 import paper_ledger
+from telegram_notify import send_scan_report
+from memecoin_v2 import paper_ledger
 
 app=FastAPI(title="Memecoin Spy Bot V2",version="2.0.0",
             description="Read-only Solana discovery and security triage. Paper mode only.")
@@ -20,7 +23,7 @@ async def health():
     return {"ok":True,"service":"memecoin-spy-bot-v2","mode":"paper",
             "real_trading_enabled":False,"utc":datetime.now(timezone.utc).isoformat(),
             "integrations":{"dexscreener":True,"solana_public_rpc":True,
-                            "rugcheck":True,"transaction_indexing":False,
+                            "rugcheck":True,"helius_transaction_indexing":bool(os.getenv("HELIUS_API_KEY")),"paper_ledger":True,
                             "live_execution":False}}
 
 @app.get("/v2/scan")
