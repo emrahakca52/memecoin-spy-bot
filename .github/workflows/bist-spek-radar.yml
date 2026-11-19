@@ -1,0 +1,24 @@
+name: BIST Spek Radar tests
+on:
+  push:
+    branches: [bist-spek-radar]
+    paths:
+      - 'bist_spek_radar/**'
+      - '.github/workflows/bist-spek-radar.yml'
+  pull_request:
+    paths:
+      - 'bist_spek_radar/**'
+      - '.github/workflows/bist-spek-radar.yml'
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: bist_spek_radar
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements-dev.txt
+      - run: pytest -q
