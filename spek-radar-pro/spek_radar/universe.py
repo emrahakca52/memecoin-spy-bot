@@ -62,6 +62,9 @@ def parse_kap_markets(html: str) -> pd.DataFrame:
                      if a.get_text(" ", strip=True).upper().strip() != code), "")
         if not name and len(cells) >= 3:
             name = cells[2]
+        # Exclude fund products even if KAP groups them with pay-market issuers.
+        if any(token in _normalise(name) for token in ("YATIRIM FONU", "BORSA YATIRIM FONU", "ETF")):
+            continue
         rows[code] = {
             "symbol": f"{code}.IS",
             "code": code,
