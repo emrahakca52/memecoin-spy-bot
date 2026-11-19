@@ -6,7 +6,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 from .paper import status as paper_status, trade as paper_trade
-from .scanner import configured_symbols, scan_symbols
+from .scanner import configured_symbols, scan_symbols, universe_status
 from .historical import analyze_history, backtest_universe
 
 app = FastAPI(title="BIST Spek Radar", version="0.1.0",
@@ -24,7 +24,8 @@ def health():
 
 @app.get("/api/universe")
 def universe():
-    return {"symbols":configured_symbols(),"count":len(configured_symbols())}
+    symbols = configured_symbols()
+    return {"symbols":symbols,"count":len(symbols),"universe":universe_status()}
 
 @app.get("/api/scan")
 def scan():
@@ -42,7 +43,9 @@ def backtest(period: str = "2y", limit: int = 40):
     if period not in {"1y", "2y", "5y", "max"}:
         raise HTTPException(status_code=400, detail="period 1y, 2y, 5y veya max olabilir")
     symbols = configured_symbols()
-    return backtest_universe(symbols, period=period, limit=max(1, min(limit, 100)))
+    result = backtest_universe(symbols, period=period, limit=max(1, min(limit, 100)))
+    result["universe"] = universe_status()
+    return result
 
 @app.get("/api/paper")
 def paper():
