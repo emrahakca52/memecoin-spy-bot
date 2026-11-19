@@ -10,6 +10,8 @@ def add_indicators(df: pd.DataFrame, benchmark: pd.Series | None = None) -> pd.D
     x["atr_pct"] = x.atr14 / x.close.replace(0, np.nan)
     x["atr_compression"] = x.atr_pct / x.atr_pct.rolling(20).median()
     x["vol_avg20"] = x.volume.rolling(20).mean()
+    # Approximate traded value; not official exchange turnover.
+    x["turnover20_tl"] = (x.close * x.volume).rolling(20).mean()
     x["rel_volume"] = x.volume / x.vol_avg20.replace(0, np.nan)
     direction = np.sign(x.close.diff()).fillna(0)
     x["obv"] = (direction * x.volume).cumsum()
@@ -46,7 +48,9 @@ def score_latest(x: pd.DataFrame) -> dict:
                "close_strength": .15, "relative_strength": .25}
     score = round(sum(parts[k]*weights[k] for k in weights))
     label = "GÜÇLÜ ERKEN UYARI" if score >= 80 else "YAKIN TAKİP" if score >= 65 else "İZLEME" if score >= 50 else "SİNYAL ZAYIF"
-    return {"score": score, "signal": label, "rel_volume": _num(rv,2),
+    turnover = r.get("turnover20_tl", np.nan)
+    liquidity = "ÇOK DÜŞÜK" if pd.notna(turnover) and turnover < 5_000_000 else "DÜŞÜK" if pd.notna(turnover) and turnover < 20_000_000 else "NORMAL" if pd.notna(turnover) else "BİLİNMİYOR"
+    return {"score": score, "signal": label, "avg_turnover20_tl": _num(turnover,0), "liquidity": liquidity, "rel_volume": _num(rv,2),
             "atr_compression": _num(comp,2), "obv_change20": _num(obv,3),
             "close_location": _num(loc,2), "relative_strength20": _num(rs,3),
             **{f"score_{k}": v for k,v in parts.items()}}
