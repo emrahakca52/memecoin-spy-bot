@@ -80,7 +80,7 @@ class HeliusProvider:
             result.update({"available":True,"sniper_cluster_detected":maximum>=3,
                            "transactions_examined":examined,"same_slot_swap_cluster_max":maximum})
             result["notes"].append("Public RPC recent sample only; incomplete heuristic, not proof of bundle activity")
-        except (httpx.HTTPError, ValueError, TypeError, KeyError):
+        except (httpx.HTTPError, ValueError, TypeError, KeyError, AttributeError):
             result["notes"].append("Public RPC transaction sample unavailable; gate remains unknown")
         finally:
             if owns:
