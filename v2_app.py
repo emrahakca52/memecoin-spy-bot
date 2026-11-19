@@ -3,7 +3,8 @@ from datetime import datetime,timezone
 import asyncio
 import os
 import time
-from fastapi import FastAPI,HTTPException,Query,Header\nfrom fastapi.responses import HTMLResponse
+from fastapi import FastAPI,HTTPException,Query,Header
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel,Field
 import hmac
 from memecoin_v2.scanner import Scanner,candidate_to_dict
