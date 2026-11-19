@@ -30,12 +30,18 @@ class Scanner:
 
     async def scan(self, limit: int=30) -> list[RankedCandidate]:
         bounded_limit=max(1,min(int(limit),50))
-        markets=await self.provider.discover_solana(limit=bounded_limit)
+        primary_error=None
+        try:
+            markets=await self.provider.discover_solana(limit=bounded_limit)
+        except Exception as exc:
+            markets=[]
+            primary_error=type(exc).__name__
+            logger.warning("Primary discovery unavailable provider=dexscreener error=%s",primary_error)
         primary_count=len(markets)
         if not markets:
             try:
                 markets=await self.fallback_provider.discover_solana(limit=bounded_limit)
-                logger.info("Discovery fallback provider=geckoterminal primary_count=%s fallback_count=%s",primary_count,len(markets))
+                logger.info("Discovery fallback provider=geckoterminal primary_count=%s primary_error=%s fallback_count=%s",primary_count,primary_error,len(markets))
             except Exception as exc:
                 logger.warning("Discovery fallback unavailable provider=geckoterminal error=%s",type(exc).__name__)
                 markets=[]
