@@ -1,6 +1,7 @@
 """Standalone V2 read-only discovery API; not the production V1 entry point."""
 from datetime import datetime,timezone
 import asyncio
+import logging
 import os
 import time
 from fastapi import FastAPI,HTTPException,Query,Header
@@ -15,6 +16,7 @@ from memecoin_v2 import paper_ledger
 
 app=FastAPI(title="Memecoin Spy Bot V2",version="2.0.0",
             description="Solana discovery, fail-closed security screening and authenticated paper ledger. No live execution.")
+logger=logging.getLogger(__name__)
 scanner=Scanner(Settings.from_env())
 _telegram_lock=asyncio.Lock()
 _last_telegram_report=0.0
@@ -47,7 +49,8 @@ async def scan(limit:int=Query(default=20,ge=1,le=50)):
                     _last_telegram_report=now
         return report
     except Exception as exc:
-        raise HTTPException(status_code=502,detail="Market or security data provider unavailable") from exc
+        logger.exception("V2 scan failed; exception_type=%s", type(exc).__name__)
+        raise HTTPException(status_code=502,detail=f"Market or security data provider unavailable ({type(exc).__name__})") from exc
 
 @app.get("/v2/wallet/{wallet_address}")
 async def wallet_activity(wallet_address:str,limit:int=Query(default=10,ge=1,le=20)):
