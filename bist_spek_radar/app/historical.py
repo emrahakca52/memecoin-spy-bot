@@ -124,26 +124,34 @@ def _extract_ticker_frame(raw: pd.DataFrame, ticker: str) -> pd.DataFrame:
     return pd.DataFrame()
 
 
-def backtest_universe(symbols: list[str], period: str = "2y", limit: int = 40) -> dict[str, Any]:
+def backtest_universe(symbols: list[str], period: str = "2y", limit: int = 40, progress_callback=None) -> dict[str, Any]:
     results = []
     failures = 0
     symbols_with_data = 0
+    processed = 0
     normalized = list(dict.fromkeys(s.upper().removesuffix(".IS") for s in symbols))
-    # Batch downloads avoid one Yahoo request per ticker, which triggers rate limits.
-    batch_size = 25
-    for offset in range(0, len(normalized), batch_size):
+    # Larger batches reduce the number of Yahoo round trips (517 symbols: ~11 batches).
+    batch_size = 50
+    total_batches = (len(normalized) + batch_size - 1) // batch_size
+    for batch_no, offset in enumerate(range(0, len(normalized), batch_size), start=1):
         batch = normalized[offset:offset + batch_size]
         tickers = [f"{s}.IS" for s in batch]
         try:
             raw = yf.download(
                 tickers=tickers, period=period, interval="1d", auto_adjust=True,
-                group_by="ticker", threads=True, progress=False, timeout=35,
+                group_by="ticker", threads=True, progress=False, timeout=50,
             )
         except Exception:
             failures += len(batch)
+            processed += len(batch)
+            if progress_callback:
+                progress_callback(processed, len(normalized), symbols_with_data, failures, batch_no, total_batches)
             continue
         if raw is None or raw.empty:
             failures += len(batch)
+            processed += len(batch)
+            if progress_callback:
+                progress_callback(processed, len(normalized), symbols_with_data, failures, batch_no, total_batches)
             continue
         for symbol, ticker in zip(batch, tickers):
             try:
@@ -156,7 +164,6 @@ def backtest_universe(symbols: list[str], period: str = "2y", limit: int = 40) -
                 f = f.dropna(subset=["vol_accel", "vol_ratio", "range_pos", "future20"])
                 for dt, r in f.iterrows():
                     score = _candidate_score(r)
-                    # Signal is calculated only from data available on that date.
                     if score >= 40 and abs(float(r.ret5)) <= 18 and float(r.ret20) <= 25:
                         results.append({"symbol": symbol, "date": str(dt.date()), "score": score,
                             "close": round(float(r.close), 4), "volume_acceleration_5d": round(float(r.vol_accel), 2),
@@ -165,8 +172,11 @@ def backtest_universe(symbols: list[str], period: str = "2y", limit: int = 40) -
                             "outcome_20d": "YÜKSELİŞ" if float(r.future20) >= 30 else ("DÜŞÜŞ" if float(r.future20) <= -15 else "NÖTR")})
             except Exception:
                 failures += 1
+        processed += len(batch)
+        if progress_callback:
+            progress_callback(processed, len(normalized), symbols_with_data, failures, batch_no, total_batches)
     results.sort(key=lambda x: (x["score"], x["volume_acceleration_5d"], x["forward_max_20d_pct"]), reverse=True)
     return {"mode":"HISTORICAL_RESEARCH_ONLY","period":period,"symbols_requested":len(normalized),
-            "symbols_with_data":symbols_with_data,"data_failures":failures,
+            "symbols_processed":processed,"symbols_with_data":symbols_with_data,"data_failures":failures,
             "candidate_count":len(results),"results":results[:limit],
             "note":"YÜKSELİŞ sınıfı, sonraki 20 işlem günündeki en yüksek fiyatın başlangıç kapanışına göre en az %30 yükselmesidir; dönem sonu getirisi değildir. Geriye dönük sonuçlar geleceği garanti etmez. Yahoo Finance verisi gecikmeli/eksik olabilir."}
