@@ -20,6 +20,7 @@ class TokenMarket:
     pair_address: str | None = None
     source: str = "unknown"
     raw: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)
+    onchain: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)
 
 
 @dataclass(frozen=True)
