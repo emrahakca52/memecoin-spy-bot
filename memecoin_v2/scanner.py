@@ -8,6 +8,8 @@ from .providers.rugcheck import RugCheckProvider
 from .providers.solana_rpc import SolanaRpcProvider
 from .providers.helius import HeliusProvider
 from grok import evaluate_token
+from .local_screening import evaluate_local
+import os
 from .risk import evaluate_market
 from .scoring import score_market
 from .settings import Settings
@@ -19,7 +21,7 @@ class Scanner:
         self.onchain_provider=onchain_provider or SolanaRpcProvider(timeout=self.settings.request_timeout_seconds)
         self.rugcheck_provider=rugcheck_provider or RugCheckProvider(timeout=self.settings.request_timeout_seconds)
         self.helius_provider=helius_provider or HeliusProvider(timeout=self.settings.request_timeout_seconds)
-        self.ai_provider=ai_provider or evaluate_token
+        self.ai_provider=ai_provider or (evaluate_token if (os.getenv("GEMINI_API_KEY","").strip() if os.getenv("AI_PROVIDER","grok").lower()=="gemini" else os.getenv("XAI_API_KEY","").strip()) else None)
 
     async def scan(self, limit: int=30) -> list[RankedCandidate]:
         markets=await self.provider.discover_solana(limit=max(1,min(int(limit),50)))
@@ -47,7 +49,7 @@ class Scanner:
                 if isinstance(helius_result,BaseException):
                     helius_result={"provider":"helius","available":False,"sniper_cluster_detected":None,"notes":["provider_unavailable"]}
                 try:
-                    ai_result=await self.ai_provider(token_for_ai,rug_result)
+                    ai_result=(await self.ai_provider(token_for_ai,rug_result) if self.ai_provider else evaluate_local(token_for_ai,rug_result))
                 except Exception:
                     ai_result={"provider":"AI","api_ok":False,"passed":False,"reasons":["provider_unavailable"]}
                 if isinstance(ai_result,BaseException):
