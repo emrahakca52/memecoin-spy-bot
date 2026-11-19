@@ -13,6 +13,10 @@ class FakeOnchainProvider:
         return {"authority_check":True,"mint_authority_present":False,
                 "freeze_authority_present":False,"holder_sample_complete":False}
 
+class FakeAiProvider:
+    async def __call__(self,token,rugcheck_result):
+        return {"provider":"test","api_ok":True,"passed":True,"decision":"COPY"}
+
 class FakeRugCheckProvider:
     async def inspect_mint(self,mint,market_context=None):
         return {"available":True,"score_normalised":12,"top10_holders_pct":18,
@@ -29,7 +33,7 @@ def market(address,**changes):
 
 class ScannerTests(unittest.IsolatedAsyncioTestCase):
     def scanner(self,markets,onchain=None,rug=None):
-        return Scanner(Settings(),FakeProvider(markets),onchain or FakeOnchainProvider(),rug or FakeRugCheckProvider())
+        return Scanner(Settings(),FakeProvider(markets),onchain or FakeOnchainProvider(),rug or FakeRugCheckProvider(),ai_provider=FakeAiProvider())
     async def test_deduplicates_addresses(self):
         result=await self.scanner([market("A"),market("A"),market("B",liquidity_usd=1)]).scan()
         self.assertEqual(len(result),2)
