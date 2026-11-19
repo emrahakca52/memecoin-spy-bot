@@ -7,25 +7,24 @@ from .providers.dexscreener import DexScreenerProvider
 from .providers.rugcheck import RugCheckProvider
 from .providers.solana_rpc import SolanaRpcProvider
 from .providers.helius import HeliusProvider
+from .providers.geckoterminal import GeckoTerminalProvider
 from grok import evaluate_token
 from .local_screening import evaluate_local
 import os
+import logging
 from .risk import evaluate_market
 from .scoring import score_market
 from .settings import Settings
 
-class Scanner:
-    def __init__(self, settings: Settings|None=None, provider=None, onchain_provider=None, rugcheck_provider=None, helius_provider=None, ai_provider=None):
+logger=logging.getLogger(__name__)\n\nclass Scanner:\n    def __init__(self, settings: Settings|None=None, provider=None, onchain_provider=None, rugcheck_provider=None, helius_provider=None, ai_provider=None, fallback_provider=None):
         self.settings=settings or Settings.from_env()
-        self.provider=provider or DexScreenerProvider(timeout=self.settings.request_timeout_seconds)
-        self.onchain_provider=onchain_provider or SolanaRpcProvider(timeout=self.settings.request_timeout_seconds)
+        self.provider=provider or DexScreenerProvider(timeout=self.settings.request_timeout_seconds)\n        self.fallback_provider=fallback_provider or GeckoTerminalProvider(timeout=self.settings.request_timeout_seconds)\n        self.onchain_provider=onchain_provider or SolanaRpcProvider(timeout=self.settings.request_timeout_seconds)
         self.rugcheck_provider=rugcheck_provider or RugCheckProvider(timeout=self.settings.request_timeout_seconds)
         self.helius_provider=helius_provider or HeliusProvider(timeout=self.settings.request_timeout_seconds)
         self.ai_provider=ai_provider or (evaluate_token if (os.getenv("GEMINI_API_KEY","").strip() if os.getenv("AI_PROVIDER","grok").lower()=="gemini" else os.getenv("XAI_API_KEY","").strip()) else None)
 
     async def scan(self, limit: int=30) -> list[RankedCandidate]:
-        markets=await self.provider.discover_solana(limit=max(1,min(int(limit),50)))
-        ranked,seen=[],set()
+        bounded_limit=max(1,min(int(limit),50))\n        markets=await self.provider.discover_solana(limit=bounded_limit)\n        primary_count=len(markets)\n        if not markets:\n            try:\n                markets=await self.fallback_provider.discover_solana(limit=bounded_limit)\n                logger.info("Discovery fallback provider=geckoterminal primary_count=%s fallback_count=%s",primary_count,len(markets))\n            except Exception as exc:\n                logger.warning("Discovery fallback unavailable provider=geckoterminal error=%s",type(exc).__name__)\n                markets=[]\n        else:\n            logger.info("Discovery provider=dexscreener candidate_count=%s",primary_count)\n        ranked,seen=[],set()
         for index,market in enumerate(markets):
             key=market.address.lower()
             if not key or key in seen: continue
