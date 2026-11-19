@@ -25,7 +25,7 @@ _last_telegram_report=0.0
 async def health():
     return {"ok":True,"service":"memecoin-spy-bot-v2","mode":"paper",
             "real_trading_enabled":False,"utc":datetime.now(timezone.utc).isoformat(),
-            "integrations":{"dexscreener":True,"solana_public_rpc":True,
+            "integrations":{"dexscreener":True,"geckoterminal_fallback":True,"solana_public_rpc":True,
                             "public_rpc_transaction_sample":True,"local_rule_screening":True,
                             "rugcheck":True,"ai_screening":bool(os.getenv("GEMINI_API_KEY") if os.getenv("AI_PROVIDER","grok").lower()=="gemini" else os.getenv("XAI_API_KEY")),"helius_transaction_indexing":bool(os.getenv("HELIUS_API_KEY")),"paper_ledger":bool(os.getenv("DATABASE_URL")),
                             "live_execution":False}}
