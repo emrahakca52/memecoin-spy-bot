@@ -80,7 +80,11 @@ def parse_kap_markets(html: str) -> pd.DataFrame:
         # suspiciously small or unclassified universe.
         table_rows: dict[str, dict] = {}
         market = None
-        for table in pd.read_html(StringIO(html)):
+        try:
+            tables = pd.read_html(StringIO(html))
+        except (ValueError, ImportError):
+            tables = []
+        for table in tables:
             for values in table.itertuples(index=False, name=None):
                 cells = [str(v).strip() for v in values if pd.notna(v)]
                 joined = " ".join(cells)
@@ -91,9 +95,12 @@ def parse_kap_markets(html: str) -> pd.DataFrame:
                 if market:
                     code = next((c.upper() for c in cells if CODE_RE.fullmatch(c.upper())), None)
                     if code:
+                        company = cells[-1] if len(cells) > 1 else ""
+                        if any(token in _normalise(company) for token in ("YATIRIM FONU", "ETF")):
+                            continue
                         table_rows[code] = {
                             "symbol": f"{code}.IS", "code": code,
-                            "company": cells[-1] if len(cells) > 1 else "",
+                            "company": company,
                             "market_segment": market, "source": "KAP",
                         }
         if len(table_rows) > len(rows):
