@@ -28,7 +28,14 @@ def _run_backtest_job(job_id: str, period: str, limit: int, symbols: list[str]) 
     BACKTEST_JOBS[job_id]["status"] = "running"
     BACKTEST_JOBS[job_id]["started_at"] = datetime.now(timezone.utc).isoformat()
     try:
-        result = backtest_universe(symbols, period=period, limit=limit)
+        def update_progress(processed, total, with_data, failures, batch_no, total_batches):
+            BACKTEST_JOBS[job_id].update({
+                "processed": processed, "symbols_requested": total,
+                "symbols_with_data": with_data, "data_failures": failures,
+                "batch": batch_no, "total_batches": total_batches,
+                "progress_pct": round(processed / total * 100, 1) if total else 100
+            })
+        result = backtest_universe(symbols, period=period, limit=limit, progress_callback=update_progress)
         result["universe"] = universe_status()
         BACKTEST_JOBS[job_id].update({"status": "completed", "result": result})
     except Exception as exc:
@@ -71,7 +78,8 @@ def start_backtest(background_tasks: BackgroundTasks, period: str = "2y", limit:
     ACTIVE_BACKTEST_JOB = job_id
     BACKTEST_JOBS[job_id] = {
         "job_id": job_id, "status": "queued", "period": period,
-        "symbols_requested": len(symbols), "created_at": datetime.now(timezone.utc).isoformat()
+        "symbols_requested": len(symbols), "processed": 0, "symbols_with_data": 0,
+        "data_failures": 0, "progress_pct": 0, "created_at": datetime.now(timezone.utc).isoformat()
     }
     background_tasks.add_task(_run_backtest_job, job_id, period, max(1, min(limit, 100)), symbols)
     return {"message": "Tarihsel tarama arka planda başlatıldı.", "job_id": job_id,
@@ -138,7 +146,7 @@ async function pollBacktest(id){let o=document.getElementById('out');
 try{let j=await(await fetch('/api/backtest/status/'+id)).json();
 if(j.status==='completed'){let b=document.getElementById('backtestBtn');b.disabled=false;b.textContent='517 Hisse Tarihsel Araştırma';let d=j.result;let rows=d.results||[];o.innerHTML='<h2>Tarihsel sonuçlar · '+d.symbols_with_data+'/'+d.symbols_requested+' hissede veri · '+d.candidate_count+' aday</h2><p>Veri hatası: '+d.data_failures+'</p><table><tr><th>Hisse</th><th>Tarih</th><th>Skor</th><th>Hacim</th><th>5g değişim</th><th>Sonraki 20g max</th><th>Sınıf</th></tr>'+rows.map(x=>'<tr><td>'+x.symbol+'</td><td>'+x.date+'</td><td>'+x.score+'</td><td>'+x.volume_ratio+'x</td><td>'+x.change_5d_pct+'%</td><td>'+x.forward_max_20d_pct+'%</td><td>'+x.outcome_20d+'</td></tr>').join('')+'</table><p class="muted">'+d.note+'</p>';return}
 if(j.status==='failed'){let b=document.getElementById('backtestBtn');b.disabled=false;b.textContent='Yeniden Dene';o.textContent='Tarama başarısız: '+j.error;return}
-o.textContent='Tarihsel tarama: '+j.status+' · '+j.symbols_requested+' sembol. Sayfa açık kalabilir.';setTimeout(()=>pollBacktest(id),5000)}
+o.textContent='Tarihsel tarama: '+(j.progress_pct||0)+'% · '+(j.processed||0)+'/'+j.symbols_requested+' hisse işlendi · '+(j.symbols_with_data||0)+' hissede veri var · '+(j.data_failures||0)+' veri hatası · Grup '+(j.batch||0)+'/'+(j.total_batches||0);setTimeout(()=>pollBacktest(id),2500)}
 catch(e){let b=document.getElementById('backtestBtn');b.disabled=false;b.textContent='Durumu Yenile';o.textContent='Durum alınamadı: '+e}}
 async function paper(){let d=await(await fetch('/api/paper')).json();document.getElementById('ledger').innerHTML='<h2>Sanal Portföy</h2><p>Mod: '+d.mode+' · Nakit: '+d.cash.toLocaleString('tr-TR')+' TL</p><p>Açık pozisyon: '+d.positions.length+' · Son işlem: '+d.recent_trades.length+'</p>'}
 paper();
