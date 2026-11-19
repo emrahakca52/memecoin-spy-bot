@@ -9,7 +9,26 @@ import yfinance as yf
 def _features(frame: pd.DataFrame) -> pd.DataFrame:
     df = frame.copy()
     if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(-1)
+        # yfinance may return (Price, Ticker) or (Ticker, Price).
+        # Select the level that actually contains OHLCV field names.
+        price_fields = {"Open", "High", "Low", "Close", "Adj Close", "Volume"}
+        chosen = None
+        for level in range(df.columns.nlevels):
+            vals = set(str(v) for v in df.columns.get_level_values(level))
+            if {"Close", "Volume"}.issubset(vals):
+                chosen = level
+                break
+        if chosen is None:
+            raise ValueError("Yahoo Finance sütunlarında Close/Volume bulunamadı")
+        if df.columns.nlevels > 1:
+            other_levels = [i for i in range(df.columns.nlevels) if i != chosen]
+            if other_levels:
+                tickers = list(dict.fromkeys(str(v) for v in df.columns.get_level_values(other_levels[0])))
+                if len(tickers) == 1:
+                    df = df.xs(tickers[0], axis=1, level=other_levels[0], drop_level=True)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(chosen if chosen < df.columns.nlevels else 0)
+    df.columns = [str(col) for col in df.columns]
     df = df.dropna(subset=["Close", "Volume"]).copy()
     if len(df) < 45:
         return pd.DataFrame()
