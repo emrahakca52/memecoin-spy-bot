@@ -56,7 +56,7 @@ def evaluate_market(m:TokenMarket,settings:Settings,now:datetime|None=None)->Ris
         if "top10_holder_concentration" not in missing: missing.append("top10_holder_concentration")
     ai=security.get("ai",{})
     if not isinstance(ai,dict) or not ai.get("api_ok"):
-        missing.append("ai_screening")
+        missing.append("local_or_ai_screening")
     elif not ai.get("passed"):
         reasons.append("ai_screening_rejected")
 
