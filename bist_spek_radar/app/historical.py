@@ -78,6 +78,10 @@ def analyze_history(symbol: str, period: str = "max") -> dict[str, Any]:
         peak_date = valid["future60"].idxmax()
         peak_gain = float(valid.loc[peak_date, "future60"])
         peak_loc = f.index.get_loc(peak_date)
+        # The selected date is the START of the strongest forward 60-session run-up.
+        # Also report the actual highest closing-price date inside that forward window.
+        future_window = f.iloc[peak_loc + 1: peak_loc + 61]
+        runup_peak_date = future_window["close"].idxmax() if not future_window.empty else peak_date
         start_loc = max(0, peak_loc - 60)
         window = f.iloc[start_loc:peak_loc].copy()
         window = window.dropna(subset=["vol_accel", "vol_ratio", "range_pos"])
@@ -98,7 +102,9 @@ def analyze_history(symbol: str, period: str = "max") -> dict[str, Any]:
                 "forward_max_40d_pct": None if pd.isna(r.future40) else round(float(r.future40), 2),
                 "forward_max_60d_pct": None if pd.isna(r.future60) else round(float(r.future60), 2),
             })
-        return {"symbol": ticker.removesuffix(".IS"), "peak_forward_60d_date": str(peak_date.date()),
+        return {"symbol": ticker.removesuffix(".IS"), "runup_start_date": str(peak_date.date()),
+                "runup_peak_date": str(runup_peak_date.date()),
+                "peak_forward_60d_date": str(peak_date.date()),
                 "peak_forward_60d_return_pct": round(peak_gain, 2),
                 "lookback_sessions": 60, "candidate_days": rows,
                 "source": "Yahoo Finance; gecikmeli/eksik olabilir"}
@@ -108,12 +114,14 @@ def analyze_history(symbol: str, period: str = "max") -> dict[str, Any]:
 def backtest_universe(symbols: list[str], period: str = "2y", limit: int = 40) -> dict[str, Any]:
     results = []
     failures = 0
+    symbols_with_data = 0
     for symbol in symbols:
         ticker = symbol.upper().removesuffix(".IS") + ".IS"
         try:
             frame = yf.download(ticker, period=period, interval="1d", auto_adjust=True, progress=False, threads=False)
             f = _features(frame)
             if f.empty: failures += 1; continue
+            symbols_with_data += 1
             f = f.dropna(subset=["vol_accel", "vol_ratio", "range_pos", "future20"])
             for dt, r in f.iterrows():
                 score = _candidate_score(r)
@@ -128,6 +136,6 @@ def backtest_universe(symbols: list[str], period: str = "2y", limit: int = 40) -
             failures += 1
     results.sort(key=lambda x: (x["score"], x["volume_acceleration_5d"], x["forward_max_20d_pct"]), reverse=True)
     return {"mode":"HISTORICAL_RESEARCH_ONLY","period":period,"symbols_requested":len(symbols),
-            "symbols_with_data":len(set(x["symbol"] for x in results)),"data_failures":failures,
+            "symbols_with_data":symbols_with_data,"data_failures":failures,
             "candidate_count":len(results),"results":results[:limit],
             "note":"Geçmiş ileri getiriler eğitim/geriye dönük test içindir; geleceği garanti etmez. Yahoo Finance verisi gecikmeli/eksik olabilir."}
