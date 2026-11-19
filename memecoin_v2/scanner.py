@@ -2,22 +2,34 @@
 from __future__ import annotations
 from .models import RankedCandidate
 from .providers.dexscreener import DexScreenerProvider
+from .providers.solana_rpc import SolanaRpcProvider
 from .risk import evaluate_market
 from .scoring import score_market
 from .settings import Settings
 
 class Scanner:
-    def __init__(self, settings: Settings | None = None, provider=None):
+    def __init__(self, settings: Settings | None = None, provider=None, onchain_provider=None):
         self.settings = settings or Settings.from_env()
         self.provider = provider or DexScreenerProvider(timeout=self.settings.request_timeout_seconds)
+        self.onchain_provider = onchain_provider or SolanaRpcProvider(timeout=self.settings.request_timeout_seconds)
 
     async def scan(self, limit: int = 30) -> list[RankedCandidate]:
         markets = await self.provider.discover_solana(limit=max(1, min(int(limit), 50)))
         ranked, seen = [], set()
-        for market in markets:
+        for index, market in enumerate(markets):
             key = market.address.lower()
             if not key or key in seen: continue
             seen.add(key)
+            # Public RPC is rate-limited: inspect only the first small sample each scan.
+            if index < 10 and market.chain.lower() == "solana":
+                try:
+                    market = __import__("dataclasses").replace(
+                        market, onchain=await self.onchain_provider.inspect_mint(market.address)
+                    )
+                except Exception:
+                    market = __import__("dataclasses").replace(
+                        market, onchain={"provider":"solana_public_rpc","notes":["On-chain inspection failed"]}
+                    )
             score, signals = score_market(market)
             risk = evaluate_market(market, self.settings)
             ranked.append(RankedCandidate(market, score, risk, signals))
@@ -34,5 +46,6 @@ def candidate_to_dict(item: RankedCandidate) -> dict:
         "source": m.source, "market_score": item.score,
         "risk": {"eligible": item.risk.eligible, "score": item.risk.score,
                  "reasons": list(item.risk.reasons), "missing": list(item.risk.missing)},
+        "onchain": m.onchain,
         "signals": list(item.signals), "mode": "paper", "real_trading_enabled": False,
     }
