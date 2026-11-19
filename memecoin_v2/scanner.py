@@ -1,5 +1,6 @@
 """Orchestrates discovery, ranking and fail-closed risk evaluation."""
 from __future__ import annotations
+from dataclasses import replace
 from .models import RankedCandidate
 from .providers.dexscreener import DexScreenerProvider
 from .providers.solana_rpc import SolanaRpcProvider
@@ -23,7 +24,7 @@ class Scanner:
             # Public RPC is rate-limited: inspect only the first small sample each scan.
             if index < 10 and market.chain.lower() == "solana":
                 try:
-                    market = __import__("dataclasses").replace(
+                    market = replace(
                         market, onchain=await self.onchain_provider.inspect_mint(market.address)
                     )
                 except Exception:
