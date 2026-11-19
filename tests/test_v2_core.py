@@ -45,6 +45,26 @@ class V2CoreTests(unittest.TestCase):
         data["rugcheck"]["lp_locked_pct"]=10
         result=evaluate_market(self.market(onchain=data),Settings())
         self.assertIn("lp_lock_below_minimum",result.reasons)
+
+    def test_ai_and_helius_positive_gates_are_required_and_can_pass(self):
+        data=self.market().onchain
+        data["ai"]={"api_ok":True,"passed":True}
+        data["helius"]={"available":True,"sniper_cluster_detected":False}
+        result=evaluate_market(self.market(onchain=data),Settings())
+        self.assertTrue(result.eligible)
+    def test_ai_rejection_blocks_candidate(self):
+        data=self.market().onchain
+        data["ai"]={"api_ok":True,"passed":False}
+        data["helius"]={"available":True,"sniper_cluster_detected":False}
+        result=evaluate_market(self.market(onchain=data),Settings())
+        self.assertIn("ai_screening_rejected",result.reasons)
+    def test_helius_cluster_blocks_candidate(self):
+        data=self.market().onchain
+        data["ai"]={"api_ok":True,"passed":True}
+        data["helius"]={"available":True,"sniper_cluster_detected":True}
+        result=evaluate_market(self.market(onchain=data),Settings())
+        self.assertIn("bundle_sniper_cluster_detected",result.reasons)
+
     def test_real_trading_is_disabled(self):
         self.assertFalse(Settings.from_env().real_trading_enabled)
 
