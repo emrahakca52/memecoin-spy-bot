@@ -15,7 +15,8 @@ python -m spek_radar.cli --all-bist --period 2y
 
 Çıktılar:
 - `output/universe_snapshot.csv`: taramada kullanılan KAP sembol/pazar anlık görüntüsü
-- `output/scan.csv`: skora göre sıralanmış tarama sonuçları
+- `output/scan.csv`: tüm başarılı sembollerin skora göre sıralanmış sonuçları
+- `output/top_20.csv`: en yüksek puanlı 20 aday (varsayılan; `--top` ile değiştirilebilir)
 - `output/errors.csv`: verisi alınamayan semboller ve hata açıklamaları
 
 Sadece belirli hisseleri taramak için:
@@ -25,7 +26,7 @@ python -m spek_radar.cli --symbols DSTKF.IS,KTLEV.IS,TERA.IS,PEKGY.IS --period 2
 
 ## Skor neyi ölçüyor?
 
-Günlük OHLCV üzerinden göreli hacim, ATR sıkışması, OBV değişimi, kapanışın günlük aralık içindeki yeri ve XU100'e göre 20 günlük göreceli güç hesaplanır. 0–100 puan bir **araştırma önceliği** puanıdır; manipülasyon tespiti, kesin yükseliş tahmini veya yatırım tavsiyesi değildir. Düşük likidite ve veri kalitesi ayrıca incelenmelidir.
+Günlük OHLCV üzerinden göreli hacim (önceki 20 seans ortalamasına göre), ATR sıkışması, ortalama günlük hacme normalize OBV değişimi, kapanışın günlük aralık içindeki yeri ve XU100'e göre 20 günlük göreceli güç hesaplanır. Böylece güncel hacim kendi karşılaştırma ortalamasını yapay biçimde yükseltmez. 0–100 puan bir **araştırma önceliği** puanıdır; manipülasyon tespiti, kesin yükseliş tahmini veya yatırım tavsiyesi değildir. Düşük likidite ve veri kalitesi ayrıca incelenmelidir.
 
 ## Veri ve kapsam sınırlamaları
 
