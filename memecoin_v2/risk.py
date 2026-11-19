@@ -54,8 +54,11 @@ def evaluate_market(m:TokenMarket,settings:Settings,now:datetime|None=None)->Ris
     # Partial RPC largest-account samples are diagnostic only, never a complete holder index.
     if not rug.get("available") or rug.get("top10_holders_pct") is None:
         if "top10_holder_concentration" not in missing: missing.append("top10_holder_concentration")
-    # No transaction-indexing feed is configured: bundle/sniper detection remains unknown.
-    missing.append("bundle_sniper_activity")
+    helius=security.get("helius",{})
+    if not isinstance(helius,dict) or not helius.get("available") or helius.get("sniper_cluster_detected") is None:
+        missing.append("bundle_sniper_activity")
+    elif helius.get("sniper_cluster_detected"):
+        reasons.append("bundle_sniper_cluster_detected")
     score=max(0.0,100.0-18.0*len(reasons)-8.0*len(missing))
     return RiskResult(eligible=not reasons and not missing,score=round(score,2),
                       reasons=tuple(reasons),missing=tuple(dict.fromkeys(missing)))
