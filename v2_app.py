@@ -24,7 +24,7 @@ async def health():
     return {"ok":True,"service":"memecoin-spy-bot-v2","mode":"paper",
             "real_trading_enabled":False,"utc":datetime.now(timezone.utc).isoformat(),
             "integrations":{"dexscreener":True,"solana_public_rpc":True,
-                            "rugcheck":True,"ai_screening":bool(os.getenv("GEMINI_API_KEY") if os.getenv("AI_PROVIDER","grok").lower()=="gemini" else os.getenv("XAI_API_KEY")),"helius_transaction_indexing":bool(os.getenv("HELIUS_API_KEY")),"paper_ledger":True,
+                            "rugcheck":True,"ai_screening":bool(os.getenv("GEMINI_API_KEY") if os.getenv("AI_PROVIDER","grok").lower()=="gemini" else os.getenv("XAI_API_KEY")),"helius_transaction_indexing":bool(os.getenv("HELIUS_API_KEY")),"paper_ledger":bool(os.getenv("DATABASE_URL")),
                             "live_execution":False}}
 
 @app.get("/v2/scan")
@@ -141,7 +141,7 @@ input{background:#0c1425;border:1px solid var(--line);border-radius:9px;padding:
 </main><script>
 const el=id=>document.getElementById(id);const fmt=v=>v==null?'—':(Number(v).toLocaleString('en-US',{maximumFractionDigits:6}));
 async function refresh(){try{const h=await fetch('/health').then(r=>r.json());el('service').textContent=h.ok?'ONLINE':'OFFLINE';el('service').className='metric '+(h.ok?'good':'bad');el('integrations').innerHTML=Object.entries(h.integrations||{}).map(([k,v])=>'<div style="padding:5px 0">'+k.replaceAll('_',' ')+' — <b class="'+(v?'good':'warn')+'">'+(v?'Hazır':'Anahtar/bağlantı bekliyor')+'</b></div>').join('');}catch(e){el('service').textContent='Bağlantı yok';el('service').className='metric bad'}
-try{const p=await fetch('/v2/paper/status').then(r=>r.ok?r.json():null);el('cash').textContent=p?('$'+fmt(p.cash)):'DB bekliyor';}catch(e){el('cash').textContent='DB bekliyor'}}
+try{const p=await fetch('/v2/paper/status').then(r=>r.ok?r.json():null);el('cash').textContent=p?('$'+fmt(p.cash_usd)):'DB bekliyor';}catch(e){el('cash').textContent='DB bekliyor'}}
 async function scan(){const b=el('scanBtn');b.disabled=true;b.textContent='Taranıyor…';try{const r=await fetch('/v2/scan?limit=20');const d=await r.json();if(!r.ok)throw Error(d.detail||'Tarama başarısız');el('count').textContent=d.count;el('eligible').textContent=d.eligible_count;el('scanTime').textContent=new Date().toLocaleString('tr-TR');el('rows').innerHTML='';for(const c of d.candidates||[]){const m=c||{},risk=c.risk||{};const tr=document.createElement('tr');const vals=[m.symbol||m.name||'—',fmt(m.price_usd),fmt(m.liquidity_usd),fmt(m.volume_24h_usd),m.market_score??risk.score??'—',risk.eligible?'UYGUN':'ELE',((risk.missing||[]).concat(risk.reasons||[]).join(', ')||'—')];for(let i=0;i<vals.length;i++){const td=document.createElement('td');td.textContent=String(vals[i]);if(i===5)td.className=risk.eligible?'good':'bad';tr.appendChild(td)}el('rows').appendChild(tr)}if(!d.candidates?.length)el('rows').innerHTML='<tr><td colspan="7">Sonuç bulunamadı.</td></tr>';}catch(e){el('rows').innerHTML='<tr><td colspan="7" class="bad">'+e.message+'</td></tr>'}finally{b.disabled=false;b.textContent='Şimdi tara';await refresh()}}
 async function walletLookup(){const a=el('wallet').value.trim();if(!a)return;el('walletResult').textContent='Sorgulanıyor…';try{const r=await fetch('/v2/wallet/'+encodeURIComponent(a)+'?limit=10');const d=await r.json();el('walletResult').textContent=JSON.stringify(d,null,2)}catch(e){el('walletResult').textContent='Sorgu başarısız: '+e.message}}
 refresh();
