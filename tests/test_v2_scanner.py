@@ -8,7 +8,10 @@ class FakeProvider:
     def __init__(self,markets): self.markets=markets
     async def discover_solana(self,limit=30): return self.markets[:limit]
 
-class EmptyProvider:\n    async def discover_solana(self,limit=30): return []\n\nclass FakeOnchainProvider:
+class EmptyProvider:
+    async def discover_solana(self,limit=30): return []
+
+class FakeOnchainProvider:
     async def inspect_mint(self,mint):
         return {"authority_check":True,"mint_authority_present":False,
                 "freeze_authority_present":False,"holder_sample_complete":False}
@@ -34,7 +37,19 @@ def market(address,**changes):
 class ScannerTests(unittest.IsolatedAsyncioTestCase):
     def scanner(self,markets,onchain=None,rug=None):
         return Scanner(Settings(),FakeProvider(markets),onchain or FakeOnchainProvider(),rug or FakeRugCheckProvider(),ai_provider=FakeAiProvider())
-    async def test_gecko_fallback_used_when_primary_is_empty(self):\n        class Fallback:\n            def __init__(self): self.called=False\n            async def discover_solana(self,limit=30):\n                self.called=True\n                return [market("GECKO",source="geckoterminal")]\n        fallback=Fallback()\n        scanner=Scanner(Settings(),EmptyProvider(),FakeOnchainProvider(),FakeRugCheckProvider(),ai_provider=FakeAiProvider(),fallback_provider=fallback)\n        result=await scanner.scan()\n        self.assertTrue(fallback.called)\n        self.assertEqual(result[0].market.source,"geckoterminal")\n\n    async def test_deduplicates_addresses(self):
+    async def test_gecko_fallback_used_when_primary_is_empty(self):
+        class Fallback:
+            def __init__(self): self.called=False
+            async def discover_solana(self,limit=30):
+                self.called=True
+                return [market("GECKO",source="geckoterminal")]
+        fallback=Fallback()
+        scanner=Scanner(Settings(),EmptyProvider(),FakeOnchainProvider(),FakeRugCheckProvider(),ai_provider=FakeAiProvider(),fallback_provider=fallback)
+        result=await scanner.scan()
+        self.assertTrue(fallback.called)
+        self.assertEqual(result[0].market.source,"geckoterminal")
+
+    async def test_deduplicates_addresses(self):
         result=await self.scanner([market("A"),market("A"),market("B",liquidity_usd=1)]).scan()
         self.assertEqual(len(result),2)
         self.assertEqual(result[0].market.address,"A")
