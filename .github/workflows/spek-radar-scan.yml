@@ -7,8 +7,6 @@ on:
         description: Historical lookback for daily OHLCV
         required: true
         default: "2y"
-  schedule:
-    - cron: "15 16 * * 1-5"
 
 permissions:
   contents: read
