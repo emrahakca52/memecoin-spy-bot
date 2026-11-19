@@ -1,0 +1,24 @@
+//@version=6
+indicator("SPEK RADAR PRO — Early Warning", overlay=false)
+volLen=input.int(20,"Hacim ortalaması",minval=5)
+atrLen=input.int(14,"ATR",minval=5)
+atrRefLen=input.int(20,"ATR referans",minval=5)
+threshold=input.int(65,"Erken uyarı eşiği",minval=1,maxval=100)
+relVol=volume/ta.sma(volume,volLen)
+atrPct=ta.atr(atrLen)/close
+compression=atrPct/ta.median(atrPct,atrRefLen)
+obv=ta.cum(math.sign(ta.change(close))*volume)
+obvChange=(obv-obv[20])/math.max(ta.sma(volume,20)*20,1)
+closeLoc=high==low?0.5:(close-low)/(high-low)
+vScore=relVol>=3?100:relVol>=2?75:relVol>=1.4?45:10
+cScore=compression<=0.75?90:compression<=0.9?65:compression<=1.05?35:10
+oScore=obvChange>0.15?85:obvChange>0.05?65:obvChange>0?35:10
+pScore=closeLoc>=0.8?85:closeLoc>=0.6?60:25
+score=math.round(vScore*0.30+cScore*0.20+oScore*0.25+pScore*0.25)
+early=score>=threshold and barstate.isconfirmed
+plot(score,"SPEK RADAR puanı",color=color.aqua,linewidth=2)
+hline(80,"Güçlü",color=color.new(color.green,20))
+hline(65,"Takip",color=color.new(color.orange,20))
+hline(50,"İzleme",color=color.new(color.gray,40))
+plotshape(early,title="Erken uyarı",style=shape.labelup,text="SPEK RADAR",color=color.green,textcolor=color.white,location=location.bottom)
+alertcondition(early,title="SPEK RADAR erken uyarı",message="SPEK RADAR: {{ticker}} erken uyarı eşiğini aştı. Verileri kontrol edin.")
