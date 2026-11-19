@@ -1,4 +1,5 @@
 import unittest
+import httpx
 from memecoin_v2.providers.helius import HeliusProvider
 
 class FakeResponse:
@@ -37,7 +38,7 @@ class HeliusTests(unittest.IsolatedAsyncioTestCase):
     async def test_unavailable_rpc_fails_closed(self):
         class BrokenClient:
             async def post(self, url, json):
-                raise RuntimeError("offline")
+                raise httpx.ConnectError("offline", request=httpx.Request("POST", url))
         result = await HeliusProvider(client=BrokenClient()).inspect_pool("pool")
         self.assertFalse(result["available"])
         self.assertIsNone(result["sniper_cluster_detected"])
