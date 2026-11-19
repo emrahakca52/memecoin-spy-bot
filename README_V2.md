@@ -1,35 +1,47 @@
-# Memecoin Spy Bot v2 — staged rebuild
+# Memecoin Spy Bot V2 — staged rebuild
 
-V2 is a separate, read-only Solana discovery and risk-triage service. It does not replace production v1 until migration and deployment checks are completed.
+V2 is a separate Solana discovery and security-triage service. It remains isolated from the production V1 process until full paper-trading parity, migration review, backup/restore verification and staging deployment are complete.
 
-## Implemented
-- Modular package with typed market models, environment settings, scoring, risk gate, scanner orchestration and DexScreener adapter.
-- Deduplicated Solana token discovery, market momentum ranking and structured risk reasons.\n- Best-effort public Solana RPC checks for mint/freeze authorities and a clearly labelled top-20 token-account sample; limited to 10 candidates per scan to reduce public endpoint load.
-- Fail-closed handling: missing liquidity/volume/transaction/age data is reported; complete holder concentration, LP lock and bundle/sniper activity remain explicitly unverified. Public RPC authority checks are shown when available; the top-20 token-account sample is informational only and never clears the holder-concentration gate. Such candidates are not marked eligible.
-- Standalone FastAPI service in v2_app.py with GET /health and GET /v2/scan?limit=20.
-- Unit tests and GitHub Actions workflow.
-- real_trading_enabled is hard-coded false. No wallet signing, swap execution, or database writes exist in v2.
+## Implemented in V2
+- Modular package with typed market models, environment settings, transparent momentum scoring, fail-closed risk gates and scanner orchestration.
+- DexScreener Solana token-profile discovery, pair selection by liquidity and duplicate-address filtering.
+- Public RugCheck report enrichment: normalized risk score, top-holder concentration, mint/freeze authority metadata, LP-lock percentage and dangerous risk flags. The lowest reported LP-lock percentage across reported markets is used.
+- Public Solana RPC enrichment with endpoint fallback: mint/freeze authority checks and a labelled top-20 token-account sample. This sample is incomplete and is never treated as a complete holder index.
+- Security-provider calls are bounded to the first 10 candidates per scan to reduce public API load.
+- Standalone FastAPI endpoints: `GET /health`, `GET /v2/scan?limit=20`, and read-only `GET /v2/wallet/{wallet_address}?limit=10`.
+- Optional Telegram scan summary, disabled unless `V2_TELEGRAM_REPORTS_ENABLED=true`. It uses the existing `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`; reports are throttled to at most one per process per 15 minutes.
+- Unit tests cover scoring, fail-closed risk decisions, RugCheck parsing, RPC lookup bounds, scanner deduplication and paper-only output.
+- `real_trading_enabled` is hard-coded false. No wallet signing, swap execution, or V2 database writes exist.
+
+## Risk decisions
+A candidate cannot be marked eligible unless market data, RugCheck normalized score, top-10 holder concentration, mint/freeze authority status and LP-lock status pass configured thresholds. Missing data is not treated as zero. Transaction-level bundle/sniper detection remains explicitly missing without a dedicated indexed transaction feed; therefore candidates remain ineligible even when other checks pass. Public RPC top-account observations do not clear that gate.
 
 ## Run locally
-~~~bash
+```bash
 pip install -r requirements.txt
 uvicorn v2_app:app --host 0.0.0.0 --port 8001
-~~~
+```
 
-Then open /health and /v2/scan. The scan endpoint calls public DexScreener endpoints; it may return HTTP 502 when the provider is unavailable or rate-limits requests.
+Open `/health`, `/v2/scan`, or `/docs`. Public providers may rate-limit or temporarily fail; V2 returns unknown/missing risk data rather than approving a candidate.
 
 ## Environment settings
-- V2_MIN_LIQUIDITY_USD (default 20000)
-- V2_MIN_VOLUME_24H_USD (default 30000)
-- V2_MIN_TXNS_24H (default 30)
-- V2_MAX_PAIR_AGE_HOURS (default 72)
-- V2_MAX_DAILY_LOSS_USD (reserved for future paper ledger; default 25)
-- V2_PAPER_STARTING_BALANCE_USD (reserved for future paper ledger; default 500)
+- `V2_MIN_LIQUIDITY_USD` (default 20000)
+- `V2_MIN_VOLUME_24H_USD` (default 30000)
+- `V2_MIN_TXNS_24H` (default 30)
+- `V2_MAX_PAIR_AGE_HOURS` (default 72)
+- `V2_MAX_TOP10_HOLDER_PCT` (default 25)
+- `V2_MIN_LP_LOCKED_PCT` (default 50)
+- `V2_MAX_RUGCHECK_SCORE` (default 55; normalized 0–100 score)
+- `V2_SOLANA_RPC_URL` (optional preferred RPC endpoint; fallback public endpoints are tried)
+- `V2_TELEGRAM_REPORTS_ENABLED` (default false; opt-in)
+- `V2_MAX_DAILY_LOSS_USD` and `V2_PAPER_STARTING_BALANCE_USD` are reserved for the future V2 paper ledger; they do not currently drive a V2 ledger.
 
-## Important limitations / next integration gate
-DexScreener is market discovery data, not proof a token is safe. V2 does not yet have a transaction-level feed or independent holder/authority/LP-lock verification. Public RPC now provides a limited authority check and partial holder sample without an API key. It does not provide reliable block/bundle/sniper analytics or a complete wallet-holder index; those still require a transaction/indexing provider such as Helius. A second AI provider requires its own credentials. Until those integrations are implemented and tested, v2 intentionally returns candidates as not eligible. Do not treat market scores as buy signals.
+## Not yet complete — external and production gates
+- Reliable launch-bundle/sniper analytics and complete wallet-level holder indexing require a transaction-indexing provider (for example Helius). No such credentials are configured. V2 does not pretend the heuristic top-20 sample is a substitute.
+- LP-lock and holder fields depend on the third-party RugCheck report schema and availability; missing or malformed fields fail closed.
+- A second AI opinion provider is not connected; no AI-based pass override exists in V2.
+- V2 paper positions, persistent accounting and trade-history migration are not implemented. V1's PostgreSQL paper history remains untouched.
+- V2 is not deployed or wired into the production Render start command. The current Render service still starts `app:app`.
 
 ## Migration safety
-- V1 entry point, Render configuration and PostgreSQL paper state/history are untouched.
-- V2 is not wired into production Render start command.
-- Do not delete legacy files or reset the database until V2 has feature parity, a reviewed migration plan, backup/restore verification and successful staging deployment.
+Do not merge/deploy V2 as a replacement or delete V1 files/reset PostgreSQL until the remaining transaction-indexing gate is resolved or explicitly accepted, V2 paper ledger has feature parity, backup/restore is verified, and a staging deployment has been checked. V1 remains the production entry point.
