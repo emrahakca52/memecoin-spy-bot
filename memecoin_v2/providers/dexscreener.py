@@ -26,14 +26,22 @@ class DexScreenerProvider:
         client = self._client or httpx.AsyncClient(timeout=self.timeout, headers={"accept": "application/json"})
         try:
             response = None
-            # Retry transient public API throttling/outages; never treat an HTTP
-            # error page as an empty successful market scan.
+            # Respect public API throttling. Retry with bounded backoff and
+            # Retry-After when supplied; if still rate-limited, return no
+            # candidates rather than turning a provider throttle into HTTP 502.
             for attempt in range(3):
                 response = await client.get(f"{BASE}/token-profiles/latest/v1")
                 if response.status_code not in {408, 429, 500, 502, 503, 504}:
                     break
                 if attempt < 2:
-                    await asyncio.sleep(0.8 * (attempt + 1))
+                    retry_after = response.headers.get("retry-after")
+                    try:
+                        delay = min(max(float(retry_after), 0.5), 8.0) if retry_after else (1.5 ** (attempt + 1))
+                    except ValueError:
+                        delay = 1.5 ** (attempt + 1)
+                    await asyncio.sleep(delay)
+            if response is not None and response.status_code == 429:
+                return []
             response.raise_for_status()
             profiles = response.json()
             if not isinstance(profiles, list): return []
