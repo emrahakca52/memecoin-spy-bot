@@ -129,13 +129,13 @@ def _analyze(symbol: str, frame: pd.DataFrame) -> Signal | None:
     )
 
 
-def scan_symbols(symbols: list[str] | None = None, period: str = "6mo") -> list[dict[str, Any]]:
+def scan_symbols(symbols: list[str] | None = None, period: str = "3mo") -> list[dict[str, Any]]:
     universe = symbols or configured_symbols()
     tickers = [f"{s.removesuffix('.IS')}.IS" for s in universe]
     try:
         raw = yf.download(
             tickers=tickers, period=period, interval="1d", auto_adjust=True,
-            group_by="ticker", threads=True, progress=False, timeout=25,
+            group_by="ticker", threads=True, progress=False, timeout=8,
         )
     except Exception:
         raw = pd.DataFrame()
