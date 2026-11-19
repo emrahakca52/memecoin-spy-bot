@@ -38,15 +38,18 @@ class Scanner:
                               "price_usd":market.price_usd,"liquidity_usd":market.liquidity_usd,
                               "volume_24h_usd":market.volume_24h_usd,"txns_24h":market.txns_24h,
                               "price_change_24h_pct":market.price_change_24h_pct}
-                ai_task=self.ai_provider(token_for_ai,{"rugcheck_pending":True})
-                rpc_result,rug_result,helius_result,ai_result=await asyncio.gather(
-                    rpc_task,rug_task,helius_task,ai_task,return_exceptions=True)
+                rpc_result,rug_result,helius_result=await asyncio.gather(
+                    rpc_task,rug_task,helius_task,return_exceptions=True)
                 if isinstance(rpc_result,BaseException):
                     rpc_result={"provider":"solana_public_rpc","notes":["On-chain inspection unavailable"]}
                 if isinstance(rug_result,BaseException):
                     rug_result={"provider":"rugcheck","available":False,"error":"provider_unavailable"}
                 if isinstance(helius_result,BaseException):
                     helius_result={"provider":"helius","available":False,"sniper_cluster_detected":None,"notes":["provider_unavailable"]}
+                try:
+                    ai_result=await self.ai_provider(token_for_ai,rug_result)
+                except Exception:
+                    ai_result={"provider":"AI","api_ok":False,"passed":False,"reasons":["provider_unavailable"]}
                 if isinstance(ai_result,BaseException):
                     ai_result={"provider":"AI","api_ok":False,"passed":False,"reasons":["provider_unavailable"]}
                 market=replace(market,onchain={"rpc":rpc_result,"rugcheck":rug_result,"helius":helius_result,"ai":ai_result})
