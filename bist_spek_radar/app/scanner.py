@@ -22,6 +22,7 @@ UNIVERSE_URL = os.getenv(
     "https://raw.githubusercontent.com/ahmeterenodaci/Istanbul-Stock-Exchange--BIST--including-symbols-and-logos/main/without_logo.csv",
 )
 FALLBACK = "THYAO,ASELS,TUPRS,EREGL,AKBNK,GARAN,ISCTR,SISE,SAHOL,KCHOL,TCELL,BIMAS,PGSUS,TOASO,FROTO,KOZAL,ASTOR,HEKTS,MIATK,DSTKF,KNFRT,VEYAS,BLCYT,KRTEK"
+UNIVERSE_STATUS: dict[str, Any] = {"source": "not_loaded", "is_full_universe": False, "warning": "Evren henüz yüklenmedi."}
 
 
 @dataclass
@@ -41,9 +42,12 @@ class Signal:
 
 
 def configured_symbols() -> list[str]:
+    global UNIVERSE_STATUS
     raw = os.getenv("BIST_SYMBOLS", "").strip()
     if raw:
-        return list(dict.fromkeys(s.strip().upper().removesuffix(".IS") for s in raw.split(",") if s.strip()))
+        symbols = list(dict.fromkeys(s.strip().upper().removesuffix(".IS") for s in raw.split(",") if s.strip()))
+        UNIVERSE_STATUS = {"source": "BIST_SYMBOLS environment variable", "is_full_universe": False, "warning": "Özel sembol listesi kullanılıyor; tüm BIST kapsamı olduğu doğrulanmadı."}
+        return symbols
     try:
         response = requests.get(UNIVERSE_URL, timeout=12, headers={"User-Agent": "BIST-Spek-Radar/1.0"})
         response.raise_for_status()
@@ -53,9 +57,13 @@ def configured_symbols() -> list[str]:
             symbols = [str(s).strip().upper().removesuffix(".IS") for s in table[col].dropna()]
             symbols = [s for s in symbols if s.isalnum() and 3 <= len(s) <= 6]
             if len(symbols) >= 100:
-                return list(dict.fromkeys(symbols))
-    except Exception:
-        pass
+                symbols = list(dict.fromkeys(symbols))
+                UNIVERSE_STATUS = {"source": UNIVERSE_URL, "is_full_universe": True, "warning": "Sembol listesi harici CSV kaynağından alındı; borsa resmî evreniyle ayrıca karşılaştırılmalı."}
+                return symbols
+    except Exception as exc:
+        UNIVERSE_STATUS = {"source": "fallback", "is_full_universe": False, "warning": f"Harici sembol listesi alınamadı ({type(exc).__name__}); yalnızca yedek liste kullanılıyor."}
+    else:
+        UNIVERSE_STATUS = {"source": "fallback", "is_full_universe": False, "warning": "Harici CSV beklenen sembol sütununu veya yeterli sayıda hisseyi içermedi; yalnızca yedek liste kullanılıyor."}
     return FALLBACK.split(",")
 
 
@@ -144,3 +152,7 @@ def scan_symbols(symbols: list[str] | None = None, period: str = "6mo") -> list[
         except Exception:
             continue
     return sorted(results, key=lambda row: (row["score"], row["volume_ratio"], row["turnover_try"]), reverse=True)
+
+
+def universe_status() -> dict[str, Any]:
+    return dict(UNIVERSE_STATUS)
