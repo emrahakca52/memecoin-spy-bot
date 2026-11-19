@@ -13,7 +13,7 @@ from telegram_notify import send_scan_report
 from memecoin_v2 import paper_ledger
 
 app=FastAPI(title="Memecoin Spy Bot V2",version="2.0.0",
-            description="Read-only Solana discovery and security triage. Paper mode only.")
+            description="Solana discovery, fail-closed security screening and authenticated paper ledger. No live execution.")
 scanner=Scanner(Settings.from_env())
 _telegram_lock=asyncio.Lock()
 _last_telegram_report=0.0
@@ -23,7 +23,7 @@ async def health():
     return {"ok":True,"service":"memecoin-spy-bot-v2","mode":"paper",
             "real_trading_enabled":False,"utc":datetime.now(timezone.utc).isoformat(),
             "integrations":{"dexscreener":True,"solana_public_rpc":True,
-                            "rugcheck":True,"helius_transaction_indexing":bool(os.getenv("HELIUS_API_KEY")),"paper_ledger":True,
+                            "rugcheck":True,"ai_screening":bool(os.getenv("GEMINI_API_KEY") if os.getenv("AI_PROVIDER","grok").lower()=="gemini" else os.getenv("XAI_API_KEY")),"helius_transaction_indexing":bool(os.getenv("HELIUS_API_KEY")),"paper_ledger":True,
                             "live_execution":False}}
 
 @app.get("/v2/scan")
