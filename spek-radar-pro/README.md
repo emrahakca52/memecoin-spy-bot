@@ -1,40 +1,44 @@
-# SPEK RADAR PRO — MVP
+# SPEK RADAR PRO
 
-BIST hisselerinde erken uyarı araştırması ve sanal test için ayrı proje. Gerçek emir göndermez.
+Borsa İstanbul pay piyasasında olağan dışı hareket hazırlığı gösteren payları taramak için araştırma ve sanal test projesi. Gerçek emir göndermez.
 
-## Kapsam
-- Günlük OHLCV üzerinden göreli hacim, ATR sıkışması, OBV eğimi, kapanış konumu ve XU100'e göre göreceli güç.
-- Açıklanabilir 0–100 araştırma puanı.
-- DSTKF, KTLEV, TERA ve PEKGY başlangıç sembolleri.
-- Sinyal kapanışta hesaplanır; geçmiş testte varsayımsal giriş sonraki seans açılışıdır.
-- 1/3/5/10 işlem günü ileri getiri raporu.
-- TradingView Pine Script v6 indikatörü.
+## Tüm BIST pay evrenini tarama
 
-## Kurulum
-Python 3.10+:
+Python 3.10+ kurulu ortamda:
+
 ```bash
-python -m venv .venv
-# Windows: .venv\\Scripts\\activate
-# macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
+python -m spek_radar.cli --all-bist --period 2y
 ```
 
-## Günlük tarama
+`--all-bist` seçeneği, çalışma anında KAP'ın resmi Pazarlar sayfasından Yıldız, Ana, Alt ve Yakın İzleme pazarlarındaki pay kodlarını çeker. Fonlar, varantlar, borçlanma araçları ve Piyasa Öncesi İşlem Platformu bu taramaya dahil edilmez. KAP sayfa yapısı değişir veya yeterli sayıda kod doğrulanamazsa program eksik evrenle devam etmek yerine hata verir.
+
+Çıktılar:
+- `output/universe_snapshot.csv`: taramada kullanılan KAP sembol/pazar anlık görüntüsü
+- `output/scan.csv`: skora göre sıralanmış tarama sonuçları
+- `output/errors.csv`: verisi alınamayan semboller ve hata açıklamaları
+
+Sadece belirli hisseleri taramak için:
 ```bash
 python -m spek_radar.cli --symbols DSTKF.IS,KTLEV.IS,TERA.IS,PEKGY.IS --period 2y
 ```
-Rapor: `output/scan.csv`.
+
+## Skor neyi ölçüyor?
+
+Günlük OHLCV üzerinden göreli hacim, ATR sıkışması, OBV değişimi, kapanışın günlük aralık içindeki yeri ve XU100'e göre 20 günlük göreceli güç hesaplanır. 0–100 puan bir **araştırma önceliği** puanıdır; manipülasyon tespiti, kesin yükseliş tahmini veya yatırım tavsiyesi değildir. Düşük likidite ve veri kalitesi ayrıca incelenmelidir.
+
+## Veri ve kapsam sınırlamaları
+
+İlk veri adaptörü Yahoo Finance/yfinance günlük verisidir; lisanslı, eşanlı BIST verisi değildir ve her payda veri sağlamayabilir. Tüm evren KAP'tan dinamik çekilir; ancak fiyat verisi alınamayan semboller `errors.csv` dosyasına yazılır. Günlük OHLCV, kurum dağılımı/takas, emir defteri, emir iptal akışı veya gerçek para girişi verisi değildir. Bu alanlar için yetkili/lisanslı veri sağlayıcısı entegrasyonu gerekir.
+
+Bugünkü sembol evrenini geçmişe uygulamak survivorship bias yaratır. Üretim öncesi tarihsel bileşen evreni, işlem maliyeti, kayma, devre kesici/işlem sırası kapanma durumları ve walk-forward test eklenmelidir.
 
 ## Geçmiş test
+
 ```bash
 python -m spek_radar.backtest --symbols DSTKF.IS,KTLEV.IS,TERA.IS,PEKGY.IS --period 5y
 ```
-Rapor: `output/backtest.csv`.
-
-## Veri sınırlamaları
-İlk adaptör Yahoo Finance/yfinance günlük verisidir; lisanslı, eşanlı BIST emir/takas verisi değildir. Aracı kurum dağılımı, MKK saklama, emir defteri ve emir iptal akışı henüz bağlı değildir. Fiyat/hacim verisi tek başına manipülasyonu, tahtacıyı veya belirli bir kurumun algoritmasını kanıtlamaz. Sinyal puanı yatırım tavsiyesi değil, araştırma önceliğidir.
-
-BIST Tüm evreni için doğrulanmış güncel ve tarihsel sembol listesi gerekir. Sadece bugünkü sembol listesini geçmişe uygulamak survivorship bias yaratır. Üretim öncesinde lisanslı veri, işlem maliyeti, kayma ve walk-forward test eklenmelidir.
 
 ## Güvenlik
-Bu proje gerçek emir göndermez ve kripto botunun dosyalarına dokunmaz. Kendi Git dalında ve `spek-radar-pro/` klasöründe tutulur.
+
+Bu proje gerçek emir göndermez. Kripto botunun ana dalına ve mevcut Render servislerine müdahale etmez.
