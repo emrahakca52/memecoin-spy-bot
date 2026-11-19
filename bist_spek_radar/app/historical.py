@@ -111,31 +111,62 @@ def analyze_history(symbol: str, period: str = "max") -> dict[str, Any]:
     except Exception as exc:
         return {"symbol": symbol.upper(), "error": f"Veri/analiz hatası: {type(exc).__name__}"}
 
+def _extract_ticker_frame(raw: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    """Extract one ticker from yfinance's grouped MultiIndex batch response."""
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+    if not isinstance(raw.columns, pd.MultiIndex):
+        return raw
+    for level in range(raw.columns.nlevels):
+        values = set(str(v) for v in raw.columns.get_level_values(level))
+        if ticker in values:
+            return raw.xs(ticker, axis=1, level=level, drop_level=True)
+    return pd.DataFrame()
+
+
 def backtest_universe(symbols: list[str], period: str = "2y", limit: int = 40) -> dict[str, Any]:
     results = []
     failures = 0
     symbols_with_data = 0
-    for symbol in symbols:
-        ticker = symbol.upper().removesuffix(".IS") + ".IS"
+    normalized = list(dict.fromkeys(s.upper().removesuffix(".IS") for s in symbols))
+    # Batch downloads avoid one Yahoo request per ticker, which triggers rate limits.
+    batch_size = 25
+    for offset in range(0, len(normalized), batch_size):
+        batch = normalized[offset:offset + batch_size]
+        tickers = [f"{s}.IS" for s in batch]
         try:
-            frame = yf.download(ticker, period=period, interval="1d", auto_adjust=True, progress=False, threads=False)
-            f = _features(frame)
-            if f.empty: failures += 1; continue
-            symbols_with_data += 1
-            f = f.dropna(subset=["vol_accel", "vol_ratio", "range_pos", "future20"])
-            for dt, r in f.iterrows():
-                score = _candidate_score(r)
-                # Candidate is intentionally pre-move: avoid already extended price action.
-                if score >= 40 and abs(float(r.ret5)) <= 18 and float(r.ret20) <= 25:
-                    results.append({"symbol": symbol, "date": str(dt.date()), "score": score,
-                        "close": round(float(r.close), 4), "volume_acceleration_5d": round(float(r.vol_accel), 2),
-                        "volume_ratio": round(float(r.vol_ratio), 2), "change_5d_pct": round(float(r.ret5), 2),
-                        "forward_max_20d_pct": round(float(r.future20), 2),
-                        "outcome_20d": "YÜKSELİŞ" if float(r.future20) >= 30 else ("DÜŞÜŞ" if float(r.future20) <= -15 else "NÖTR")})
+            raw = yf.download(
+                tickers=tickers, period=period, interval="1d", auto_adjust=True,
+                group_by="ticker", threads=True, progress=False, timeout=35,
+            )
         except Exception:
-            failures += 1
+            failures += len(batch)
+            continue
+        if raw is None or raw.empty:
+            failures += len(batch)
+            continue
+        for symbol, ticker in zip(batch, tickers):
+            try:
+                frame = _extract_ticker_frame(raw, ticker)
+                f = _features(frame)
+                if f.empty:
+                    failures += 1
+                    continue
+                symbols_with_data += 1
+                f = f.dropna(subset=["vol_accel", "vol_ratio", "range_pos", "future20"])
+                for dt, r in f.iterrows():
+                    score = _candidate_score(r)
+                    # Signal is calculated only from data available on that date.
+                    if score >= 40 and abs(float(r.ret5)) <= 18 and float(r.ret20) <= 25:
+                        results.append({"symbol": symbol, "date": str(dt.date()), "score": score,
+                            "close": round(float(r.close), 4), "volume_acceleration_5d": round(float(r.vol_accel), 2),
+                            "volume_ratio": round(float(r.vol_ratio), 2), "change_5d_pct": round(float(r.ret5), 2),
+                            "forward_max_20d_pct": round(float(r.future20), 2),
+                            "outcome_20d": "YÜKSELİŞ" if float(r.future20) >= 30 else ("DÜŞÜŞ" if float(r.future20) <= -15 else "NÖTR")})
+            except Exception:
+                failures += 1
     results.sort(key=lambda x: (x["score"], x["volume_acceleration_5d"], x["forward_max_20d_pct"]), reverse=True)
-    return {"mode":"HISTORICAL_RESEARCH_ONLY","period":period,"symbols_requested":len(symbols),
+    return {"mode":"HISTORICAL_RESEARCH_ONLY","period":period,"symbols_requested":len(normalized),
             "symbols_with_data":symbols_with_data,"data_failures":failures,
             "candidate_count":len(results),"results":results[:limit],
-            "note":"Geçmiş ileri getiriler eğitim/geriye dönük test içindir; geleceği garanti etmez. Yahoo Finance verisi gecikmeli/eksik olabilir."}
+            "note":"YÜKSELİŞ sınıfı, sonraki 20 işlem günündeki en yüksek fiyatın başlangıç kapanışına göre en az %30 yükselmesidir; dönem sonu getirisi değildir. Geriye dönük sonuçlar geleceği garanti etmez. Yahoo Finance verisi gecikmeli/eksik olabilir."}
