@@ -4,8 +4,8 @@ V2 is a separate, read-only Solana discovery and risk-triage service. It does no
 
 ## Implemented
 - Modular package with typed market models, environment settings, scoring, risk gate, scanner orchestration and DexScreener adapter.
-- Deduplicated Solana token discovery, market momentum ranking and structured risk reasons.
-- Fail-closed handling: missing liquidity/volume/transaction/age data is reported; holder concentration, mint/freeze authority, LP lock and bundle/sniper activity remain explicitly unverified. Such candidates are not marked eligible.
+- Deduplicated Solana token discovery, market momentum ranking and structured risk reasons.\n- Best-effort public Solana RPC checks for mint/freeze authorities and a clearly labelled top-20 token-account sample; limited to 10 candidates per scan to reduce public endpoint load.
+- Fail-closed handling: missing liquidity/volume/transaction/age data is reported; complete holder concentration, LP lock and bundle/sniper activity remain explicitly unverified. Public RPC authority checks are shown when available; the top-20 token-account sample is informational only and never clears the holder-concentration gate. Such candidates are not marked eligible.
 - Standalone FastAPI service in v2_app.py with GET /health and GET /v2/scan?limit=20.
 - Unit tests and GitHub Actions workflow.
 - real_trading_enabled is hard-coded false. No wallet signing, swap execution, or database writes exist in v2.
@@ -27,7 +27,7 @@ Then open /health and /v2/scan. The scan endpoint calls public DexScreener endpo
 - V2_PAPER_STARTING_BALANCE_USD (reserved for future paper ledger; default 500)
 
 ## Important limitations / next integration gate
-DexScreener is market discovery data, not proof a token is safe. V2 does not yet have a transaction-level feed or independent holder/authority/LP-lock verification. A Helius API key and implementation/testing are required for block/bundle/sniper analytics. A second AI provider requires its own credentials. Until those integrations are implemented and tested, v2 intentionally returns candidates as not eligible. Do not treat market scores as buy signals.
+DexScreener is market discovery data, not proof a token is safe. V2 does not yet have a transaction-level feed or independent holder/authority/LP-lock verification. Public RPC now provides a limited authority check and partial holder sample without an API key. It does not provide reliable block/bundle/sniper analytics or a complete wallet-holder index; those still require a transaction/indexing provider such as Helius. A second AI provider requires its own credentials. Until those integrations are implemented and tested, v2 intentionally returns candidates as not eligible. Do not treat market scores as buy signals.
 
 ## Migration safety
 - V1 entry point, Render configuration and PostgreSQL paper state/history are untouched.
