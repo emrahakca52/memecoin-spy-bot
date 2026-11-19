@@ -1,6 +1,7 @@
 """DexScreener public discovery adapter for Solana token profiles."""
 from __future__ import annotations
 import time
+import asyncio
 import httpx
 from ..models import TokenMarket
 
@@ -24,7 +25,15 @@ class DexScreenerProvider:
         owns_client = self._client is None
         client = self._client or httpx.AsyncClient(timeout=self.timeout, headers={"accept": "application/json"})
         try:
-            response = await client.get(f"{BASE}/token-profiles/latest/v1")
+            response = None
+            # Retry transient public API throttling/outages; never treat an HTTP
+            # error page as an empty successful market scan.
+            for attempt in range(3):
+                response = await client.get(f"{BASE}/token-profiles/latest/v1")
+                if response.status_code not in {408, 429, 500, 502, 503, 504}:
+                    break
+                if attempt < 2:
+                    await asyncio.sleep(0.8 * (attempt + 1))
             response.raise_for_status()
             profiles = response.json()
             if not isinstance(profiles, list): return []
@@ -39,7 +48,10 @@ class DexScreenerProvider:
             for address in addresses:
                 try:
                     pair_response = await client.get(f"{BASE}/token-pairs/v1/solana/{address}")
-                    if pair_response.status_code == 429: break
+                    if pair_response.status_code in {408, 429, 500, 502, 503, 504}:
+                        # Keep already collected candidates; stop before the
+                        # provider rate limit turns a partial scan into a crash.
+                        break
                     pair_response.raise_for_status()
                     pairs = pair_response.json()
                     if not isinstance(pairs, list) or not pairs: continue
