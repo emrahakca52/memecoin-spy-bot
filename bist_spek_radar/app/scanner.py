@@ -163,7 +163,8 @@ def _analyze(symbol: str, frame: pd.DataFrame) -> Signal | None:
         symbol=symbol, name=symbol, score=min(score, 100), last_close=round(last, 4),
         change_1d_pct=round(change_1d, 2), change_5d_pct=round(change_5d, 2),
         volume_ratio=round(vol_ratio, 2), turnover_try=round(turnover, 2),
-        volatility_20d_pct=round(vol20, 2), short_term_score=short_score, swing_score=swing_score,\n        exit_risk_score=exit_score, phase=phase, exit_reasons=exit_reasons, reasons=reasons,
+        volatility_20d_pct=round(vol20, 2), short_term_score=short_score, swing_score=swing_score,
+        exit_risk_score=exit_score, phase=phase, exit_reasons=exit_reasons, reasons=reasons,
         data_date=str(df.index[-1].date()),
     )
 
