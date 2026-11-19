@@ -54,6 +54,12 @@ def evaluate_market(m:TokenMarket,settings:Settings,now:datetime|None=None)->Ris
     # Partial RPC largest-account samples are diagnostic only, never a complete holder index.
     if not rug.get("available") or rug.get("top10_holders_pct") is None:
         if "top10_holder_concentration" not in missing: missing.append("top10_holder_concentration")
+    ai=security.get("ai",{})
+    if not isinstance(ai,dict) or not ai.get("api_ok"):
+        missing.append("ai_screening")
+    elif not ai.get("passed"):
+        reasons.append("ai_screening_rejected")
+
     helius=security.get("helius",{})
     if not isinstance(helius,dict) or not helius.get("available") or helius.get("sniper_cluster_detected") is None:
         missing.append("bundle_sniper_activity")
