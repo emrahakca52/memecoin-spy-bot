@@ -3,11 +3,11 @@ from datetime import datetime,timezone
 import asyncio
 import os
 import time
-from fastapi import FastAPI,HTTPException,Query
+from fastapi import FastAPI,HTTPException,Query,Header\nfrom pydantic import BaseModel,Field\nimport hmac
 from memecoin_v2.scanner import Scanner,candidate_to_dict
 from memecoin_v2.settings import Settings
 from wallet_tracker import get_wallet_token_activity
-from telegram_notify import send_scan_report
+from telegram_notify import send_scan_report\nfrom memecoin_v2 import paper_ledger
 
 app=FastAPI(title="Memecoin Spy Bot V2",version="2.0.0",
             description="Read-only Solana discovery and security triage. Paper mode only.")
@@ -55,3 +55,53 @@ async def wallet_activity(wallet_address:str,limit:int=Query(default=10,ge=1,le=
         raise HTTPException(status_code=400,detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=502,detail="Solana wallet activity provider unavailable") from exc
+
+
+class PaperBuyRequest(BaseModel):
+    mint: str = Field(min_length=32, max_length=64)
+    symbol: str = Field(min_length=1, max_length=20)
+    price_usd: float = Field(gt=0, le=1_000_000_000)
+    amount_usd: float = Field(gt=0, le=100_000)
+
+class PaperSellRequest(BaseModel):
+    mint: str = Field(min_length=32, max_length=64)
+    price_usd: float = Field(gt=0, le=1_000_000_000)
+    quantity: float = Field(gt=0, le=1e18)
+
+def _require_paper_key(provided: str | None):
+    expected=os.getenv("V2_PAPER_API_KEY","").strip()
+    if not expected:
+        raise HTTPException(status_code=503,detail="V2 paper write API is disabled: configure V2_PAPER_API_KEY")
+    if not provided or not hmac.compare_digest(provided,expected):
+        raise HTTPException(status_code=401,detail="Invalid paper API key")
+
+@app.get("/v2/paper/status")
+async def paper_status():
+    try:
+        paper_ledger.initialize()
+        return paper_ledger.status()
+    except Exception as exc:
+        raise HTTPException(status_code=503,detail="V2 paper ledger unavailable; check DATABASE_URL") from exc
+
+@app.post("/v2/paper/buy")
+async def paper_buy(payload:PaperBuyRequest,x_paper_api_key:str|None=Header(default=None)):
+    _require_paper_key(x_paper_api_key)
+    try:
+        paper_ledger.initialize()
+        return paper_ledger.buy(payload.mint,payload.symbol,payload.price_usd,payload.amount_usd,
+                                Settings.from_env().max_daily_loss_usd)
+    except paper_ledger.LedgerError as exc:
+        raise HTTPException(status_code=400,detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503,detail="V2 paper ledger unavailable") from exc
+
+@app.post("/v2/paper/sell")
+async def paper_sell(payload:PaperSellRequest,x_paper_api_key:str|None=Header(default=None)):
+    _require_paper_key(x_paper_api_key)
+    try:
+        paper_ledger.initialize()
+        return paper_ledger.sell(payload.mint,payload.price_usd,payload.quantity)
+    except paper_ledger.LedgerError as exc:
+        raise HTTPException(status_code=400,detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503,detail="V2 paper ledger unavailable") from exc
