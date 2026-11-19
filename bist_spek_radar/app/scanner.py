@@ -36,6 +36,11 @@ class Signal:
     volume_ratio: float
     turnover_try: float
     volatility_20d_pct: float
+    short_term_score: int
+    swing_score: int
+    exit_risk_score: int
+    phase: str
+    exit_reasons: list[str]
     reasons: list[str]
     data_date: str
     data_source: str = "Yahoo Finance (indicative; may be delayed)"
@@ -93,8 +98,42 @@ def _analyze(symbol: str, frame: pd.DataFrame) -> Signal | None:
     returns = close.pct_change().dropna()
     vol20 = float(returns.iloc[-20:].std(ddof=1) * np.sqrt(20) * 100)
     turnover = float(last * volume.iloc[-1])
+    change_20d = float((close.iloc[-1] / close.iloc[-21] - 1) * 100)
+    high20 = float(close.iloc[-21:].max())
+    distance_from_high20 = float((last / high20 - 1) * 100) if high20 > 0 else 0.0
+    previous_volume = float(volume.iloc[-2])
+    volume_fade = previous_volume > 0 and float(volume.iloc[-1]) < previous_volume * 0.55
 
-    # Score includes both pre-breakout activity and post-move exhaustion.
+    # Separate early-move scores from exhaustion/exit-risk scores.
+    short_score, swing_score, exit_score = 0, 0, 0
+    short_reasons, swing_reasons, exit_reasons = [], [], []
+    if vol_ratio >= 3 and abs(change_1d) <= 4:
+        short_score += 30; short_reasons.append("Fiyat henüz sınırlı hareket ederken hacim belirgin arttı")
+    elif vol_ratio >= 2:
+        short_score += 18; short_reasons.append("Günlük hacim 20 günlük medyanın en az 2 katı")
+    if -2 <= change_1d <= 4 and -4 <= change_5d <= 10:
+        short_score += 15; short_reasons.append("Kısa vadeli fiyat henüz aşırı yükselmedi")
+    if change_1d > 0 and vol_ratio >= 1.5:
+        short_score += 15; short_reasons.append("Pozitif günlük hareket hacimle destekleniyor")
+    if vol_ratio >= 1.5 and change_20d <= 18:
+        swing_score += 20; swing_reasons.append("Hacim artışı 20 günlük aşırı yükselişten önce/erken aşamada")
+    if 0 <= change_5d <= 15:
+        swing_score += 15; swing_reasons.append("5 günlük yükseliş henüz aşırı hızlanmamış")
+    if change_20d <= 25:
+        swing_score += 10; swing_reasons.append("20 günlük fiyat uzaması sınırlı")
+    if change_1d <= -5 and vol_ratio >= 2:
+        exit_score += 35; exit_reasons.append("Yüksek hacimle sert günlük düşüş")
+    if change_5d >= 20:
+        exit_score += 20; exit_reasons.append("5 işlem gününde sert fiyat uzaması")
+    if change_20d >= 40:
+        exit_score += 20; exit_reasons.append("20 işlem gününde aşırı yükseliş")
+    if volume_fade and change_5d >= 10:
+        exit_score += 15; exit_reasons.append("Yükseliş sonrası günlük hacimde belirgin sönme")
+    if distance_from_high20 <= -8 and change_20d >= 15:
+        exit_score += 20; exit_reasons.append("20 günlük zirveden belirgin geri çekilme")
+    short_score, swing_score, exit_score = min(short_score, 100), min(swing_score, 100), min(exit_score, 100)
+    phase = "ÇIKIŞ RİSKİ" if exit_score >= 40 else ("HIZLI HAREKET ADAYI" if short_score >= 40 else ("ORTA VADE ADAYI" if swing_score >= 35 else "İZLEME"))
+    # General anomaly score remains as a separate context score.
     score, reasons = 0, []
     if vol_ratio >= 5:
         score += 30; reasons.append(f"Hacim 20 günlük medyanın {vol_ratio:.1f} katı")
@@ -124,7 +163,7 @@ def _analyze(symbol: str, frame: pd.DataFrame) -> Signal | None:
         symbol=symbol, name=symbol, score=min(score, 100), last_close=round(last, 4),
         change_1d_pct=round(change_1d, 2), change_5d_pct=round(change_5d, 2),
         volume_ratio=round(vol_ratio, 2), turnover_try=round(turnover, 2),
-        volatility_20d_pct=round(vol20, 2), reasons=reasons,
+        volatility_20d_pct=round(vol20, 2), short_term_score=short_score, swing_score=swing_score,\n        exit_risk_score=exit_score, phase=phase, exit_reasons=exit_reasons, reasons=reasons,
         data_date=str(df.index[-1].date()),
     )
 
