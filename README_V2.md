@@ -1,18 +1,35 @@
-# Memecoin Spy Bot v2 — clean architecture foundation
+# Memecoin Spy Bot v2 — staged rebuild
 
-This is the parallel v2 rebuild. The current production entry points and PostgreSQL paper history are intentionally untouched while v2 is validated.
+V2 is a separate, read-only Solana discovery and risk-triage service. It does not replace production v1 until migration and deployment checks are completed.
 
-## Current scope
-- Provider adapter: latest Solana token profiles and pair metrics from DexScreener.
-- Provider-independent market model.
-- Transparent momentum ranking, separate from hard risk decisions.
-- Fail-closed risk gate: missing market data is reported; holder concentration, authority revocation, LP lock and bundle/sniper checks remain explicitly unverified until independent sources are connected.
-- Paper-only settings. `real_trading_enabled` is hard-coded false.
+## Implemented
+- Modular package with typed market models, environment settings, scoring, risk gate, scanner orchestration and DexScreener adapter.
+- Deduplicated Solana token discovery, market momentum ranking and structured risk reasons.
+- Fail-closed handling: missing liquidity/volume/transaction/age data is reported; holder concentration, mint/freeze authority, LP lock and bundle/sniper activity remain explicitly unverified. Such candidates are not marked eligible.
+- Standalone FastAPI service in v2_app.py with GET /health and GET /v2/scan?limit=20.
+- Unit tests and GitHub Actions workflow.
+- real_trading_enabled is hard-coded false. No wallet signing, swap execution, or database writes exist in v2.
 
-## Run tests
-```bash
-python -m unittest discover -s tests -v
-```
+## Run locally
+~~~bash
+pip install -r requirements.txt
+uvicorn v2_app:app --host 0.0.0.0 --port 8001
+~~~
 
-## Important limitations
-DexScreener market data is discovery data, not proof that a token is safe. This foundation does not execute swaps, sign transactions, or read/write the existing PostgreSQL ledger. Do not delete legacy files or reset the database until v2 has equivalent feature coverage, migration checks, deployment verification and a separately approved cutover.
+Then open /health and /v2/scan. The scan endpoint calls public DexScreener endpoints; it may return HTTP 502 when the provider is unavailable or rate-limits requests.
+
+## Environment settings
+- V2_MIN_LIQUIDITY_USD (default 20000)
+- V2_MIN_VOLUME_24H_USD (default 30000)
+- V2_MIN_TXNS_24H (default 30)
+- V2_MAX_PAIR_AGE_HOURS (default 72)
+- V2_MAX_DAILY_LOSS_USD (reserved for future paper ledger; default 25)
+- V2_PAPER_STARTING_BALANCE_USD (reserved for future paper ledger; default 500)
+
+## Important limitations / next integration gate
+DexScreener is market discovery data, not proof a token is safe. V2 does not yet have a transaction-level feed or independent holder/authority/LP-lock verification. A Helius API key and implementation/testing are required for block/bundle/sniper analytics. A second AI provider requires its own credentials. Until those integrations are implemented and tested, v2 intentionally returns candidates as not eligible. Do not treat market scores as buy signals.
+
+## Migration safety
+- V1 entry point, Render configuration and PostgreSQL paper state/history are untouched.
+- V2 is not wired into production Render start command.
+- Do not delete legacy files or reset the database until V2 has feature parity, a reviewed migration plan, backup/restore verification and successful staging deployment.
