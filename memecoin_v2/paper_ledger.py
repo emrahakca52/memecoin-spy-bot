@@ -1,7 +1,7 @@
 """Isolated PostgreSQL paper ledger. Creates only v2-prefixed tables; never alters V1 data."""
 from __future__ import annotations
 import os
-from datetime import datetime, timezone
+import math
 import psycopg
 from psycopg.rows import dict_row
 
@@ -13,6 +13,13 @@ def _connect():
     if not dsn:
         raise RuntimeError("DATABASE_URL is not configured")
     return psycopg.connect(dsn, row_factory=dict_row, connect_timeout=8)
+
+def _starting_balance() -> float:
+    try:
+        value=float(os.getenv("V2_PAPER_STARTING_BALANCE_USD","500"))
+        return value if math.isfinite(value) and 1 <= value <= 1_000_000_000 else 500.0
+    except (TypeError,ValueError,OverflowError):
+        return 500.0
 
 def initialize():
     """Idempotent, additive schema creation isolated to V2."""
@@ -51,12 +58,12 @@ def initialize():
             )
         """)
         conn.execute("INSERT INTO v2_paper_account(id,starting_cash,cash) VALUES (1,%s,%s) ON CONFLICT (id) DO NOTHING",
-                     (float(os.getenv("V2_PAPER_STARTING_BALANCE_USD", "500")), float(os.getenv("V2_PAPER_STARTING_BALANCE_USD", "500"))))
+                     (_starting_balance(), _starting_balance()))
 
 def buy(mint: str, symbol: str, price: float, amount_usd: float, daily_loss_limit: float):
     if not mint or len(mint) > 64 or not symbol or len(symbol) > 20:
         raise LedgerError("Invalid mint or symbol")
-    if price <= 0 or amount_usd <= 0:
+    if not math.isfinite(price) or not math.isfinite(amount_usd) or price <= 0 or amount_usd <= 0:
         raise LedgerError("Price and amount must be positive")
     with _connect() as conn:
         account = conn.execute("SELECT * FROM v2_paper_account WHERE id=1 FOR UPDATE").fetchone()
@@ -68,6 +75,8 @@ def buy(mint: str, symbol: str, price: float, amount_usd: float, daily_loss_limi
         if float(account["cash"]) < amount_usd:
             raise LedgerError("Insufficient paper cash")
         qty = amount_usd / price
+        if not math.isfinite(qty):
+            raise LedgerError("Paper quantity is outside the supported range")
         pos = conn.execute("SELECT * FROM v2_paper_positions WHERE mint=%s FOR UPDATE", (mint,)).fetchone()
         if pos:
             new_qty = float(pos["quantity"]) + qty
@@ -83,7 +92,7 @@ def buy(mint: str, symbol: str, price: float, amount_usd: float, daily_loss_limi
         return {"mint":mint,"symbol":symbol,"quantity":qty,"price_usd":price,"notional_usd":amount_usd,"side":"BUY","mode":"paper","real_trading_enabled":False}
 
 def sell(mint: str, price: float, quantity: float):
-    if not mint or price <= 0 or quantity <= 0:
+    if not mint or not math.isfinite(price) or not math.isfinite(quantity) or price <= 0 or quantity <= 0:
         raise LedgerError("Mint, price and quantity must be valid positive values")
     with _connect() as conn:
         account = conn.execute("SELECT * FROM v2_paper_account WHERE id=1 FOR UPDATE").fetchone()
@@ -91,6 +100,8 @@ def sell(mint: str, price: float, quantity: float):
         if not account or not pos or float(pos["quantity"]) < quantity:
             raise LedgerError("Position not found or sell quantity exceeds paper holdings")
         notional = price * quantity
+        if not math.isfinite(notional):
+            raise LedgerError("Paper sale value is outside the supported range")
         cost = float(pos["average_entry"]) * quantity
         pnl = notional - cost
         remaining = float(pos["quantity"]) - quantity
