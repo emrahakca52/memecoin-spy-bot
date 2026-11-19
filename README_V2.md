@@ -4,9 +4,9 @@ V2 is a separate Solana discovery and security-triage service. It is isolated fr
 
 ## Implemented in V2
 
-Discovery fallback behavior is logged with primary and fallback candidate counts. A provider returning HTTP 200 with an empty list is treated as an empty feed, not as proof that no new Solana tokens exist. The scanner falls back to GeckoTerminal; provider errors remain fail-closed.
+Discovery fallback behavior is logged with primary and fallback candidate counts. A provider returning HTTP 200 with an empty list is treated as an empty feed, not as proof that no new Solana tokens exist. The scanner falls back to DexPaprika's Solana new-pools search (sorted by pool creation time), then GeckoTerminal; provider errors remain fail-closed.
 - Modular scanner, transparent market scoring and fail-closed risk gates.
-- Multi-source Solana discovery: DexScreener latest token profiles first, with GeckoTerminal's public Solana new-pools feed as an automatic fallback when the primary discovery feed returns no candidates; RugCheck security enrichment remains separate. GeckoTerminal is a beta public API with rate limits, so it is a fallback rather than a guaranteed always-on source.
+- Multi-source Solana discovery: DexScreener latest token profiles first, DexPaprika's public Solana pool search as the second source, and GeckoTerminal's public new-pools feed as the third fallback. DexPaprika sorts pools by creation time and requires no API key; pool creation is not proof that a token is new or safe. GeckoTerminal is beta and rate-limited. RugCheck security enrichment remains separate.
 - Deterministic local screening when no Grok/Gemini key is configured. This is a rules engine, **not AI advice**; the dashboard reports AI availability separately.
 - Optional Grok/Gemini screening when a valid provider key is configured.
 - Public Solana RPC transaction sampling without a paid key: up to 12 recent signatures, at most 3 concurrent transaction lookups, and endpoint fallback. This is an incomplete heuristic; unavailable or unclassifiable samples remain unknown and fail closed. It is not equivalent to Helius Enhanced Transactions.
