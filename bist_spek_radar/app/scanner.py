@@ -1,17 +1,27 @@
-"""Explainable anomaly screening for Borsa Istanbul daily bars.
+"""Broad-universe, explainable BIST anomaly screening.
 
-Yahoo Finance data is indicative and may be delayed/incomplete. This module
-flags statistical outliers; it does not infer intent or prove manipulation.
+Universe source: public KAP-derived symbol CSV (fallback list if unavailable).
+Market bars: Yahoo Finance; indicative/delayed and not exchange-authoritative.
+This flags statistical outliers; it does not prove manipulation or intent.
 """
 from __future__ import annotations
 
+import io
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from typing import Any
 
 import numpy as np
 import pandas as pd
+import requests
 import yfinance as yf
+
+UNIVERSE_URL = os.getenv(
+    "BIST_UNIVERSE_URL",
+    "https://raw.githubusercontent.com/ahmeterenodaci/Istanbul-Stock-Exchange--BIST--including-symbols-and-logos/main/without_logo.csv",
+)
+FALLBACK = "THYAO,ASELS,TUPRS,EREGL,AKBNK,GARAN,ISCTR,SISE,SAHOL,KCHOL,TCELL,BIMAS,PGSUS,TOASO,FROTO,KOZAL,ASTOR,HEKTS,MIATK,DSTKF,KNFRT,VEYAS,BLCYT,KRTEK"
 
 
 @dataclass
@@ -29,67 +39,79 @@ class Signal:
     data_date: str
     data_source: str = "Yahoo Finance (indicative; may be delayed)"
 
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
 
 def configured_symbols() -> list[str]:
-    raw = os.getenv("BIST_SYMBOLS", "THYAO,ASELS,TUPRS,EREGL,AKBNK,GARAN,ISCTR,SISE,SAHOL,KCHOL,TCELL,BIMAS,PGSUS,TOASO,FROTO,KOZAL,ASTOR,HEKTS,MIATK,DSTKF")
-    return list(dict.fromkeys(s.strip().upper().removesuffix(".IS") for s in raw.split(",") if s.strip()))
+    raw = os.getenv("BIST_SYMBOLS", "").strip()
+    if raw:
+        return list(dict.fromkeys(s.strip().upper().removesuffix(".IS") for s in raw.split(",") if s.strip()))
+    try:
+        response = requests.get(UNIVERSE_URL, timeout=12, headers={"User-Agent": "BIST-Spek-Radar/1.0"})
+        response.raise_for_status()
+        table = pd.read_csv(io.StringIO(response.text))
+        col = next((c for c in table.columns if c.lower() in {"symbol", "ticker", "code"}), None)
+        if col:
+            symbols = [str(s).strip().upper().removesuffix(".IS") for s in table[col].dropna()]
+            symbols = [s for s in symbols if s.isalnum() and 3 <= len(s) <= 6]
+            if len(symbols) >= 100:
+                return list(dict.fromkeys(symbols))
+    except Exception:
+        pass
+    return FALLBACK.split(",")
 
 
 def _analyze(symbol: str, frame: pd.DataFrame) -> Signal | None:
     if frame is None or frame.empty:
         return None
     if isinstance(frame.columns, pd.MultiIndex):
-        frame.columns = frame.columns.get_level_values(0)
-    needed = {"Close", "Volume"}
-    if not needed.issubset(frame.columns):
+        # yf.download(group_by="ticker") returns ticker at level 0.
+        if symbol in frame.columns.get_level_values(0):
+            frame = frame[symbol]
+        else:
+            frame.columns = frame.columns.get_level_values(-1)
+    if not {"Close", "Volume"}.issubset(frame.columns):
         return None
     df = frame.dropna(subset=["Close", "Volume"]).copy()
     if len(df) < 25:
         return None
-    close = df["Close"].astype(float)
-    volume = df["Volume"].astype(float)
+    close, volume = df["Close"].astype(float), df["Volume"].astype(float)
     last = float(close.iloc[-1])
     if not np.isfinite(last) or last <= 0:
         return None
-    vol_base = float(volume.iloc[-21:-1].median())
+    baseline = volume.iloc[-21:-1]
+    vol_base = float(baseline.median())
     vol_ratio = float(volume.iloc[-1] / vol_base) if vol_base > 0 else 0.0
     change_1d = float((close.iloc[-1] / close.iloc[-2] - 1) * 100)
     change_5d = float((close.iloc[-1] / close.iloc[-6] - 1) * 100)
     returns = close.pct_change().dropna()
     vol20 = float(returns.iloc[-20:].std(ddof=1) * np.sqrt(20) * 100)
     turnover = float(last * volume.iloc[-1])
-    score = 0
-    reasons: list[str] = []
-    if vol_ratio >= 3:
-        score += 30
-        reasons.append(f"Hacim, önceki 20 gün medyanının {vol_ratio:.1f} katı")
+
+    # Score includes both pre-breakout activity and post-move exhaustion.
+    score, reasons = 0, []
+    if vol_ratio >= 5:
+        score += 30; reasons.append(f"Hacim 20 günlük medyanın {vol_ratio:.1f} katı")
+    elif vol_ratio >= 3:
+        score += 24; reasons.append(f"Hacim 20 günlük medyanın {vol_ratio:.1f} katı")
     elif vol_ratio >= 2:
-        score += 18
-        reasons.append(f"Hacim artışı: {vol_ratio:.1f} kat")
-    if abs(change_1d) >= 7:
-        score += 25
-        reasons.append(f"Günlük fiyat hareketi %{change_1d:.1f}")
+        score += 15; reasons.append(f"Hacim artışı {vol_ratio:.1f} kat")
+    if abs(change_1d) >= 8:
+        score += 18; reasons.append(f"Günlük fiyat hareketi %{change_1d:.1f}")
     elif abs(change_1d) >= 4:
-        score += 15
-        reasons.append(f"Belirgin günlük hareket: %{change_1d:.1f}")
-    if abs(change_5d) >= 15:
-        score += 20
-        reasons.append(f"5 günlük hareket %{change_5d:.1f}")
-    elif abs(change_5d) >= 8:
-        score += 10
-        reasons.append(f"5 günlük hareket %{change_5d:.1f}")
-    if vol20 >= 12:
-        score += 15
-        reasons.append(f"Yüksek 20 günlük oynaklık: %{vol20:.1f}")
-    elif vol20 >= 7:
-        score += 8
-        reasons.append(f"Artan oynaklık: %{vol20:.1f}")
+        score += 10; reasons.append(f"Günlük fiyat hareketi %{change_1d:.1f}")
+    if abs(change_5d) >= 20:
+        score += 18; reasons.append(f"5 günlük hareket %{change_5d:.1f}")
+    elif abs(change_5d) >= 10:
+        score += 10; reasons.append(f"5 günlük hareket %{change_5d:.1f}")
+    if vol20 >= 15:
+        score += 12; reasons.append(f"20 günlük oynaklık %{vol20:.1f}")
+    elif vol20 >= 8:
+        score += 6; reasons.append(f"20 günlük oynaklık %{vol20:.1f}")
+    # Turnover is a liquidity context field, not a manipulation signal.
     if turnover >= 100_000_000:
-        score += 10
-        reasons.append("Günlük işlem tutarı 100 milyon TL üzerinde (yaklaşık)")
+        score += 5; reasons.append("Günlük işlem tutarı 100 milyon TL üzerinde")
+    # Very high volume with muted price can indicate absorption/rotation.
+    if vol_ratio >= 2 and abs(change_1d) < 1.5:
+        score += 12; reasons.append("Hacim yüksek, fiyat tepkisi sınırlı")
     return Signal(
         symbol=symbol, name=symbol, score=min(score, 100), last_close=round(last, 4),
         change_1d_pct=round(change_1d, 2), change_5d_pct=round(change_5d, 2),
@@ -100,14 +122,25 @@ def _analyze(symbol: str, frame: pd.DataFrame) -> Signal | None:
 
 
 def scan_symbols(symbols: list[str] | None = None, period: str = "6mo") -> list[dict[str, Any]]:
+    universe = symbols or configured_symbols()
+    tickers = [f"{s.removesuffix('.IS')}.IS" for s in universe]
+    try:
+        raw = yf.download(
+            tickers=tickers, period=period, interval="1d", auto_adjust=True,
+            group_by="ticker", threads=True, progress=False, timeout=25,
+        )
+    except Exception:
+        raw = pd.DataFrame()
     results: list[dict[str, Any]] = []
-    for symbol in (symbols or configured_symbols()):
-        ticker = symbol if symbol.endswith(".IS") else f"{symbol}.IS"
+    if raw.empty:
+        return results
+    for symbol in universe:
+        ticker = f"{symbol.removesuffix('.IS')}.IS"
         try:
-            history = yf.Ticker(ticker).history(period=period, interval="1d", auto_adjust=True)
-            signal = _analyze(symbol.removesuffix(".IS"), history)
+            frame = raw[ticker] if isinstance(raw.columns, pd.MultiIndex) and ticker in raw.columns.get_level_values(0) else raw
+            signal = _analyze(symbol.removesuffix(".IS"), frame)
             if signal and signal.score > 0:
-                results.append(signal.to_dict())
+                results.append(asdict(signal))
         except Exception:
             continue
-    return sorted(results, key=lambda row: (row["score"], row["turnover_try"]), reverse=True)
+    return sorted(results, key=lambda row: (row["score"], row["volume_ratio"], row["turnover_try"]), reverse=True)
