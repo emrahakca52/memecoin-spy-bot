@@ -12,11 +12,11 @@ V2 is a separate Solana discovery and security-triage service. It remains isolat
 - Security-provider calls are bounded to the first 10 candidates per scan to reduce public API load.
 - Standalone FastAPI endpoints: `GET /health`, `GET /v2/scan?limit=20`, and read-only `GET /v2/wallet/{wallet_address}?limit=10`, GET /v2/paper/status, and authenticated POST /v2/paper/buy / POST /v2/paper/sell.
 - Optional Telegram scan summary, disabled unless `V2_TELEGRAM_REPORTS_ENABLED=true`. It uses the existing `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`; reports are throttled to at most one per process per 15 minutes.
-- Unit tests cover scoring, fail-closed risk decisions, RugCheck parsing, RPC lookup bounds, scanner deduplication and paper-only output.
-- `real_trading_enabled` is hard-coded false. No wallet signing, swap execution, or V2 database writes exist.
+- Unit tests cover scoring, fail-closed risk decisions, RugCheck parsing, RPC lookup bounds, Helius same-slot clustering, scanner deduplication and paper-only output.
+- `real_trading_enabled` is hard-coded false. No wallet signing or swap execution exists. The only V2 database writes are additive paper-ledger records in v2_paper_* tables.
 
 ## Risk decisions
-A candidate cannot be marked eligible unless market data, RugCheck normalized score, top-10 holder concentration, mint/freeze authority status and LP-lock status pass configured thresholds. Missing data is not treated as zero. Transaction-level bundle/sniper detection remains explicitly missing without a dedicated indexed transaction feed; therefore candidates remain ineligible even when other checks pass. Public RPC top-account observations do not clear that gate.
+A candidate cannot be marked eligible unless market data, RugCheck normalized score, top-10 holder concentration, mint/freeze authority status and LP-lock status pass configured thresholds. Missing data is not treated as zero. Transaction-level same-slot swap clustering is checked through Helius when configured. It is heuristic rather than exhaustive; if the key, provider fields, or sample are unavailable, candidates remain ineligible. Public RPC top-account observations do not clear the holder-index gate.
 
 ## Run locally
 ```bash
@@ -41,7 +41,7 @@ Open `/health`, `/v2/scan`, or `/docs`. Public providers may rate-limit or tempo
 - `V2_MAX_DAILY_LOSS_USD` controls the realized daily paper-loss brake; `V2_PAPER_STARTING_BALANCE_USD` seeds the isolated V2 paper account once.
 
 ## Not yet complete — external and production gates
-- Reliable launch-bundle/sniper analytics and complete wallet-level holder indexing require a transaction-indexing provider (for example Helius). No such credentials are configured. V2 does not pretend the heuristic top-20 sample is a substitute.
+- Helius credentials are not configured yet. Without them, same-slot swap clustering remains unknown and the eligibility gate fails closed. Complete wallet-level holder indexing is still not provided by the top-20 RPC sample.
 - LP-lock and holder fields depend on the third-party RugCheck report schema and availability; missing or malformed fields fail closed.
 - A second AI opinion provider is not connected; no AI-based pass override exists in V2.
 - V2 paper ledger is additive and separate; it does not import V1 trade history or calculate unrealized PnL from live prices. V1's PostgreSQL paper history remains untouched.
