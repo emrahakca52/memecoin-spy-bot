@@ -6,6 +6,7 @@ V2 is a separate Solana discovery and security-triage service. It remains isolat
 - Modular package with typed market models, environment settings, transparent momentum scoring, fail-closed risk gates and scanner orchestration.
 - DexScreener Solana token-profile discovery, pair selection by liquidity and duplicate-address filtering.
 - Public RugCheck report enrichment: normalized risk score, top-holder concentration, mint/freeze authority metadata, LP-lock percentage and dangerous risk flags. The lowest reported LP-lock percentage across reported markets is used.
+- Existing Grok/Gemini AI screening is reused as an additional fail-closed gate; missing API credentials or invalid responses never approve a candidate.
 - Optional Helius Enhanced Transactions same-slot swap clustering for the first 10 candidates per scan. It is a conservative heuristic, not proof of coordinated sniping; unavailable data remains unknown and fails closed.
 - Isolated PostgreSQL paper ledger using only v2_paper_* tables. It supports paper buys, sells, realized PnL, open positions, cash balance and a realized daily-loss brake. Write endpoints require V2_PAPER_API_KEY; the existing V1 tables are not altered.
 - Public Solana RPC enrichment with endpoint fallback: mint/freeze authority checks and a labelled top-20 token-account sample. This sample is incomplete and is never treated as a complete holder index.
@@ -16,7 +17,7 @@ V2 is a separate Solana discovery and security-triage service. It remains isolat
 - `real_trading_enabled` is hard-coded false. No wallet signing or swap execution exists. The only V2 database writes are additive paper-ledger records in v2_paper_* tables.
 
 ## Risk decisions
-A candidate cannot be marked eligible unless market data, RugCheck normalized score, top-10 holder concentration, mint/freeze authority status and LP-lock status pass configured thresholds. Missing data is not treated as zero. Transaction-level same-slot swap clustering is checked through Helius when configured. It is heuristic rather than exhaustive; if the key, provider fields, or sample are unavailable, candidates remain ineligible. Public RPC top-account observations do not clear the holder-index gate.
+A candidate cannot be marked eligible unless market data, RugCheck normalized score, top-10 holder concentration, mint/freeze authority status, LP-lock status, AI screening and Helius same-slot swap analysis pass configured thresholds. Missing data is not treated as zero. Transaction-level same-slot swap clustering is checked through Helius when configured. It is heuristic rather than exhaustive; if the key, provider fields, or sample are unavailable, candidates remain ineligible. Public RPC top-account observations do not clear the holder-index gate.
 
 ## Run locally
 ```bash
@@ -34,6 +35,8 @@ Open `/health`, `/v2/scan`, or `/docs`. Public providers may rate-limit or tempo
 - `V2_MAX_TOP10_HOLDER_PCT` (default 25)
 - `V2_MIN_LP_LOCKED_PCT` (default 50)
 - `V2_MAX_RUGCHECK_SCORE` (default 55; normalized 0–100 score)
+- `AI_PROVIDER` (`grok` by default; set to `gemini` to use Gemini)
+- `XAI_API_KEY` (Grok credential) or `GEMINI_API_KEY` (Gemini credential)
 - `HELIUS_API_KEY` (optional; enables enhanced same-slot swap clustering; configure only in Render environment, never paste into chat)
 - `V2_PAPER_API_KEY` (required to authorize paper buy/sell endpoints; choose a long random secret)
 - `V2_SOLANA_RPC_URL` (optional preferred RPC endpoint; fallback public endpoints are tried)
