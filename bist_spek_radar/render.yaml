@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: bist-spek-radar
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    rootDir: bist_spek_radar
+    autoDeploy: false
+    envVars:
+      - key: BIST_SYMBOLS
+        value: THYAO,ASELS,TUPRS,EREGL,AKBNK,GARAN,ISCTR,SISE,SAHOL,KCHOL,TCELL,BIMAS,PGSUS,TOASO,FROTO,KOZAL,ASTOR,HEKTS,MIATK,DSTKF
