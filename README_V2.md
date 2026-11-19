@@ -3,8 +3,10 @@
 V2 is a separate Solana discovery and security-triage service. It is isolated from production V1; V1's entry point, database tables and trading behavior are not changed.
 
 ## Implemented in V2
+
+Discovery fallback behavior is logged with primary and fallback candidate counts. A provider returning HTTP 200 with an empty list is treated as an empty feed, not as proof that no new Solana tokens exist. The scanner falls back to GeckoTerminal; provider errors remain fail-closed.
 - Modular scanner, transparent market scoring and fail-closed risk gates.
-- DexScreener market discovery and RugCheck security enrichment.
+- Multi-source Solana discovery: DexScreener latest token profiles first, with GeckoTerminal's public Solana new-pools feed as an automatic fallback when the primary discovery feed returns no candidates; RugCheck security enrichment remains separate. GeckoTerminal is a beta public API with rate limits, so it is a fallback rather than a guaranteed always-on source.
 - Deterministic local screening when no Grok/Gemini key is configured. This is a rules engine, **not AI advice**; the dashboard reports AI availability separately.
 - Optional Grok/Gemini screening when a valid provider key is configured.
 - Public Solana RPC transaction sampling without a paid key: up to 12 recent signatures, at most 3 concurrent transaction lookups, and endpoint fallback. This is an incomplete heuristic; unavailable or unclassifiable samples remain unknown and fail closed. It is not equivalent to Helius Enhanced Transactions.
