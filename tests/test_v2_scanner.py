@@ -44,7 +44,7 @@ class ScannerTests(unittest.IsolatedAsyncioTestCase):
                 self.called=True
                 return [market("GECKO",source="geckoterminal")]
         fallback=Fallback()
-        scanner=Scanner(Settings(),EmptyProvider(),FakeOnchainProvider(),FakeRugCheckProvider(),ai_provider=FakeAiProvider(),fallback_provider=fallback)
+        scanner=Scanner(Settings(),EmptyProvider(),FakeOnchainProvider(),FakeRugCheckProvider(),ai_provider=FakeAiProvider(),fallback_provider=fallback,paprika_provider=EmptyProvider())
         result=await scanner.scan()
         self.assertTrue(fallback.called)
         self.assertEqual(result[0].market.source,"geckoterminal")
