@@ -2,7 +2,7 @@
 indicator("BIST Spek Radar • Erken AL / SAT", shorttitle="BIST Spek Radar", overlay=true, max_labels_count=500)
 
 // ── Kullanıcı ayarları
-minScore = input.int(65, "AL için minimum puan", minval=40, maxval=95)
+minScore = input.int(90, "AL için minimum puan", minval=70, maxval=100)
 volLen = input.int(20, "Hacim baz periyodu", minval=10)
 cooldown = input.int(5, "Sinyaller arası bar", minval=1)
 showPanel = input.bool(true, "Radar panelini göster")
