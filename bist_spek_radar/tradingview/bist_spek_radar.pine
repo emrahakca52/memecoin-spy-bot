@@ -39,6 +39,10 @@ score += rangePos >= 0.35 and rangePos <= 0.90 ? 10 : 0
 score += ema9 >= ema21 and ema9 > ema9[3] ? 10 : 0
 score += rsi >= 48 and rsi <= 70 ? 5 : 0
 score += obv > obvEma ? 5 : 0
+// Ek teyit puanları: güçlü momentum, ana trend ve para akışı
+score += macdHist > 0 and macdHist > macdHist[1] ? 5 : 0
+score += close > ema50 and ema50 > ema50[3] ? 5 : 0
+score += obv > obv[3] ? 5 : 0
 score := math.min(score, 100)
 
 // ── Sinyaller: bar kapanışında kesinleşir
