@@ -24,7 +24,7 @@ volAccel = vol5Base > 0 ? ta.sma(volume, 5) / vol5Base : 0.0
 barRange = math.max(high - low, syminfo.mintick)
 moneyFlowMultiplier = ((close - low) - (high - close)) / barRange
 moneyFlowVolume = moneyFlowMultiplier * volume
-cmf = ta.sum(moneyFlowVolume, 20) / math.max(ta.sum(volume, 20), 1)
+cmf = ta.sma(moneyFlowVolume, 20) / math.max(ta.sma(volume, 20), 1)
 
 // 4) KIRILIM / SIKIŞMA
 priorHigh = ta.highest(high, 20)[1]
