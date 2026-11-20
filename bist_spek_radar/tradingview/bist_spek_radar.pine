@@ -56,7 +56,7 @@ if buySignal
 lossOfTrend = ta.crossunder(ema9, ema21)
 momentumFade = rsi < 48 and macdHist < macdHist[1]
 distributionRisk = volRatio >= 1.5 and close < open and close < close[1]
-sellSignal = barstate.isconfirmed and (lossOfTrend or (momentumFade and distributionRisk) or (rsi > 78 and ta.crossunder(rsi, 72)))
+sellSignal = barstate.isconfirmed and (lossOfTrend or (momentumFade and distributionRisk) or (rsi > 78 and ta.crossunder(rsi, 78)))
 
 plot(ema9, "EMA 9", color=color.new(color.lime, 0), linewidth=2)
 plot(ema21, "EMA 21", color=color.new(color.orange, 0), linewidth=2)
