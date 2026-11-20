@@ -1,91 +1,64 @@
 //@version=6
-indicator("BIST Spek Radar PRO", shorttitle="BIST SPEK PRO", overlay=true, max_labels_count=300)
+indicator("BIST Spek Radar - Sade", shorttitle="SPEK RADAR", overlay=true, max_labels_count=100)
 
-// AYARLAR
-minScore = input.int(80, "AL puanı", minval=60, maxval=95)
-showAverages = input.bool(true, "EMA çizgilerini göster")
-showPanel = input.bool(true, "Özet panelini göster")
-avoidExtended = input.bool(true, "Geç kalınmış yükselişte AL verme")
+// Ayarlar
+breakoutLen = input.int(20, "Kirilim periyodu", minval=10, maxval=60)
+volumeFactor = input.float(1.5, "Kirilimda hacim katsayisi", minval=1.1, maxval=4.0, step=0.1)
+showEma = input.bool(true, "EMA 21'i goster")
 
-// 1) TREND
-ema9 = ta.ema(close, 9)
+// Trend ve para akisi
 ema21 = ta.ema(close, 21)
 ema50 = ta.ema(close, 50)
-trendStrong = close > ema21 and ema9 > ema21 and ema21 > ema50
-trendImproving = ema9 > ema21 and ema9 > ema9[3]
+barRange = math.max(high - low, syminfo.mintick)
+mfMultiplier = ((close - low) - (high - close)) / barRange
+mfVolume = mfMultiplier * volume
+cmf = ta.sma(mfVolume, 20) / math.max(ta.sma(volume, 20), 1)
 
-// 2) HACİM
+// Hacim ve OBV birikimi
 volAvg = ta.sma(volume, 20)
 volRatio = volAvg > 0 ? volume / volAvg : 0.0
-vol5Base = ta.sma(volume, 20)[5]
-volAccel = vol5Base > 0 ? ta.sma(volume, 5) / vol5Base : 0.0
+obv = ta.cum(close > close[1] ? volume : close < close[1] ? -volume : 0)
+obvBase = ta.ema(obv, 21)
+obvRising = obv > obvBase and obvBase > obvBase[3]
 
-// 3) PARA AKIŞI (Chaikin Money Flow hesabı)
-barRange = math.max(high - low, syminfo.mintick)
-moneyFlowMultiplier = ((close - low) - (high - close)) / barRange
-moneyFlowVolume = moneyFlowMultiplier * volume
-cmf = ta.sma(moneyFlowVolume, 20) / math.max(ta.sma(volume, 20), 1)
+// Daralma: Bollinger bant genisligi son 100 barin dip bolgesinde
+basis = ta.sma(close, 20)
+dev = 2.0 * ta.stdev(close, 20)
+bbWidth = basis != 0 ? (2.0 * dev) / basis : na
+lowestWidth = ta.lowest(bbWidth, 100)
+squeeze = not na(lowestWidth) and bbWidth <= lowestWidth * 1.35
 
-// 4) KIRILIM / SIKIŞMA
-priorHigh = ta.highest(high, 20)[1]
-priorLow = ta.lowest(low, 20)[1]
-rangePosition = priorHigh > priorLow ? (close - priorLow) / (priorHigh - priorLow) : 0.5
-nearBreakout = close >= priorHigh * 0.97 and close <= priorHigh * 1.03
+// Hazirlik: daralma + pozitif para akisi + birikim + yukari egimli kisa trend
+trendUp = close > ema21 and ema21 > ema21[3]
+prepPoints = (squeeze ? 1 : 0) + (cmf > 0.03 ? 1 : 0) + (obvRising ? 1 : 0) + (trendUp ? 1 : 0)
+preparation = prepPoints >= 3
 
-// 5) MOMENTUM
+// Kirilim: onceki breakoutLen barin tepesinin kapanisla asilmasi
+priorHigh = ta.highest(high, breakoutLen)[1]
 rsi = ta.rsi(close, 14)
-[macdLine, macdSignal, macdHist] = ta.macd(close, 12, 26, 9)
-momentumStrong = rsi >= 52 and rsi <= 72 and macdHist > 0 and macdHist >= macdHist[1]
+notChasing = close < ema21 * 1.10 and close < close[1] * 1.08
+breakout = ta.crossover(close, priorHigh)
+rawBuy = breakout and volRatio >= volumeFactor and cmf > 0.03 and close > ema21 and rsi >= 50 and rsi <= 76 and notChasing
 
-// 6) AŞIRI YÜKSELİŞ FİLTRESİ
-ret1 = 100 * (close / close[1] - 1)
-ret5 = 100 * (close / close[5] - 1)
-ret20 = 100 * (close / close[20] - 1)
-notExtended = ret1 < 8 and ret5 < 18 and ret20 < 30
+// Tek AL ve tek SAT: sinyalden sonra yeni AL icin SAT kosulu beklenir
+var bool inTrade = false
+buySignal = barstate.isconfirmed and rawBuy and not inTrade
+sellCondition = ta.crossunder(close, ema21) or (ta.crossunder(ta.ema(close, 9), ema21) and cmf < 0)
+sellSignal = barstate.isconfirmed and inTrade and sellCondition
 
-// NET 100 PUAN
-score = 0
-score += volRatio >= 2.0 ? 15 : volRatio >= 1.5 ? 10 : volRatio >= 1.2 ? 5 : 0
-score += volAccel >= 2.0 ? 10 : volAccel >= 1.5 ? 7 : volAccel >= 1.2 ? 4 : 0
-score += trendStrong ? 20 : trendImproving ? 12 : 0
-score += cmf > 0.15 ? 20 : cmf > 0.05 ? 14 : cmf > 0 ? 7 : 0
-score += nearBreakout ? 15 : rangePosition >= 0.65 and rangePosition < 0.97 ? 10 : rangePosition >= 0.45 ? 5 : 0
-score += momentumStrong ? 15 : rsi >= 48 and macdHist > 0 ? 8 : 0
-score += notExtended ? 5 : 0
-score := math.min(score, 100)
+if buySignal
+    inTrade := true
+else if sellSignal
+    inTrade := false
 
-// SİNYAL
-buySetup = score >= minScore and volRatio >= 1.2 and cmf > 0 and trendImproving and momentumStrong and (not avoidExtended or notExtended)
-buySignal = barstate.isconfirmed and buySetup and not buySetup[1]
+prepSignal = barstate.isconfirmed and preparation and not preparation[1] and not inTrade
 
-sellTrend = ta.crossunder(ema9, ema21)
-sellFlow = cmf < 0 and close < open and volRatio >= 1.3
-sellMomentum = rsi < 45 and macdHist < 0
-sellSignal = barstate.isconfirmed and (sellTrend or sellFlow or sellMomentum)
+plot(showEma ? ema21 : na, "EMA 21", color=color.orange, linewidth=2)
+plotshape(prepSignal, title="HAZIRLIK", text="HAZIR", style=shape.labelup, location=location.belowbar, color=color.yellow, textcolor=color.black, size=size.tiny)
+plotshape(buySignal, title="AL", text="AL", style=shape.labelup, location=location.belowbar, color=color.lime, textcolor=color.black, size=size.small)
+plotshape(sellSignal, title="SAT", text="SAT", style=shape.labeldown, location=location.abovebar, color=color.red, textcolor=color.white, size=size.small)
+bgcolor(preparation and not inTrade ? color.new(color.yellow, 92) : na, title="Hazirlik alani")
 
-plot(showAverages ? ema9 : na, "EMA 9", color=color.lime, linewidth=2)
-plot(showAverages ? ema21 : na, "EMA 21", color=color.orange, linewidth=2)
-plot(showAverages ? ema50 : na, "EMA 50", color=color.blue, linewidth=1)
-plotshape(buySignal, title="ERKEN AL", text="AL", style=shape.labelup, location=location.belowbar, color=color.lime, textcolor=color.black, size=size.small)
-plotshape(sellSignal, title="SAT / RİSK", text="SAT", style=shape.labeldown, location=location.abovebar, color=color.red, textcolor=color.white, size=size.small)
-bgcolor(buySetup ? color.new(color.green, 90) : na, title="AL hazırlık bölgesi")
-
-// SADE PANEL
-var table panel = table.new(position.top_right, 2, 5, border_width=1)
-if barstate.islast and showPanel
-    state = buySignal ? "ERKEN AL" : buySetup ? "AL'A HAZIRLAN" : sellSignal ? "SAT / RİSK" : "İZLE"
-    stateColor = buySignal ? color.lime : buySetup ? color.orange : sellSignal ? color.red : color.silver
-    table.cell(panel, 0, 0, "BIST SPEK PRO", bgcolor=color.black, text_color=color.white)
-    table.cell(panel, 1, 0, syminfo.ticker, bgcolor=color.black, text_color=color.white)
-    table.cell(panel, 0, 1, "Durum")
-    table.cell(panel, 1, 1, state, text_color=stateColor)
-    table.cell(panel, 0, 2, "Güç puanı")
-    table.cell(panel, 1, 2, str.tostring(score) + " / 100")
-    table.cell(panel, 0, 3, "Hacim")
-    table.cell(panel, 1, 3, str.tostring(volRatio, "#.##") + " kat")
-    table.cell(panel, 0, 4, "Para akışı")
-    table.cell(panel, 1, 4, str.tostring(cmf, "#.###"))
-
-alertcondition(buySignal, title="BIST SPEK PRO - ERKEN AL", message="BIST SPEK PRO ERKEN AL | {{ticker}} | {{interval}} | {{close}}")
-alertcondition(buySetup and not buySetup[1], title="BIST SPEK PRO - HAZIRLIK", message="BIST SPEK PRO HAZIRLIK | {{ticker}} | {{interval}} | {{close}}")
-alertcondition(sellSignal, title="BIST SPEK PRO - SAT/RİSK", message="BIST SPEK PRO SAT/RİSK | {{ticker}} | {{interval}} | {{close}}")
+alertcondition(prepSignal, title="SPEK RADAR HAZIRLIK", message="SPEK RADAR HAZIRLIK | {{ticker}} | {{interval}} | {{close}}")
+alertcondition(buySignal, title="SPEK RADAR AL", message="SPEK RADAR AL | {{ticker}} | {{interval}} | {{close}}")
+alertcondition(sellSignal, title="SPEK RADAR SAT", message="SPEK RADAR SAT | {{ticker}} | {{interval}} | {{close}}")
